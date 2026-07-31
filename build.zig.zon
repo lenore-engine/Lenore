@@ -1,0 +1,10 @@
+.{
+    .name = .lenore,
+    .fingerprint = 0x27851431b53a5f99,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lenore_platform = .{ .path = "lenore-platform" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE", "NOTICE.md", "AUTHORS" },
+}

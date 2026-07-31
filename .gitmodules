@@ -1,0 +1,3 @@
+[submodule "lenore-platform"]
+	path = lenore-platform
+	url = git@github.com:lenore-engine/lenore-platform.git
