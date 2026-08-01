@@ -1,3 +1,12 @@
 [submodule "lenore-platform"]
 	path = lenore-platform
-	url = git@github.com:lenore-engine/lenore-platform.git
+	url = git@lenore:lenore-engine/lenore-platform.git
+[submodule "lenore-gpu"]
+	path = lenore-gpu
+	url = git@lenore:lenore-engine/lenore-gpu.git
+[submodule "lenore-resources"]
+	path = lenore-resources
+	url = git@lenore:lenore-engine/lenore-resources.git
+[submodule "lenore-gltf"]
+	path = lenore-gltf
+	url = git@lenore:lenore-engine/lenore-gltf.git
