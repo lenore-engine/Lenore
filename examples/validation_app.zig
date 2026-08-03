@@ -20,10 +20,9 @@ const log = std.log.scoped(.validation);
 //
 // Usage: run-validation_app -- <model.glb>
 //
-// The first mesh's base-colour image is decoded when it is an embedded PNG or
-// JPEG, as in the Khronos glTF-Binary samples. Other slots keep their neutral
-// fallbacks; the draw still has one material, so this exercises source-image
-// decoding and RGBA8 upload without pretending the material loop already exists.
+// Every mesh and material is uploaded. An embedded PNG or JPEG base-colour
+// image is decoded to RGBA8; absent maps use the texture cache's neutral
+// fallback. Other material slots remain neutral until their shader paths exist.
 
 const checking = std.debug.runtime_safety;
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -48,16 +47,49 @@ comptime {
     }
 }
 
-// One instance, placed at the origin. The camera is what moves.
-const instance_count = 1;
-
-// One skinned instance's playback: the pose the frame samples into, and the
-// clip it samples from. The pose borrows the skin's template, which the model
-// owns.
+// One skin's playback. The pose borrows the template owned by the model, and
+// `source_index` is the document index that a mesh carries.
 const Skin = struct {
+    source_index: u32,
     pose: res.SkeletonPose,
     clip: ?*const res.Animation,
 };
+
+fn skinForIndex(skins: []Skin, source_index: u32) ?*Skin {
+    for (skins) |*skin| {
+        if (skin.source_index == source_index) return skin;
+    }
+    return null;
+}
+
+const RecordPlan = scene.DrawBatches(*const gpu.Mesh, u32);
+
+pub const BatchTranslationError = error{BatchDestinationTooSmall};
+
+// The deliberate module-boundary copy: scene owns ordering and face policy;
+// GPU owns resource pointers and Vulkan state. The destination is preallocated,
+// and its capacity is checked before the first write.
+fn translateRecordBatches(
+    batches: []const RecordPlan.Batch,
+    destination: []gpu.RecordBatch,
+) BatchTranslationError![]gpu.RecordBatch {
+    if (destination.len < batches.len) return error.BatchDestinationTooSmall;
+
+    for (batches, destination[0..batches.len]) |batch, *record| {
+        record.* = .{
+            .mesh = batch.mesh,
+            .material_index = batch.material,
+            .cull_mode = switch (batch.face_culling) {
+                .none => .{},
+                .back => .{ .back_bit = true },
+                .front => .{ .front_bit = true },
+            },
+            .first_instance = batch.first_instance,
+            .instance_count = batch.instance_count,
+        };
+    }
+    return destination[0..batches.len];
+}
 
 // The base an instance record carries, from what the plan assigned it. The plan
 // marks an entity with no pose, and that marker is not an index: the unskinned
@@ -65,6 +97,22 @@ const Skin = struct {
 // the device.
 fn jointBase(planned: u32) u32 {
     return if (planned == scene.no_joint_base) 0 else planned;
+}
+
+fn frameCamera(camera: *scene.Camera, sphere: res.Sphere, aspect: f32) f32 {
+    // A vertical field of view narrows horizontally below aspect one. Increase
+    // distance by the inverse aspect there so the same sphere stays inside both
+    // axes when a compositor gives the window a portrait extent.
+    const distance = @max(sphere.radius * 3.0 / @min(aspect, 1.0), 0.01);
+    camera.anchor = .{ .orbit = .{
+        .target = .{ sphere.centre[0], sphere.centre[1], sphere.centre[2] },
+        .distance = distance,
+    } };
+    camera.projection = .{ .perspective = .{
+        .near = @max(distance * 0.01, 1.0e-4),
+        .far = distance * 10.0,
+    } };
+    return distance;
 }
 
 // The weighted sum of joint matrices applied to a vertex, exactly as
@@ -136,77 +184,93 @@ pub fn main(process: std.process.Init.Minimal) !void {
     });
     if (model.meshes.len == 0) return error.NoGeometry;
 
-    const source = &model.meshes[0];
-    log.info("mesh: {d} vertices, {d} indices, streams {any}", .{
-        source.vertices.len,
-        source.indices.len,
-        source.streams,
-    });
-    check(source.indices.len % 3 == 0, "index count {d} is whole triangles", .{source.indices.len});
-    check(source.indices.len > 0, "geometry is indexed", .{});
+    if (model.materials.len == 0) return error.NoMaterials;
+    if (model.meshes.len > frame_capacity.instances) return error.InstanceCapacityExceeded;
+    if (model.meshes.len > std.math.maxInt(u32)) return error.TooManyMeshes;
+    if (model.materials.len > std.math.maxInt(u32)) return error.TooManyMaterials;
 
-    // Skeletal playback, for a mesh that declares the skinning stream.
-    //
-    // The pose borrows the skin's template, so both outlive the frame loop.
-    var skin: ?Skin = null;
-    defer if (skin) |*owned| owned.pose.deinit(gpa);
-    if (source.streams.skinned) {
-        // glTF 2.0 specification, 3.7.3.3: a skinned mesh primitive has the
-        // attributes that skinning reads, and a node referencing it names the
-        // skin they index. A document with the stream and no skin gives the
-        // shader an array to index and nothing to fill it with, so this stops
-        // before anything reaches the device.
-        if (model.skins.len == 0) return error.SkinnedMeshWithoutSkin;
+    var total_vertices: usize = 0;
+    var total_indices: usize = 0;
+    for (model.meshes, 0..) |*mesh, index| {
+        if (mesh.material >= model.materials.len) return error.MaterialIndexOutOfRange;
+        log.info("mesh {d}: {d} vertices, {d} indices, material {d}, streams {any}", .{
+            index,
+            mesh.vertices.len,
+            mesh.indices.len,
+            mesh.material,
+            mesh.streams,
+        });
+        check(
+            mesh.indices.len == 0 or mesh.indices.len % 3 == 0,
+            "mesh {d} index count {d} is whole triangles",
+            .{ index, mesh.indices.len },
+        );
+        total_vertices += mesh.vertices.len;
+        total_indices += mesh.indices.len;
+    }
 
-        const template = &model.skins[0].skeleton;
-        skin = .{
-            .pose = try res.SkeletonPose.init(gpa, template),
+    // Every skin owns one pose. Meshes refer to it by the document's skin index,
+    // which is not necessarily the position of that skin in the imported slice.
+    const skins = try gpa.alloc(Skin, model.skins.len);
+    var initialized_skins: usize = 0;
+    defer {
+        for (skins[0..initialized_skins]) |*skin| skin.pose.deinit(gpa);
+        gpa.free(skins);
+    }
+    for (model.skins, skins) |*source_skin, *skin| {
+        skin.* = .{
+            .source_index = source_skin.index,
+            .pose = try res.SkeletonPose.init(gpa, &source_skin.skeleton),
             // The first clip. Which one plays is playback's choice and this app
             // has no way to make it; a skin with none holds its bind pose.
-            .clip = if (model.skins[0].clips.len > 0) &model.skins[0].clips[0] else null,
+            .clip = if (source_skin.clips.len > 0) &source_skin.clips[0] else null,
         };
-        skin.?.pose.evaluate();
+        initialized_skins += 1;
+        skin.pose.evaluate();
 
-        log.info("skin: {d} joints over {d} slots, {d} clip(s)", .{
-            template.jointCount(),
-            template.slotCount(),
-            model.skins[0].clips.len,
+        log.info("skin {d}: {d} joints over {d} slots, {d} clip(s)", .{
+            source_skin.index,
+            source_skin.skeleton.jointCount(),
+            source_skin.skeleton.slotCount(),
+            source_skin.clips.len,
         });
-        if (skin.?.clip) |clip|
+        if (skin.clip) |clip|
             log.info("clip: keyed from {d:.3} to {d:.3} s over {d} slots", .{
                 clip.start_time,
                 clip.duration,
                 clip.slot_count,
             });
+    }
 
-        // The shader indexes the joint array with what a vertex carries and no
-        // bound of its own, so the one that would read outside it is answered
-        // here, once, over the whole mesh.
-        const joint_count = template.jointCount();
+    for (model.meshes, 0..) |*mesh, mesh_index| {
+        if (!mesh.streams.skinned) continue;
+
+        // glTF 2.0 specification, 3.7.3.3: a skinned mesh primitive has the
+        // attributes that skinning reads, and a node referencing it names the
+        // skin they index. A document with the stream and no matching skin gives
+        // the shader an array to index and nothing to fill it with.
+        const source_skin_index = mesh.skin orelse return error.SkinnedMeshWithoutSkin;
+        const skin = skinForIndex(skins, source_skin_index) orelse
+            return error.SkinnedMeshWithoutSkin;
+        const joint_count = skin.pose.jointCount();
+        if (joint_count == 0) return error.EmptySkin;
+
+        // The shader has no bound of its own, so answer the one that would read
+        // outside the joint array once, before a device is touched.
         var highest: u32 = 0;
-        for (source.vertices) |vertex| {
-            // Indexing a vector needs a comptime index, so the lanes are unrolled.
+        for (mesh.vertices) |vertex| {
             inline for (0..4) |lane| highest = @max(highest, vertex.joints[lane]);
         }
         if (highest >= joint_count) return error.JointIndexOutOfRange;
-        check(true, "every vertex joint index is under the skin's {d}", .{joint_count});
+        check(true, "mesh {d} joint indices are under the skin's {d}", .{ mesh_index, joint_count });
 
-        // The whole chain from the asset's inverse bind matrices to the
-        // matrices the shader reads, answered without a device.
-        //
-        // glTF 2.0 specification, 3.7.3.3: an inverse bind matrix takes the
-        // mesh into a joint's own space, and the joint's global transform takes
-        // it back out into the scene. Their product is the mesh's placement in
-        // the scene and does not depend on which joint it was taken from, so at
-        // the bind pose every joint matrix is the same matrix.
-        //
-        // That is the invariant, and it holds whatever the asset's placement
-        // is. A transposed matrix, a joint bound to the wrong slot or an
-        // inverse bind applied on the wrong side each break it, and on screen
-        // all three are the same torn mesh.
-        const bind_placement = skin.?.pose.joint_transforms[0];
+        // glTF 2.0 specification, 3.7.3.3: at the bind pose each joint matrix is
+        // the same placement, whatever that placement is. A transpose, a wrong
+        // slot or applying the inverse bind on the wrong side breaks this before
+        // all three become the same torn mesh on screen.
+        const bind_placement = skin.pose.joint_transforms[0];
         var worst_joint: f32 = 0;
-        for (skin.?.pose.joint_transforms) |joint| {
+        for (skin.pose.joint_transforms) |joint| {
             inline for (0..4) |row| {
                 inline for (0..4) |column| {
                     worst_joint = @max(worst_joint, @abs(joint[row][column] - bind_placement[row][column]));
@@ -216,20 +280,13 @@ pub fn main(process: std.process.Init.Minimal) !void {
         log.info("bind pose: joints disagree by at most {d:.6}", .{worst_joint});
         check(worst_joint < 1e-4, "every joint carries the same bind placement", .{});
 
-        // And what that one placement does to the mesh, which is where the
-        // asset's own orientation shows. Not a failure: a skeleton under a
-        // rotated node legitimately moves every vertex, and this says by how
-        // much before the device is asked to do the same.
         var worst_vertex_drift: f32 = 0;
-        for (source.vertices) |vertex| {
-            const skinned = skinnedPosition(&skin.?.pose, vertex);
+        for (mesh.vertices) |vertex| {
+            const skinned = skinnedPosition(&skin.pose, vertex);
             const placed = zm.mul(
                 zm.f32x4(vertex.position[0], vertex.position[1], vertex.position[2], 1),
                 bind_placement,
             );
-            // Against the placement rather than against the source: this is
-            // the per-vertex half, and it fails where a weight set does not sum
-            // to one or a joint index reaches the wrong matrix.
             inline for (0..3) |axis|
                 worst_vertex_drift = @max(worst_vertex_drift, @abs(skinned[axis] - placed[axis]));
         }
@@ -239,35 +296,31 @@ pub fn main(process: std.process.Init.Minimal) !void {
         });
     }
 
-    const material = &model.materials[source.material];
-    const base_colour_key = material.textures.base_colour.path;
-    var base_colour: ?DecodedImage = if (base_colour_key) |key|
-        try decodeEmbeddedImage(gpa, &model, key)
-    else
-        null;
-    defer if (base_colour) |*decoded| decoded.deinit(gpa);
-    if (base_colour) |decoded| {
-        log.info("base colour: decoded embedded image {d}x{d}", .{ decoded.cols, decoded.rows });
+    var world: res.Aabb = undefined;
+    for (model.meshes, 0..) |*mesh, index| {
+        var mesh_world = localBounds(mesh.vertices);
+        if (mesh.streams.skinned) {
+            const skin = skinForIndex(skins, mesh.skin.?) orelse return error.SkinnedMeshWithoutSkin;
+            mesh_world = scene.worldAabb(mesh_world, skin.pose.joint_transforms[0]);
+        }
+        world = if (index == 0) mesh_world else scene.unionAabb(world, mesh_world);
     }
-
-    const local = localBounds(source.vertices);
-    log.info("local bounds: [{d:.3} {d:.3} {d:.3}] to [{d:.3} {d:.3} {d:.3}]", .{
-        local.min[0], local.min[1], local.min[2],
-        local.max[0], local.max[1], local.max[2],
+    log.info("model bounds: [{d:.3} {d:.3} {d:.3}] to [{d:.3} {d:.3} {d:.3}]", .{
+        world.min[0], world.min[1], world.min[2],
+        world.max[0], world.max[1], world.max[2],
     });
     check(
-        local.min[0] <= local.max[0] and local.min[1] <= local.max[1] and local.min[2] <= local.max[2],
+        world.min[0] <= world.max[0] and world.min[1] <= world.max[1] and world.min[2] <= world.max[2],
         "bounds are not inverted",
         .{},
     );
 
-    // The transform the whole model is drawn with. Identity here: the importer
-    // has already baked every node's world matrix into the vertices, so a
-    // second one would apply the placement twice.
+    // The instance transform is identity: static vertices are already in world
+    // space, and the bind placement above carries skinned vertices there.
     const model_matrix = zm.identity();
-    const world = scene.worldAabb(local, model_matrix);
+    const identity_bounds = scene.worldAabb(world, model_matrix);
     check(
-        approxEqual(world.min, local.min) and approxEqual(world.max, local.max),
+        approxEqual(identity_bounds.min, world.min) and approxEqual(identity_bounds.max, world.max),
         "an identity transform leaves the bounds where they were",
         .{},
     );
@@ -346,49 +399,76 @@ pub fn main(process: std.process.Init.Minimal) !void {
     );
     var uploaded: gpu.Uploaded = uploaded: {
         errdefer batch.deinit();
-        const mesh_handle = try batch.addMesh(u32, .{
-            .vertices = source.vertices,
-            .indices = source.indices,
-            .streams = source.streams,
-        });
-        const set_handle = try batch.addTextureSet(.{
-            .base_colour = if (base_colour) |decoded| .{
-                .key = base_colour_key.?,
-                .source = .{ .rgba8 = .{
-                    .width = decoded.cols,
-                    .height = decoded.rows,
-                    .bytes = std.mem.sliceAsBytes(decoded.data),
-                } },
-                .sampler = material.textures.base_colour.sampler,
-            } else null,
-        });
-        _ = mesh_handle;
-        _ = set_handle;
+
+        for (model.meshes) |*mesh| {
+            _ = try batch.addMesh(u32, .{
+                .vertices = mesh.vertices,
+                .indices = mesh.indices,
+                .streams = mesh.streams,
+            });
+        }
+        for (model.materials, 0..) |*material, material_index| {
+            const base_colour_key = material.textures.base_colour.path;
+            var base_colour: ?DecodedImage = if (base_colour_key) |key|
+                try decodeEmbeddedImage(gpa, &model, key)
+            else
+                null;
+            defer if (base_colour) |*decoded| decoded.deinit(gpa);
+
+            if (base_colour) |decoded| {
+                log.info("material {d}: decoded base colour {d}x{d}", .{
+                    material_index,
+                    decoded.cols,
+                    decoded.rows,
+                });
+            }
+            _ = try batch.addTextureSet(.{
+                .base_colour = if (base_colour) |decoded| .{
+                    .key = base_colour_key.?,
+                    .source = .{ .rgba8 = .{
+                        .width = decoded.cols,
+                        .height = decoded.rows,
+                        .bytes = std.mem.sliceAsBytes(decoded.data),
+                    } },
+                    .sampler = material.textures.base_colour.sampler,
+                } else null,
+            });
+        }
         break :uploaded try batch.finish();
     };
     defer uploaded.deinit(gpa, &storage, &textures);
 
-    const mesh = storage.mesh(uploaded.meshes.items[0]).?;
-    const texture_set = storage.textureSet(uploaded.texture_sets.items[0]).?;
     check(
-        mesh.vertex_count == source.vertices.len,
-        "uploaded {d} vertices, the asset had {d}",
-        .{ mesh.vertex_count, source.vertices.len },
+        uploaded.meshes.items.len == model.meshes.len and
+            uploaded.texture_sets.items.len == model.materials.len,
+        "upload retained {d} meshes and {d} material sets",
+        .{ uploaded.meshes.items.len, uploaded.texture_sets.items.len },
     );
+
+    // Resolve pointers only after every insertion that can grow storage. No
+    // resource is added during the frame loop, so these remain stable until the
+    // uploaded residency is released.
+    const gpu_meshes = try gpa.alloc(*const gpu.Mesh, model.meshes.len);
+    defer gpa.free(gpu_meshes);
+    var uploaded_vertices: usize = 0;
+    var uploaded_indices: usize = 0;
+    var uploaded_bounds_match = true;
+    for (model.meshes, uploaded.meshes.items, gpu_meshes) |*source_mesh, handle, *gpu_mesh| {
+        const resident = storage.mesh(handle) orelse return error.UploadedMeshMissing;
+        gpu_mesh.* = resident;
+        uploaded_vertices += resident.vertex_count;
+        uploaded_indices += resident.index_count;
+        const expected = localBounds(source_mesh.vertices);
+        uploaded_bounds_match = uploaded_bounds_match and
+            approxEqual(resident.bounds.box.min, expected.min) and
+            approxEqual(resident.bounds.box.max, expected.max);
+    }
     check(
-        mesh.index_count == source.indices.len,
-        "uploaded {d} indices, the asset had {d}",
-        .{ mesh.index_count, source.indices.len },
+        uploaded_vertices == total_vertices and uploaded_indices == total_indices,
+        "uploaded {d} vertices and {d} indices",
+        .{ uploaded_vertices, uploaded_indices },
     );
-    log.info("bounds spheres: vertices {d:.4}, enclosing box {d:.4}", .{
-        mesh.bounds.sphere.radius,
-        sphere.radius,
-    });
-    check(
-        approxEqual(mesh.bounds.box.min, local.min) and approxEqual(mesh.bounds.box.max, local.max),
-        "uploaded bounds reproduce the source box",
-        .{},
-    );
+    check(uploaded_bounds_match, "every uploaded mesh reproduces its source box", .{});
 
     var samplers: gpu.SamplerCache = .init(&context);
     defer samplers.deinit(gpa);
@@ -402,23 +482,49 @@ pub fn main(process: std.process.Init.Minimal) !void {
         .{ .width = extent.width, .height = extent.height },
         frames_in_flight,
         frame_capacity,
+        @intCast(model.materials.len),
         swapchain.surface_format.format,
         post_sampler,
     );
     defer renderer.deinit();
-    renderer.bindMaterial(texture_set);
+    for (uploaded.texture_sets.items, 0..) |handle, material_index| {
+        const texture_set = storage.textureSet(handle) orelse return error.UploadedTextureSetMissing;
+        try renderer.setMaterialTextures(@intCast(material_index), texture_set);
+    }
 
-    // A clear that is not black, so a window showing it proves the whole post
-    // chain carried the main pass's target to the screen, and a window that is
-    // still black narrows the fault to that chain rather than to the geometry.
-    renderer.clear_colour = .{ 0.05, 0.10, 0.20, 1 };
+    const post_settings: gpu.PostSettings = .{};
 
-    log.info("diagnostic: clear [{d:.2} {d:.2} {d:.2}], culling {s}", .{
+    // The visible field carries HDR values in every channel. A copied post
+    // leaves them above display range; the selected operator maps them to the
+    // bounded blue field printed beside the source.
+    renderer.clear_colour = .{ 1.25, 2, 3, 1 };
+    const mapped_clear = try gpu.toneMap(.{
         renderer.clear_colour[0],
         renderer.clear_colour[1],
         renderer.clear_colour[2],
-        if (renderer.cull_mode.back_bit) "back faces" else "none",
-    });
+    }, post_settings);
+    log.info(
+        "diagnostic: HDR clear [{d:.2} {d:.2} {d:.2}] maps to [{d:.3} {d:.3} {d:.3}] at exposure {d:.2}",
+        .{
+            renderer.clear_colour[0],
+            renderer.clear_colour[1],
+            renderer.clear_colour[2],
+            mapped_clear[0],
+            mapped_clear[1],
+            mapped_clear[2],
+            post_settings.exposure,
+        },
+    );
+    check(
+        renderer.clear_colour[0] > 1 and
+            renderer.clear_colour[1] > 1 and
+            renderer.clear_colour[2] > 1 and
+            mapped_clear[0] < mapped_clear[1] and
+            mapped_clear[1] < mapped_clear[2] and
+            mapped_clear[2] < 1,
+        "the diagnostic separates copied HDR from bounded tonemapping",
+        .{},
+    );
 
     log.info("attachments: hdr {t}, depth {t}, present {t}", .{
         renderer.hdr.format,
@@ -441,21 +547,13 @@ pub fn main(process: std.process.Init.Minimal) !void {
 
     // The camera, placed so the whole model fits. Everything below is host-side
     // and is the answer the device is about to be given.
-    const distance = sphere.radius * 3.0 + 1.0;
     var camera: scene.Camera = .{
-        .anchor = .{ .orbit = .{
-            .target = .{ sphere.centre[0], sphere.centre[1], sphere.centre[2] },
-            .distance = distance,
-        } },
+        .anchor = .{ .orbit = .{ .target = @splat(0), .distance = 0.01 } },
         .yaw = -std.math.pi / 4.0,
         .pitch = -0.35,
     };
-    camera.projection = .{ .perspective = .{
-        .near = @max(distance * 0.01, 0.01),
-        .far = distance * 10.0,
-    } };
-
     const aspect = @as(f32, @floatFromInt(extent.width)) / @as(f32, @floatFromInt(extent.height));
+    const distance = frameCamera(&camera, sphere, aspect);
     const view_projection = try camera.viewProjection(aspect);
     const placement = camera.placement();
     log.info("camera: eye [{d:.3} {d:.3} {d:.3}] distance {d:.3} aspect {d:.4}", .{
@@ -496,21 +594,97 @@ pub fn main(process: std.process.Init.Minimal) !void {
     // Where this frame's instances put their joints. Planned once, because the
     // draw list does not change here; the plan is a pure function of the poses
     // being drawn, so replanning every frame would return the same answer.
-    const poses = [instance_count]?*const res.SkeletonPose{
-        if (skin) |*owned| &owned.pose else null,
-    };
-    var joint_bases: [instance_count]u32 = undefined;
-    const joint_total = try scene.assignJointOffsets(&poses, &joint_bases, @intCast(frame_capacity.joints));
+    const poses = try gpa.alloc(?*const res.SkeletonPose, model.meshes.len);
+    defer gpa.free(poses);
+    for (model.meshes, poses) |*mesh, *pose| {
+        pose.* = if (mesh.streams.skinned)
+            &(skinForIndex(skins, mesh.skin.?) orelse return error.SkinnedMeshWithoutSkin).pose
+        else
+            null;
+    }
+    const joint_bases = try gpa.alloc(u32, model.meshes.len);
+    defer gpa.free(joint_bases);
+    const joint_total = try scene.assignJointOffsets(poses, joint_bases, @intCast(frame_capacity.joints));
     check(
         joint_total <= frame_capacity.joints,
         "the frame's {d} joint(s) fit an array of {d}",
         .{ joint_total, frame_capacity.joints },
     );
 
-    const instances = [instance_count]gpu.Instance{.{
-        .model = model_matrix,
-        .joint_base = jointBase(joint_bases[0]),
-    }};
+    const instances = try gpa.alloc(gpu.Instance, model.meshes.len);
+    defer gpa.free(instances);
+    const draw_candidates = try gpa.alloc(RecordPlan.Draw, model.meshes.len);
+    defer gpa.free(draw_candidates);
+    const draw_order = try gpa.alloc(u32, model.meshes.len);
+    defer gpa.free(draw_order);
+    for (model.meshes, gpu_meshes, joint_bases, instances, draw_candidates, draw_order, 0..) |
+        *source_mesh,
+        gpu_mesh,
+        joint_base,
+        *instance,
+        *candidate,
+        *order,
+        index,
+    | {
+        instance.* = .{
+            .model = model_matrix,
+            .joint_base = jointBase(joint_base),
+            .material_index = source_mesh.material,
+        };
+
+        candidate.* = .{
+            .mesh = gpu_mesh,
+            .material = source_mesh.material,
+            // Imported static geometry may combine nodes whose baked transforms
+            // have opposite determinant signs, and that sign is not retained in
+            // the mesh product. Skinning has the same problem per deformation.
+            // No culling is the only conservative state until scene input can
+            // prove one winding for the whole batch.
+            .face_culling = .none,
+        };
+        order.* = @intCast(index);
+    }
+
+    const scene_batch_storage = try gpa.alloc(RecordPlan.Batch, model.meshes.len);
+    defer gpa.free(scene_batch_storage);
+    const scene_batches = try RecordPlan.build(draw_candidates, draw_order, scene_batch_storage);
+    const record_batch_storage = try gpa.alloc(gpu.RecordBatch, scene_batches.len);
+    defer gpa.free(record_batch_storage);
+    const record_batches = try translateRecordBatches(scene_batches, record_batch_storage);
+
+    var translation_matches = true;
+    var has_non_zero_first_instance = false;
+    for (scene_batches, record_batches, 0..) |planned, record, index| {
+        const culling_matches = switch (planned.face_culling) {
+            .none => !record.cull_mode.front_bit and !record.cull_mode.back_bit,
+            .back => record.cull_mode.back_bit and !record.cull_mode.front_bit,
+            .front => record.cull_mode.front_bit and !record.cull_mode.back_bit,
+        };
+        translation_matches = translation_matches and
+            record.mesh == planned.mesh and
+            record.material_index == planned.material and
+            record.first_instance == planned.first_instance and
+            record.instance_count == planned.instance_count and
+            culling_matches;
+        has_non_zero_first_instance = has_non_zero_first_instance or record.first_instance > 0;
+        log.info("batch {d}: material {d}, instances [{d}..{d}), culling {t}", .{
+            index,
+            planned.material,
+            planned.first_instance,
+            planned.first_instance + planned.instance_count,
+            planned.face_culling,
+        });
+    }
+    check(translation_matches, "scene batches survive the explicit GPU translation", .{});
+    if (record_batches.len > 1) {
+        check(
+            has_non_zero_first_instance,
+            "a multi-batch frame records a non-zero firstInstance",
+            .{},
+        );
+    }
+
+    var joint_storage: [frame_capacity.joints]gpu.Joint = undefined;
 
     // Where playback starts. The clock is monotonic from its own init, so this
     // is the first frame's zero rather than the process's.
@@ -536,13 +710,11 @@ pub fn main(process: std.process.Init.Minimal) !void {
     // normals the device is about to be handed. A black picture with every
     // vertex facing away is a scene, not a fault; a black picture with most of
     // them facing the light is one.
-    reportLitFraction(source.vertices, live);
+    reportLitFraction(model.meshes, live);
 
     // The normal as the device will read it, not as the asset stated it. It is
-    // packed 10-10-10-2 on upload and expanded by the vertex input stage, and
-    // until something shaded with it no run had ever looked at what comes back
-    // out.
-    reportPackedNormals(source.vertices);
+    // packed 10-10-10-2 on upload and expanded by the vertex input stage.
+    reportPackedNormals(model.meshes);
 
     log.info("checks before the first frame: {d} failed", .{failures});
     log.info("validation errors before the first frame: {d}", .{gpu.validationErrorCount()});
@@ -576,9 +748,9 @@ pub fn main(process: std.process.Init.Minimal) !void {
             try swapchain.recreate(surface_extent);
             const size = swapchain.currentExtent();
             try renderer.resize(.{ .width = size.width, .height = size.height });
-            renderer.bindMaterial(texture_set);
             stale = false;
             const resized_aspect = @as(f32, @floatFromInt(size.width)) / @as(f32, @floatFromInt(size.height));
+            _ = frameCamera(&camera, sphere, resized_aspect);
             const target = renderer.targetExtent();
             log.info("resized: swapchain {d}x{d}, main pass target {d}x{d}", .{
                 size.width, size.height, target.width, target.height,
@@ -609,45 +781,44 @@ pub fn main(process: std.process.Init.Minimal) !void {
         const frame_view_projection = try camera.viewProjection(frame_aspect);
         const eye = camera.placement().position;
 
-        // The pose this frame draws. Sampling writes the clip's channels over
-        // the locals and leaves every slot it does not target at its bind
-        // value, so a clip that moves part of a skeleton is not a skeleton
-        // half undefined.
-        var joint_matrices: []const gpu.Joint = &.{};
-        if (skin) |*owned| {
-            if (owned.clip) |clip| {
-                const elapsed = @as(f32, @floatFromInt(clock.now() - started)) / std.time.ns_per_s;
+        // Sampling writes each clip's channels over its pose's locals and
+        // leaves untargeted slots at their bind value. Evaluate each unique pose
+        // once, then copy it into every draw-order run the scene plan assigned.
+        const elapsed = @as(f32, @floatFromInt(clock.now() - started)) / std.time.ns_per_s;
+        for (skins) |*skin| {
+            if (skin.clip) |clip| {
                 try clip.sample(
                     clip.cursorAt(elapsed),
-                    owned.pose.local_translations,
-                    owned.pose.local_rotations,
-                    owned.pose.local_scales,
+                    skin.pose.local_translations,
+                    skin.pose.local_rotations,
+                    skin.pose.local_scales,
                 );
             }
-            owned.pose.evaluate();
-            joint_matrices = owned.pose.joint_transforms;
+            skin.pose.evaluate();
         }
+        for (poses, joint_bases) |pose, joint_base| {
+            const live_pose = pose orelse continue;
+            const first: usize = @intCast(joint_base);
+            @memcpy(joint_storage[first..][0..live_pose.joint_transforms.len], live_pose.joint_transforms);
+        }
+        const joint_matrices = joint_storage[0..joint_total];
 
         try renderer.update(frame_index, .{
             .camera = .{
                 .view_projection = frame_view_projection,
                 .position = .{ eye[0], eye[1], eye[2], 1 },
             },
-            .models = &instances,
+            .models = instances,
             .joints = joint_matrices,
             .lights = live,
         });
 
         const commands = try frame.beginCommands(&context);
-        renderer.record(commands, frame_index, .{
+        try renderer.record(commands, frame_index, .{
             .image = swapchain.images[acquired.image_index].image,
             .view = swapchain.images[acquired.image_index].view,
             .extent = .{ .width = current.width, .height = current.height },
-        }, .{
-            .mesh = mesh,
-            .textures = texture_set,
-            .instances = &instances,
-        });
+        }, record_batches, post_settings);
         try frame.submit(&context, .{
             .wait = frame.image_acquired,
             // The first thing the frame does to the presentable image is render
@@ -786,71 +957,85 @@ fn pack(light: scene.Light) gpu.LightUniform {
     };
 }
 
-// How much of the mesh faces a light, counted the way the fragment shader
+// How much of the model faces a light, counted the way the fragment shader
 // decides it: a vertex is lit when its normal has a positive dot with the
 // direction toward some light.
 //
 // Vertex normals rather than fragments, so this is an estimate. It answers the
 // only question a black window raises here, which is whether the geometry is
 // pointing at the light at all.
-fn reportLitFraction(vertices: []const res.Vertex3D, lights: []const gpu.LightUniform) void {
+fn reportLitFraction(meshes: []const gltf.importer.Mesh, lights: []const gpu.LightUniform) void {
     var lit: usize = 0;
-    for (vertices) |vertex| {
-        for (lights) |light| {
-            const to_light: res.Vec3 = switch (light.kind) {
-                .directional => .{ -light.direction[0], -light.direction[1], -light.direction[2] },
-                .point, .spot => .{
-                    light.position[0] - vertex.position[0],
-                    light.position[1] - vertex.position[1],
-                    light.position[2] - vertex.position[2],
-                },
-            };
-            if (@reduce(.Add, vertex.normal * to_light) > 0) {
-                lit += 1;
-                break;
+    var total: usize = 0;
+    for (meshes) |mesh| {
+        total += mesh.vertices.len;
+        for (mesh.vertices) |vertex| {
+            for (lights) |light| {
+                const to_light: res.Vec3 = switch (light.kind) {
+                    .directional => .{ -light.direction[0], -light.direction[1], -light.direction[2] },
+                    .point, .spot => .{
+                        light.position[0] - vertex.position[0],
+                        light.position[1] - vertex.position[1],
+                        light.position[2] - vertex.position[2],
+                    },
+                };
+                if (@reduce(.Add, vertex.normal * to_light) > 0) {
+                    lit += 1;
+                    break;
+                }
             }
         }
     }
-    log.info("lighting: {d} of {d} vertices face a light", .{ lit, vertices.len });
+    log.info("lighting: {d} of {d} vertices face a light", .{ lit, total });
     check(lit > 0, "some of the model faces a light", .{});
 }
 
-// The largest distance between a normal as authored and the same normal after
-// the round trip through the packed vertex.
+// The largest distance between an authored normal and the same normal after the
+// round trip through the packed vertex, over every mesh the frame uploads.
 //
 // Vulkan specification, Fixed-Point Data Conversion: a 10-bit snorm reads back
 // as max(c / 511, -1), so a component resolves to about 1/511 and the worst a
 // direction can move is a little over that.
-fn reportPackedNormals(vertices: []const res.Vertex3D) void {
+fn reportPackedNormals(meshes: []const gltf.importer.Mesh) void {
     var worst: f32 = 0;
+    var worst_mesh: usize = 0;
     var worst_at: usize = 0;
-    for (vertices, 0..) |vertex, index| {
-        // Through `packVertex`, which is what the upload calls. Packing the
-        // components directly would test the arithmetic and not the path.
-        const word = gpu.packVertex(&vertex).normal;
-        const unpacked = res.Vec3{
-            unpackSnorm10(word),
-            unpackSnorm10(word >> 10),
-            unpackSnorm10(word >> 20),
-        };
-        const drift = @sqrt(@reduce(.Add, (unpacked - vertex.normal) * (unpacked - vertex.normal)));
-        if (drift > worst) {
-            worst = drift;
-            worst_at = index;
+    for (meshes, 0..) |mesh, mesh_index| {
+        for (mesh.vertices, 0..) |vertex, index| {
+            // Through `packVertex`, which is what the upload calls. Packing the
+            // components directly would test the arithmetic and not the path.
+            const word = gpu.packVertex(&vertex).normal;
+            const unpacked = res.Vec3{
+                unpackSnorm10(word),
+                unpackSnorm10(word >> 10),
+                unpackSnorm10(word >> 20),
+            };
+            const drift = @sqrt(@reduce(.Add, (unpacked - vertex.normal) * (unpacked - vertex.normal)));
+            if (drift > worst) {
+                worst = drift;
+                worst_mesh = mesh_index;
+                worst_at = index;
+            }
         }
     }
-    log.info("normals: vertex 0 source [{d:.3} {d:.3} {d:.3}] packs to 0x{X:0>8} at byte {d} of {d}", .{
-        vertices[0].normal[0],
-        vertices[0].normal[1],
-        vertices[0].normal[2],
-        gpu.packVertex(&vertices[0]).normal,
+
+    const first = &meshes[0].vertices[0];
+    const worst_source = meshes[worst_mesh].vertices[worst_at];
+    log.info("normals: first source [{d:.3} {d:.3} {d:.3}] packs to 0x{X:0>8} at byte {d} of {d}", .{
+        first.normal[0],
+        first.normal[1],
+        first.normal[2],
+        gpu.packVertex(first).normal,
         @offsetOf(gpu.GpuVertex, "normal"),
         @sizeOf(gpu.GpuVertex),
     });
-    log.info("normals: worst packing drift {d:.5} at vertex {d}, source [{d:.3} {d:.3} {d:.3}]", .{
-        worst,                        worst_at,
-        vertices[worst_at].normal[0], vertices[worst_at].normal[1],
-        vertices[worst_at].normal[2],
+    log.info("normals: worst packing drift {d:.5} at mesh {d} vertex {d}, source [{d:.3} {d:.3} {d:.3}]", .{
+        worst,
+        worst_mesh,
+        worst_at,
+        worst_source.normal[0],
+        worst_source.normal[1],
+        worst_source.normal[2],
     });
     // Three components each within one step of 1/511, so the bound is the
     // length of that: sqrt(3)/511.
