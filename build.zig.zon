@@ -4,7 +4,19 @@
     .version = "0.0.1",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .lenore_gltf = .{ .path = "lenore-gltf" },
+        .lenore_gpu = .{ .path = "lenore-gpu" },
         .lenore_platform = .{ .path = "lenore-platform" },
+        .lenore_resources = .{ .path = "lenore-resources" },
+        .lenore_scene = .{ .path = "lenore-scene" },
+        .zignal = .{
+            .url = "https://github.com/arrufat/zignal/archive/refs/tags/0.10.0.tar.gz",
+            .hash = "zignal-0.10.0-OrZ3syf3JwDM3rBtoTFDXQT4iUJeoPqVaAJDHAjtM7jN",
+        },
+        .zmath = .{
+            .url = "git+https://github.com/zig-gamedev/zmath.git#9e42b04a24c970a297b365f3d3022f92dbf3219d",
+            .hash = "zmath-0.11.0-dev-wjwivTwtAwDOjG2_KGP-HLtHrONfsFfHttalmxFAGVAK",
+        },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE", "NOTICE.md", "AUTHORS" },
+    .paths = .{ "build.zig", "build.zig.zon", "examples", "src", "LICENSE", "NOTICE.md", "AUTHORS" },
 }

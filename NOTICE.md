@@ -42,11 +42,20 @@ that point remain available under BSD-3-Clause; nothing is withdrawn.
 Dependencies are consumed unmodified and keep their own licences. Their terms
 are not affected by this file:
 
-| Dependency | Used for |
-|---|---|
-| vulkan-zig (Snektron) | Vulkan bindings generated from `vk.xml` |
-| zmath (zig-gamedev) | SIMD math |
-| zglfw (zig-gamedev) | the current platform backend, to be replaced |
+| Dependency | Licence | Used for |
+|---|---|---|
+| vulkan-zig (Snektron) | MIT, © Robin Voetter | Vulkan bindings generated from `vk.xml` |
+| zmath (zig-gamedev) | MIT, © 2021 Michal Ziulek, © 2024 zig-gamedev contributors | SIMD math |
+| zglfw (zig-gamedev) | MIT, © 2022 Michal Ziulek | the current platform backend, to be replaced |
+| system_sdk (zig-gamedev) | MIT, © 2021 Michal Ziulek | system libraries zglfw links against |
+| zignal | MIT, © 2024–2026 B Factory Inc, © Zignal Contributors | source PNG decoding in composition tools |
+
+All five are MIT, whose only condition is that the copyright notice and the
+permission notice travel with copies and substantial portions. Nothing here
+vendors their source, so the obligation is discharged by this table and by the
+`LICENSE` file each package carries in the fetched package directory. MIT
+imposes no term that BSD-3-Clause does not already accept, and none of it
+constrains the intended move to Apache-2.0.
 
 The Vulkan registry (`vk/vk.xml`) is published by The Khronos Group under its
 own terms.
