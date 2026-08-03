@@ -3,6 +3,7 @@ zig-out/
 local/
 zig-pkg/
 .claude-variants/
+.piold/
 .mcp.json
 CLAUDE.md
 .README.md
