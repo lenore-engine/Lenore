@@ -15,6 +15,23 @@ const memory_config: gpu.MemoryConfig = .{
     .readback_buffer_block_size = 8 << 20,
 };
 
+// Deliberately far below the module's default of 256 KiB blocks and 32 MiB.
+// Growing the pool, exhausting it, stalling and reclaiming it are the paths that
+// only a load bigger than the ceiling reaches, and a small ceiling is how this
+// example reaches them without a large asset.
+const staging_config: gpu.StagingConfig = .{
+    .block_capacity = 64 << 10,
+    .max_blocks = 4,
+};
+
+// Four times the whole staging pool, so the copy below cannot be anything but a
+// sequence of chunks with stalls between them.
+const segmented_bytes: u64 = 1 << 20;
+
+// What the host round trip below writes, copies to device memory, copies back
+// and reads.
+const round_trip_bytes: u64 = 256;
+
 pub fn main(process: std.process.Init.Minimal) !void {
     const gpa = if (checking) debug_allocator.allocator() else std.heap.smp_allocator;
     defer if (checking) {
@@ -113,36 +130,13 @@ pub fn main(process: std.process.Init.Minimal) !void {
         separated,
     });
 
-    // Upload memory is persistently mapped and coherent, so the write below needs
+    // Upload memory is persistently mapped and coherent, so the writes below need
     // no flush. Ordering against the GPU read is what the submit provides: the
     // host write completes before vkQueueSubmit2, and Vulkan specification,
     // Host Write Ordering Guarantees, makes that write visible to the copy
     // without a barrier.
-    // Large enough for a 2048-square BC7 mip chain. BC7 spends one byte per
-    // texel, so the base level is 4 MiB and the chain converges on four thirds
-    // of that, a little under 5.6 MiB. A smaller arena is not an error: reserve
-    // reports that the request never fits, as distinct from not fitting right
-    // now.
-    var staging: gpu.StagingArena = try .init(&context, &allocator, 8 << 20);
+    var staging: gpu.StagingPool = try .init(&context, &allocator, gpa, staging_config);
     defer staging.deinit();
-
-    // Two reservations, so the second one's offset is what makes the copy region
-    // explicit rather than incidental.
-    const filler = try staging.reserve(64, 4);
-    @memset(filler.bytes, 0x5A);
-    const vertex_bytes = try staging.reserve(256, 4);
-    @memset(vertex_bytes.bytes, 0xA5);
-
-    // One 4x4 RGBA level, tightly packed. A block-compressed format would size
-    // its levels by block count instead, which is the container's job and not
-    // the image's.
-    const texel_size = 4;
-    const texture_extent = 4;
-    const texture_bytes = try staging.reserve(
-        texture_extent * texture_extent * texel_size,
-        texel_size,
-    );
-    @memset(texture_bytes.bytes, 0xFF);
 
     var vertices: gpu.Buffer = try .init(
         &context,
@@ -156,20 +150,66 @@ pub fn main(process: std.process.Init.Minimal) !void {
     );
     defer vertices.deinit();
 
-    // Cold setup: one copy, submitted on its own and waited for. A frame loop
-    // would batch this instead of idling the queue per command buffer.
+    // A transfer larger than the whole pool, so every branch of the placement
+    // policy runs: a fresh block, a full one, the ceiling, and the stall that
+    // reclaims them all.
+    var segmented: gpu.Buffer = try .init(
+        &context,
+        &allocator,
+        segmented_bytes,
+        .{ .transfer_dst_bit = true },
+        .device,
+    );
+    defer segmented.deinit();
+
+    // Cold setup: copies recorded into one transfer, which submits and waits as
+    // often as reclaiming the pool requires. A frame loop would not idle the
+    // queue like this.
     var setup_pool: gpu.OneShotPool = try .init(&context);
     defer setup_pool.deinit(&context);
 
-    // One copy, recorded and submitted on its own. Everything below goes through
-    // the upload transaction instead; this stays because it is the only direct
-    // use of a copy region with a non-zero source offset.
-    const setup = try gpu.beginOneShot(&context, setup_pool.handle);
-    try vertices.recordCopyFrom(staging.source(), setup, .{
-        .source_offset = vertex_bytes.offset,
-        .size = vertex_bytes.bytes.len,
-    });
-    try gpu.submitOneShotAndWait(&context, setup_pool.handle, setup);
+    var setup: gpu.Transfer = try .begin(&context, setup_pool.handle, &staging);
+    {
+        errdefer setup.deinit();
+
+        // Two reservations, so the second one's offset is what makes the copy
+        // region explicit rather than incidental.
+        const filler = try setup.reserve(.{ .size = 64, .alignment = 4 });
+        @memset(filler.bytes, 0x5A);
+        const vertex_bytes = try setup.reserve(.{ .size = round_trip_bytes, .alignment = 4 });
+        @memset(vertex_bytes.bytes, 0xA5);
+        try vertices.recordCopyFrom(vertex_bytes.source, setup.commandBuffer(), .{
+            .source_offset = vertex_bytes.offset,
+            .size = vertex_bytes.bytes.len,
+        });
+
+        // A reservation returns what fits rather than refusing what does not, so
+        // the loop is the caller's whole share of the work. The command buffer
+        // is read inside it, because a stall retires the one read before.
+        var written: u64 = 0;
+        var chunks: u32 = 0;
+        while (written < segmented_bytes) {
+            const chunk = try setup.reserve(.{
+                .size = segmented_bytes - written,
+                .alignment = 4,
+            });
+            @memset(chunk.bytes, 0x33);
+            try segmented.recordCopyFrom(chunk.source, setup.commandBuffer(), .{
+                .source_offset = chunk.offset,
+                .destination_offset = written,
+                .size = chunk.bytes.len,
+            });
+            written += chunk.bytes.len;
+            chunks += 1;
+        }
+
+        try setup.finish();
+        std.log.info(
+            "staging: {d} bytes in {d} chunks of at most {d}, {d} block(s) and {d} stall(s)",
+            .{ segmented_bytes, chunks, staging.blockCapacity(), staging.blockCount(), setup.flushes },
+        );
+    }
+    setup.deinit();
 
     // The round trip: host write into mapped upload memory, copy to device-local
     // memory, copy back into mapped readback memory, host read. It verifies the
@@ -185,10 +225,10 @@ pub fn main(process: std.process.Init.Minimal) !void {
     defer readback.deinit();
 
     const verify = try gpu.beginOneShot(&context, setup_pool.handle);
-    try readback.recordCopyFrom(&vertices, verify, .{ .size = vertex_bytes.bytes.len });
+    try readback.recordCopyFrom(&vertices, verify, .{ .size = round_trip_bytes });
     try gpu.submitOneShotAndWait(&context, setup_pool.handle, verify);
 
-    const returned = readback.mapped().?[0..vertex_bytes.bytes.len];
+    const returned = readback.mapped().?[0..round_trip_bytes];
     var intact = true;
     for (returned) |byte| intact = intact and byte == 0xA5;
     std.log.info("readback: {d} bytes, contents intact {}", .{ returned.len, intact });
@@ -199,12 +239,13 @@ pub fn main(process: std.process.Init.Minimal) !void {
     var frame: gpu.Frame = try .init(&context);
     defer frame.deinit(&context);
 
-    // The texture cache records one upload per fallback, so it needs a
-    // submission of its own before anything can bind them.
-    const cache_setup = try gpu.beginOneShot(&context, setup_pool.handle);
-    var textures: gpu.TextureCache = try .init(&context, &allocator, gpa, &staging, cache_setup);
+    // The texture cache records one upload per fallback, so it needs a transfer
+    // of its own to finish before anything can bind them.
+    var cache_setup: gpu.Transfer = try .begin(&context, setup_pool.handle, &staging);
+    var textures: gpu.TextureCache = try .init(&context, &allocator, gpa, &cache_setup);
     defer if (textures.deinit() == .leak) std.log.err("texture references outstanding", .{});
-    try gpu.submitOneShotAndWait(&context, setup_pool.handle, cache_setup);
+    try cache_setup.finish();
+    cache_setup.deinit();
 
     var storage: gpu.ResourceStorage = .empty;
     defer storage.deinit(gpa);
@@ -231,8 +272,8 @@ pub fn main(process: std.process.Init.Minimal) !void {
     const quad_indices = [_]u16{ 0, 1, 2, 2, 3, 0 };
     const morph_positions = [_]f32{0.0} ** (quad.len * 2 * 3);
 
-    // The transaction: every copy into one command buffer, submitted once. A
-    // failure anywhere below rolls the whole thing back, command buffer first.
+    // The transaction: every copy through one transfer, and a failure anywhere
+    // below rolls the whole thing back, the transfer first.
     var batch = try gpu.UploadBatch.begin(
         gpa,
         &context,
@@ -253,10 +294,10 @@ pub fn main(process: std.process.Init.Minimal) !void {
         });
 
         const set_handle = try batch.addTextureSet(.{
-            .base_colour = if (ktx2_bytes) |bytes| .{
+            .base_colour = if (ktx2_bytes) |bytes| .{ .request = .{
                 .key = texture_path.?,
                 .source = .{ .ktx2 = bytes },
-            } else null,
+            } } else null,
         });
 
         const mesh = storage.mesh(mesh_handle).?;
@@ -287,8 +328,8 @@ pub fn main(process: std.process.Init.Minimal) !void {
     });
 
     // A batch dropped without finishing, which is the path the transaction exists
-    // for. It frees its command buffer before destroying what it registered,
-    // because that buffer holds commands naming those resources.
+    // for. It retires its transfer before destroying what it registered, because
+    // the command buffer holds commands naming those resources.
     {
         var rolled_back = try gpu.UploadBatch.begin(
             gpa,
@@ -328,15 +369,15 @@ pub fn main(process: std.process.Init.Minimal) !void {
     // Binding is state, valid outside a render pass. Drawing is not, so
     // Mesh.draw stays uncompiled until there is one.
     const binding = try gpu.beginOneShot(&context, setup_pool.handle);
-    storage.mesh(uploaded.meshes.items[0]).?.bind(&context, binding);
+    storage.mesh(uploaded.meshes.items[0]).?.bind(&context, binding, null);
     try gpu.submitOneShotAndWait(&context, setup_pool.handle, binding);
 
-    // Every submission has completed, so the arena is free again. Nothing here
-    // tracks that for the caller.
-    staging.reset();
-    std.log.info("staging: {d} of {d} bytes free after reset", .{
-        staging.remaining(),
-        staging.capacity(),
+    // Every transfer above finished, and finishing is what reclaims the blocks,
+    // so what is left is the memory the pool grew to rather than anything still
+    // held.
+    std.log.info("staging: {d} block(s) resident, {d} bytes", .{
+        staging.blockCount(),
+        staging.residentBytes(),
     });
 
     // Samplers are cached by value, so the same configuration asked for twice is
