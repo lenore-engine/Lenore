@@ -252,7 +252,10 @@ pub fn main(process: std.process.Init.Minimal) !void {
 
     // A KTX2 file to load, if one was named. Without it every slot binds its
     // neutral fallback, which is the path a material without textures takes.
-    var arguments: std.process.Args.Iterator = .init(process.args);
+    // initAllocator because on Windows there is no other: the iterator owns the
+    // buffer its arguments are decoded into, and `texture_path` points into it.
+    var arguments: std.process.Args.Iterator = try .initAllocator(process.args, gpa);
+    defer arguments.deinit();
     _ = arguments.skip();
     const texture_path = arguments.next();
     const ktx2_bytes: ?[]u8 = if (texture_path) |path|

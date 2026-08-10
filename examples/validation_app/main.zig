@@ -130,8 +130,9 @@ const Arguments = struct {
     bloom: bool = true,
     bloom_settings: gpu.BloomSettings = .{},
 
-    fn parse(process: std.process.Init.Minimal) !Arguments {
-        var iterator: std.process.Args.Iterator = .init(process.args);
+    // The iterator is the caller's: on Windows it owns the buffer the arguments
+    // were decoded into, and the paths returned here point into it.
+    fn parse(iterator: *std.process.Args.Iterator) !Arguments {
         _ = iterator.skip();
 
         var positional: [2]?[]const u8 = .{ null, null };
@@ -551,7 +552,11 @@ pub fn main(process: std.process.Init.Minimal) !void {
     const clock: platform.Clock = .init(io);
     var timer: lenore.PhaseTimer = .begin(clock);
 
-    const arguments = try Arguments.parse(process);
+    // initAllocator because on Windows there is no other. It outlives the
+    // Arguments below, whose paths point into it.
+    var argument_iterator: std.process.Args.Iterator = try .initAllocator(process.args, gpa);
+    defer argument_iterator.deinit();
+    const arguments = try Arguments.parse(&argument_iterator);
 
     // The loader confines every reference a document makes to a root, so it
     // takes a directory and a name inside it rather than a path. Splitting the

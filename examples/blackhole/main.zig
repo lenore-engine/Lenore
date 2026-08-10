@@ -574,7 +574,10 @@ pub fn main(process: std.process.Init.Minimal) !void {
     var tier: usize = default_tier;
     var spin: f32 = 1;
     {
-        var iterator: std.process.Args.Iterator = .init(process.args);
+        // initAllocator because on Windows there is no other. Nothing outlives
+        // the block: what the parse keeps is a tier index and a sign.
+        var iterator: std.process.Args.Iterator = try .initAllocator(process.args, gpa);
+        defer iterator.deinit();
         _ = iterator.skip();
         while (iterator.next()) |argument| {
             if (std.mem.startsWith(u8, argument, "--tier=")) {

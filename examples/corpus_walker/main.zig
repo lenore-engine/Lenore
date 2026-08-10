@@ -559,7 +559,11 @@ pub fn main(process: std.process.Init.Minimal) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var arguments: std.process.Args.Iterator = .init(process.args);
+    // initAllocator because on Windows there is no other: the iterator owns the
+    // buffer its arguments are decoded into, and the paths below point into it
+    // for the length of the run.
+    var arguments: std.process.Args.Iterator = try .initAllocator(process.args, gpa);
+    defer arguments.deinit();
     _ = arguments.skip();
 
     var root_path: ?[]const u8 = null;
