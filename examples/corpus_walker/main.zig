@@ -453,6 +453,7 @@ const Walker = struct {
     // away wherever the operator had flown to, which is the one thing this
     // application exists to let them do; `f` asks for the framing back.
     pub fn onResize(_: *Walker, _: *lenore.Engine, _: platform.Extent2D) !void {}
+    pub fn onCompute(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
 
     pub fn onRecord(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onFrame(

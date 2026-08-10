@@ -349,6 +349,7 @@ const Harness = struct {
         reportNdcExtent(view_projection, self.bounds, ratio, extent);
         reportUpAxis(gpu.vulkanClip(view_projection), self.bounds, extent);
     }
+    pub fn onCompute(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onRecord(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
 
     pub fn onFrame(

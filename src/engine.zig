@@ -37,13 +37,16 @@ const Level = level_module.Level;
 // current one, without the latency a deeper queue adds.
 const frames_in_flight = 2;
 
-// What runs on top of the loop. Every driver declares all four, and they are
+// What runs on top of the loop. Every driver declares all five, and they are
 // called at the one point in the frame where each is answerable:
 //
 //   onEvent(driver, engine, event) !void
 //       Every input event, before the frame that reacts to it.
 //   onResize(driver, engine, extent) !void
 //       After the swapchain and the render targets have followed the surface.
+//   onCompute(driver, engine, level, commands) !void
+//       Before any rendering opens. Compute work ends with its own dependency
+//       from storage writes to the stage that consumes them.
 //   onRecord(driver, engine, level, commands) !void
 //       Inside the main pass, after the scene and before it closes. See the
 //       call site for what may be recorded there and what may not.
@@ -64,6 +67,7 @@ const frames_in_flight = 2;
 pub const NoDriver = struct {
     pub fn onEvent(_: *NoDriver, _: *Engine, _: platform.Event) !void {}
     pub fn onResize(_: *NoDriver, _: *Engine, _: platform.Extent2D) !void {}
+    pub fn onCompute(_: *NoDriver, _: *Engine, _: *Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onRecord(_: *NoDriver, _: *Engine, _: *Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onFrame(_: *NoDriver, _: *Engine, _: *Level, _: FrameTime) !void {}
 };
@@ -679,9 +683,12 @@ pub const Engine = struct {
 
             const commands = try frame.beginCommands(&self.context);
             // Before any rendering is opened: a dispatch cannot be recorded
-            // inside one, and the barrier the prepass ends with orders its
-            // writes against the vertex fetch of the draws below.
+            // inside one, and each compute owner ends with the barrier that
+            // hands its writes to the stages below. The morph pass is the
+            // engine's; application compute follows it through the same command
+            // buffer and cannot escape the frame's fence lifetime.
             self.morph_pass.record(commands, self.frame_index);
+            try driver.onCompute(self, level, commands);
 
             // Everything a frame can be refused for is refused here, before a
             // single command is recorded. What comes back is what every stage

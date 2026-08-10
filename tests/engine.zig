@@ -21,6 +21,7 @@ const testing = std.testing;
 const Full = struct {
     pub fn onEvent(_: *Full, _: *lenore.Engine, _: platform.Event) !void {}
     pub fn onResize(_: *Full, _: *lenore.Engine, _: platform.Extent2D) !void {}
+    pub fn onCompute(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onRecord(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onFrame(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: lenore.FrameTime) !void {}
 };
