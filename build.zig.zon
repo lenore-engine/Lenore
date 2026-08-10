@@ -6,6 +6,7 @@
     .dependencies = .{
         .lenore_gltf = .{ .path = "lenore-gltf" },
         .lenore_gpu = .{ .path = "lenore-gpu" },
+        .lenore_ktx = .{ .path = "lenore-ktx" },
         .lenore_platform = .{ .path = "lenore-platform" },
         .lenore_resources = .{ .path = "lenore-resources" },
         .lenore_scene = .{ .path = "lenore-scene" },

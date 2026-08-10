@@ -13,3 +13,6 @@
 [submodule "lenore-scene"]
 	path = lenore-scene
 	url = git@lenore:lenore-engine/lenore-scene.git
+[submodule "lenore-ktx"]
+	path = lenore-ktx
+	url = git@lenore:lenore-engine/lenore-ktx.git
