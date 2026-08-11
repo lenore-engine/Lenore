@@ -1,18 +1,18 @@
 [submodule "lenore-platform"]
 	path = lenore-platform
-	url = git@lenore:lenore-engine/lenore-platform.git
+	url = https://github.com/lenore-engine/lenore-platform.git
 [submodule "lenore-gpu"]
 	path = lenore-gpu
-	url = git@lenore:lenore-engine/lenore-gpu.git
+	url = https://github.com/lenore-engine/lenore-gpu.git
 [submodule "lenore-resources"]
 	path = lenore-resources
-	url = git@lenore:lenore-engine/lenore-resources.git
+	url = https://github.com/lenore-engine/lenore-resources.git
 [submodule "lenore-gltf"]
 	path = lenore-gltf
-	url = git@lenore:lenore-engine/lenore-gltf.git
+	url = https://github.com/lenore-engine/lenore-gltf.git
 [submodule "lenore-scene"]
 	path = lenore-scene
-	url = git@lenore:lenore-engine/lenore-scene.git
+	url = https://github.com/lenore-engine/lenore-scene.git
 [submodule "lenore-ktx"]
 	path = lenore-ktx
-	url = git@lenore:lenore-engine/lenore-ktx.git
+	url = https://github.com/lenore-engine/lenore-ktx.git
