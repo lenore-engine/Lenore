@@ -748,15 +748,15 @@ fn reportModel(model: *const gltf.importer.Model) !void {
         );
     }
 
-    for (model.skins) |*skin| {
-        log.info("skin {d}: {d} joints over {d} slots, {d} clip(s)", .{
-            skin.index,
+    for (model.skins, 0..) |*skin, skeleton| {
+        log.info("skeleton {d}: {d} joints over {d} slots, {d} clip(s)", .{
+            skeleton,
             skin.skeleton.jointCount(),
             skin.skeleton.slotCount(),
             skin.clips.len,
         });
         for (skin.clips, 0..) |*clip, index| {
-            log.info("skin clip {d}: keyed from {d:.3} to {d:.3} s over {d} slots", .{
+            log.info("skeleton clip {d}: keyed from {d:.3} to {d:.3} s over {d} slots", .{
                 index,
                 clip.start_time,
                 clip.duration,
@@ -873,27 +873,31 @@ fn reportLevel(
     // the same placement, whatever that placement is. A transpose, a wrong slot
     // or applying the inverse bind on the wrong side breaks this before all
     // three become the same torn mesh on screen.
-    for (world.skins) |*skin| {
-        const joints = skin.animator.jointTransforms();
+    for (world.skeletons, 0..) |*skeleton, index| {
+        const joints = skeleton.animator.jointTransforms();
         if (joints.len == 0) continue;
         var worst: f32 = 0;
         for (joints) |joint| worst = @max(worst, matrixDrift(joint, joints[0]));
-        log.info("bind pose: skin {d} joints disagree by at most {d:.6}", .{ skin.source_index, worst });
-        log.info("bind pose: skin {d} moves the model's height axis to [{d:.3} {d:.3} {d:.3}]", .{
-            skin.source_index,
+        log.info("bind pose: skeleton {d} joints disagree by at most {d:.6}", .{ index, worst });
+        log.info("bind pose: skeleton {d} moves the model's height axis to [{d:.3} {d:.3} {d:.3}]", .{
+            index,
             joints[0][2][0],
             joints[0][2][1],
             joints[0][2][2],
         });
-        check(worst < 1e-4, "every joint of skin {d} carries the same bind placement", .{skin.source_index});
+        check(worst < 1e-4, "every joint of skeleton {d} carries the same bind placement", .{index});
     }
 
     // The weighted sum of joint matrices applied to a vertex, exactly as the
     // shader computes it. Written twice on purpose: this is the host's account
     // of what the device should produce, and the two agreeing is the check.
     for (model.meshes, world.skin_of_mesh, 0..) |*mesh, maybe_skin, index| {
-        const skin_index = maybe_skin orelse continue;
-        const joints = world.skins[skin_index].animator.jointTransforms();
+        const skin = maybe_skin orelse continue;
+        // The mesh's own run of its skeleton's joints. Taking the whole array
+        // would read another skin's joints wherever a skeleton carries several,
+        // which is exactly what the vertex attribute cannot do.
+        const all = world.skeletons[skin.skeleton].animator.jointTransforms();
+        const joints = all[skin.joint_offset..][0..skin.joint_count];
         if (joints.len == 0) continue;
 
         var worst: f32 = 0;

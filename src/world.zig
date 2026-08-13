@@ -59,25 +59,23 @@ pub fn placePoint(point: res.Vec3, matrix: zm.Mat) res.Vec3 {
     return .{ carried[0], carried[1], carried[2] };
 }
 
-// A document skin bound to its playback.
+// One imported skeleton bound to its playback.
 //
-// Only the identity is the engine's. The animator, its cursor and the pose it
-// writes all live in `lenore-resources` beside the node and morph animators,
-// because none of that knows anything about glTF; `source_index` does, and is
-// the reason this wrapper exists at all.
-pub const Skin = struct {
-    // The document's skin index, which is what a mesh names. Not the position of
-    // this skin in the imported slice; the two need not agree.
-    source_index: u32,
+// One per connected component of the document's joint forest rather than one per
+// skin, which is the importer's shape and not a choice made here: joints that
+// share a tree have to be posed together, because one skin's joint may be what
+// carries another's. A mesh names the run of joint transforms it reads.
+//
+// Nothing of glTF is left in it. The animator, its cursor and the pose it writes
+// all live in `lenore-resources` beside the node and morph animators, and this
+// is now the whole of the engine's side.
+pub const Skeleton = struct {
     animator: res.SkeletonAnimator,
+    // The root slots whose transform above them the rigid hierarchy carries.
+    // Borrowed from the model, which outlives the world for the same reason the
+    // meshes are.
+    prefix_links: []const gltf.importer.PrefixLink,
 };
-
-pub fn skinForIndex(skins: []Skin, source_index: u32) ?*Skin {
-    for (skins) |*skin| {
-        if (skin.source_index == source_index) return skin;
-    }
-    return null;
-}
 
 // Where every draw is this frame, what order they are recorded in, and the
 // instance record each one reads.
@@ -238,16 +236,18 @@ pub const World = struct {
     // Borrowed from the model, which outlives the world.
     meshes: []const gltf.importer.Mesh,
 
-    skins: []Skin,
-    // How many of `skins` hold a pose that must be released. The slice is
+    skeletons: []Skeleton,
+    // How many of `skeletons` hold a pose that must be released. The slice is
     // allocated whole and filled one at a time, so a failure part way through
     // init leaves these two disagreeing, and teardown has to follow the counter
     // rather than the length.
-    skins_ready: usize,
-    // Which skin drives each mesh, by mesh index. An index rather than a
-    // pointer: a pointer into `skins` would make the world unmovable after
-    // init, for a lookup that costs one load either way.
-    skin_of_mesh: []?u32,
+    skeletons_ready: usize,
+    // Where each mesh reads its joints: which skeleton, and the run inside it.
+    // The importer resolved it, because a skeleton may carry several skins and
+    // the document's skin index alone no longer says where to read. Values
+    // rather than pointers: a pointer into `skeletons` would make the world
+    // unmovable after init, for a lookup that costs one load either way.
+    skin_of_mesh: []?gltf.importer.SkinPlacement,
 
     node_animator: ?res.NodeAnimator,
     morph_animators: []res.MorphAnimator,
@@ -308,8 +308,8 @@ pub const World = struct {
         return .{
             .allocator = allocator,
             .meshes = &.{},
-            .skins = &.{},
-            .skins_ready = 0,
+            .skeletons = &.{},
+            .skeletons_ready = 0,
             .skin_of_mesh = &.{},
             .node_animator = null,
             .morph_animators = &.{},
@@ -359,8 +359,8 @@ pub const World = struct {
         var self: World = .{
             .allocator = allocator,
             .meshes = model.meshes,
-            .skins = &.{},
-            .skins_ready = 0,
+            .skeletons = &.{},
+            .skeletons_ready = 0,
             .skin_of_mesh = &.{},
             .node_animator = null,
             .morph_animators = &.{},
@@ -388,7 +388,7 @@ pub const World = struct {
         };
         errdefer self.deinit();
 
-        try self.buildSkins(model);
+        try self.buildSkeletons(model);
         try self.buildAnimators(model);
         self.morph_registrations = try allocator.dupe(?u32, morph_registrations);
 
@@ -441,8 +441,8 @@ pub const World = struct {
         if (self.node_animator) |*animator| animator.deinit(allocator);
 
         allocator.free(self.skin_of_mesh);
-        for (self.skins[0..self.skins_ready]) |*skin| skin.animator.deinit(allocator);
-        allocator.free(self.skins);
+        for (self.skeletons[0..self.skeletons_ready]) |*skeleton| skeleton.animator.deinit(allocator);
+        allocator.free(self.skeletons);
 
         self.* = undefined;
     }
@@ -468,7 +468,14 @@ pub const World = struct {
     ) !FrameState {
         if (self.node_animator) |*animator| animator.update(frame_time.delta);
         for (self.morph_animators) |*animator| animator.update(frame_time.delta);
-        for (self.skins) |*skin| skin.animator.update(frame_time.delta);
+
+        // Between the two, and that is the whole reason the order is written
+        // out here. A skeleton hanging below an animated node reads that node's
+        // world transform from the rigid hierarchy, which the line above has
+        // just advanced, and its own pass below composes against it. Advancing
+        // the skeletons first would pose them against last frame's carrier.
+        self.carrySkeletons();
+        for (self.skeletons) |*skeleton| skeleton.animator.update(frame_time.delta);
 
         // The weights reach the device through the prepass rather than through
         // an instance record, so this is their only path and it has to follow
@@ -505,6 +512,30 @@ pub const World = struct {
         };
     }
 
+    // The transform above each skeleton that hangs below something the rigid
+    // hierarchy moves.
+    //
+    // glTF 2.0, 3.7.3.2 keeps a skinned mesh node's own transform out of the
+    // draw, and that is the rule everyone implements. It says nothing about the
+    // chain above the joints, which does move the skeleton: `BrainStem` parents
+    // its eighteen joints under a node carrying 1309 keys of translation,
+    // rotation and scale, and freezing that node was this model animating its
+    // limbs while standing still.
+    //
+    // Nothing to do for a document with no rigid animation, and nothing to do
+    // for the skeletons whose chain really is static: they carry no links.
+    fn carrySkeletons(self: *World) void {
+        const animator = if (self.node_animator) |*node| node else return;
+        for (self.skeletons) |*skeleton| {
+            for (skeleton.prefix_links) |link| {
+                skeleton.animator.pose.setRootPrefix(
+                    link.slot,
+                    animator.world_transforms[link.node_slot],
+                );
+            }
+        }
+    }
+
     // Copies each posed mesh's joint transforms into the run the offsets
     // assigned it. The offsets were planned once: they are a pure function of
     // the joint counts being drawn, and no draw is added or removed here.
@@ -514,9 +545,15 @@ pub const World = struct {
     // nothing a test can run.
     pub fn packJoints(self: *World) void {
         for (self.skin_of_mesh, self.plan.joint_bases) |maybe_skin, base| {
-            const skin_index = maybe_skin orelse continue;
-            const transforms = self.skins[skin_index].animator.jointTransforms();
-            @memcpy(self.joint_storage[base..][0..transforms.len], transforms);
+            const skin = maybe_skin orelse continue;
+            // The mesh's own run of its skeleton's joints, not the whole of
+            // them: a skeleton shared by several skins holds all of their joints
+            // end to end, and the vertex attribute indexes one run.
+            const transforms = self.skeletons[skin.skeleton].animator.jointTransforms();
+            @memcpy(
+                self.joint_storage[base..][0..skin.joint_count],
+                transforms[skin.joint_offset..][0..skin.joint_count],
+            );
         }
     }
 
@@ -541,26 +578,26 @@ pub const World = struct {
                 started += 1;
             }
         }
-        for (self.skins) |*skin| {
-            if (index < skin.animator.clips.len) {
-                try skin.animator.play(index);
+        for (self.skeletons) |*skeleton| {
+            if (index < skeleton.animator.clips.len) {
+                try skeleton.animator.play(index);
                 started += 1;
             }
         }
         return started;
     }
 
-    // How many document animations anything in this world can play. Skins and
-    // the rigid hierarchy agree on it, so either one answers.
+    // How many document animations anything in this world can play. Skeletons
+    // and the rigid hierarchy agree on it, so either one answers.
     pub fn clipCount(self: *const World) usize {
         if (self.node_animator) |*animator| return animator.template.clips.len;
-        if (self.skins.len > 0) return self.skins[0].animator.clips.len;
+        if (self.skeletons.len > 0) return self.skeletons[0].animator.clips.len;
         return 0;
     }
 
     pub fn activeClip(self: *const World) ?u16 {
         if (self.node_animator) |*animator| return animator.active_clip;
-        if (self.skins.len > 0) return self.skins[0].animator.active_clip;
+        if (self.skeletons.len > 0) return self.skeletons[0].animator.active_clip;
         return null;
     }
 
@@ -569,55 +606,63 @@ pub const World = struct {
     pub fn castersMove(self: *const World) bool {
         if (self.node_animator != null) return true;
         if (self.morph_animators.len > 0) return true;
-        for (self.skins) |*skin| {
-            if (skin.animator.clips.len > 0) return true;
+        for (self.skeletons) |*skeleton| {
+            if (skeleton.animator.clips.len > 0) return true;
         }
         return false;
     }
 
-    fn buildSkins(self: *World, model: *const gltf.importer.Model) !void {
+    fn buildSkeletons(self: *World, model: *const gltf.importer.Model) !void {
         const allocator = self.allocator;
 
         // The whole slice at once, so teardown frees the allocation it was
-        // given. `skins_ready` is what says how much of it holds an animator.
-        self.skins = try allocator.alloc(Skin, model.skins.len);
-        for (model.skins, self.skins) |*source, *skin| {
-            skin.* = .{
-                .source_index = source.index,
-                // Every clip the document gave this skin, not the first: which
-                // one plays is playback's choice and the world offers no way to
-                // make it here.
+        // given. `skeletons_ready` is what says how much of it holds an
+        // animator.
+        self.skeletons = try allocator.alloc(Skeleton, model.skins.len);
+        for (model.skins, self.skeletons) |*source, *skeleton| {
+            skeleton.* = .{
+                // Every clip the document gave this skeleton, not the first:
+                // which one plays is playback's choice and the world offers no
+                // way to make it here.
                 .animator = try .init(allocator, &source.skeleton, source.clips),
+                .prefix_links = source.prefix_links,
             };
-            self.skins_ready += 1;
+            self.skeletons_ready += 1;
         }
 
         // glTF 2.0 specification, 3.7.3.3: a skinned mesh primitive carries the
         // attributes skinning reads, and the node referencing it names the skin
         // they index. A document with the stream and no matching skin hands the
         // shader an array to index and nothing to fill it with.
-        self.skin_of_mesh = try allocator.alloc(?u32, model.meshes.len);
+        self.skin_of_mesh = try allocator.alloc(?gltf.importer.SkinPlacement, model.meshes.len);
         for (model.meshes, self.skin_of_mesh) |*mesh, *slot| {
             if (!mesh.streams.skinned) {
                 slot.* = null;
                 continue;
             }
-            const source_index = mesh.skin orelse return error.SkinnedMeshWithoutSkin;
-            const found = for (self.skins, 0..) |*skin, index| {
-                if (skin.source_index == source_index) break index;
-            } else return error.SkinnedMeshWithoutSkin;
+            const placement = mesh.skin orelse return error.SkinnedMeshWithoutSkin;
+            if (placement.skeleton >= self.skeletons.len) return error.SkinnedMeshWithoutSkin;
+            if (placement.joint_count == 0) return error.EmptySkin;
 
-            const joint_count = self.skins[found].animator.pose.jointCount();
-            if (joint_count == 0) return error.EmptySkin;
+            // The run has to be inside the skeleton that holds it. Checked here
+            // because `packJoints` copies it every frame with no bound of its
+            // own, and because the importer's arithmetic is the only thing
+            // between an asset and this.
+            const joints = self.skeletons[placement.skeleton].animator.pose.jointCount();
+            if (placement.joint_offset + placement.joint_count > joints)
+                return error.JointIndexOutOfRange;
 
             // The shader has no bound of its own, and the indices came from a
             // file. Answered once here, so the vertex path carries no check.
+            // Against the mesh's own run, which is the space the attribute
+            // addresses rather than the whole skeleton.
             for (mesh.vertices) |vertex| {
                 inline for (0..4) |lane| {
-                    if (vertex.joints[lane] >= joint_count) return error.JointIndexOutOfRange;
+                    if (vertex.joints[lane] >= placement.joint_count)
+                        return error.JointIndexOutOfRange;
                 }
             }
-            slot.* = @intCast(found);
+            slot.* = placement;
         }
     }
 
@@ -721,8 +766,11 @@ pub const World = struct {
             index,
         | {
             var placed: res.Aabb = .compute(mesh.vertices);
-            if (self.skin_of_mesh[index]) |skin_index|
-                placed = scene.worldAabb(placed, self.skins[skin_index].animator.jointTransforms()[0]);
+            if (self.skin_of_mesh[index]) |skin|
+                placed = scene.worldAabb(
+                    placed,
+                    self.skeletons[skin.skeleton].animator.jointTransforms()[skin.joint_offset],
+                );
             centre.* = scene.sphereAroundAabb(placed).centre;
             box.* = placed;
             // A skinned mesh's box is its bind pose and a morphed mesh's is its
@@ -747,12 +795,20 @@ pub const World = struct {
 
         // Planned once: the offsets are a pure function of the joint counts
         // being drawn, and no draw is added or removed after this.
-        const poses = try allocator.alloc(?*const res.SkeletonPose, count);
-        defer allocator.free(poses);
-        for (self.skin_of_mesh, poses) |maybe_skin, *pose| {
-            pose.* = if (maybe_skin) |index| &self.skins[index].animator.pose else null;
+        //
+        // Each mesh's own count, not its skeleton's. A skeleton shared by
+        // several skins holds every one of their joints, and a mesh uploads only
+        // the run it reads.
+        const joint_counts = try allocator.alloc(?u32, count);
+        defer allocator.free(joint_counts);
+        for (self.skin_of_mesh, joint_counts) |maybe_skin, *joints| {
+            joints.* = if (maybe_skin) |skin| skin.joint_count else null;
         }
-        self.joint_total = try scene.assignJointOffsets(poses, joint_bases, @intCast(capacity.joints));
+        self.joint_total = try scene.assignJointOffsets(
+            joint_counts,
+            joint_bases,
+            @intCast(capacity.joints),
+        );
         self.joint_storage = try allocator.alloc(gpu.Joint, capacity.joints);
     }
 };

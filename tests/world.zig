@@ -474,7 +474,7 @@ const Skinned = struct {
         });
         errdefer self.skeleton.deinit(allocator);
 
-        self.skins = .{.{ .skeleton = self.skeleton, .clips = &.{}, .index = 4 }};
+        self.skins = .{.{ .skeleton = self.skeleton, .clips = &.{}, .prefix_links = &.{} }};
         self.vertices = .{ vertexAt(.{ 0, 0, 0 }), vertexAt(.{ 1, 1, 1 }) };
         for (&self.vertices) |*vertex| {
             vertex.joints = @splat(shape.joint);
@@ -485,7 +485,14 @@ const Skinned = struct {
         self.meshes[0].streams.skinned = true;
         // The document's skin index, which is deliberately not the position of
         // the skin in the imported slice.
-        self.meshes[0].skin = 4;
+        // The run has to match the skeleton the fixture built: a jointless one
+        // is what `EmptySkin` is about, and claiming two joints of it would be
+        // refused a step earlier for a different reason.
+        self.meshes[0].skin = .{
+            .skeleton = 0,
+            .joint_offset = 0,
+            .joint_count = if (shape.jointless) 0 else 2,
+        };
         self.materials = .{material(.@"opaque")};
 
         const defaults = try allocator.alloc(f32, 2);
@@ -528,8 +535,10 @@ test "a skinned draw takes joint slots and is found by its document index" {
     defer world.deinit();
 
     try testing.expectEqual(@as(u32, 2), world.joint_total);
-    try testing.expectEqual(@as(?u32, 0), world.skin_of_mesh[0]);
-    try testing.expectEqual(@as(u32, 4), world.skins[0].source_index);
+    const placed = world.skin_of_mesh[0] orelse return error.TestExpectedSkin;
+    try testing.expectEqual(@as(u32, 0), placed.skeleton);
+    try testing.expectEqual(@as(u32, 0), placed.joint_offset);
+    try testing.expectEqual(@as(u32, 2), placed.joint_count);
     // A morph template exists, so something in this world can move.
     try testing.expectEqual(true, world.castersMove());
 }
@@ -572,12 +581,12 @@ test "a skinned mesh naming no skin is refused" {
     try testing.expectError(error.SkinnedMeshWithoutSkin, fixture.open(allocator));
 }
 
-test "a skinned mesh naming a skin the document does not have is refused" {
+test "a skinned mesh naming a skeleton the document does not have is refused" {
     const allocator = testing.allocator;
     var fixture: Skinned = undefined;
     try fixture.build(allocator, .{});
     defer fixture.deinit(allocator);
-    fixture.meshes[0].skin = 9;
+    fixture.meshes[0].skin = .{ .skeleton = 9, .joint_offset = 0, .joint_count = 2 };
 
     try testing.expectError(error.SkinnedMeshWithoutSkin, fixture.open(allocator));
 }
@@ -653,14 +662,14 @@ test "each skin's joints land in the run the offsets gave it" {
     defer large.deinit(allocator);
 
     var skins = [_]gltf.importer.Skin{
-        .{ .skeleton = small, .clips = &.{}, .index = 10 },
-        .{ .skeleton = large, .clips = &.{}, .index = 20 },
+        .{ .skeleton = small, .clips = &.{}, .prefix_links = &.{} },
+        .{ .skeleton = large, .clips = &.{}, .prefix_links = &.{} },
     };
     var vertices = [_]res.Vertex3D{ vertexAt(.{ 0, 0, 0 }), vertexAt(.{ 1, 1, 1 }) };
     var meshes = [_]gltf.importer.Mesh{ meshAt(&vertices, 0), meshAt(&vertices, 0) };
-    for (&meshes, [_]u32{ 10, 20 }) |*mesh, source| {
+    for (&meshes, [_]u32{ 0, 1 }, [_]u32{ 2, 3 }) |*mesh, skeleton, joints| {
         mesh.streams.skinned = true;
-        mesh.skin = source;
+        mesh.skin = .{ .skeleton = skeleton, .joint_offset = 0, .joint_count = joints };
     }
     var materials = [_]res.MaterialInfo{material(.@"opaque")};
     var model: gltf.importer.Model = .{
@@ -687,7 +696,7 @@ test "each skin's joints land in the run the offsets gave it" {
     // A value per joint that says which skin and which slot it came from, so a
     // run written to the wrong offset is identifiable rather than merely
     // different.
-    for (world.skins, 0..) |*skin, skin_index| {
+    for (world.skeletons, 0..) |*skin, skin_index| {
         for (skin.animator.pose.joint_transforms, 0..) |*joint, slot| {
             joint.* = zm.translation(@floatFromInt(skin_index + 1), @floatFromInt(slot), 0);
         }
@@ -791,11 +800,11 @@ test "a skin that has a clip is playing one when the world opens" {
     var clips = [_]res.Animation{try .init(allocator, channels, "slide")};
     defer clips[0].deinit(allocator);
 
-    var skins = [_]gltf.importer.Skin{.{ .skeleton = skeleton, .clips = &clips, .index = 0 }};
+    var skins = [_]gltf.importer.Skin{.{ .skeleton = skeleton, .clips = &clips, .prefix_links = &.{} }};
     var vertices = [_]res.Vertex3D{ vertexAt(.{ 0, 0, 0 }), vertexAt(.{ 1, 1, 1 }) };
     var meshes = [_]gltf.importer.Mesh{meshAt(&vertices, 0)};
     meshes[0].streams.skinned = true;
-    meshes[0].skin = 0;
+    meshes[0].skin = .{ .skeleton = 0, .joint_offset = 0, .joint_count = 2 };
     var materials = [_]res.MaterialInfo{material(.@"opaque")};
     var model: gltf.importer.Model = .{
         .meshes = &meshes,
@@ -816,7 +825,7 @@ test "a skin that has a clip is playing one when the world opens" {
 
     // A skin left unstarted holds its bind pose forever, which looks exactly
     // like a document with no animation in it.
-    try testing.expectEqual(@as(?u16, 0), world.skins[0].animator.active_clip);
+    try testing.expectEqual(@as(?u16, 0), world.skeletons[0].animator.active_clip);
     // Nothing else in this model can move, so the skin is the only thing that
     // can make this true.
     try testing.expectEqual(true, world.castersMove());
@@ -874,11 +883,11 @@ test "switching a clip moves the skin and the rigid hierarchy together" {
     }
     defer for (&clips) |*clip| clip.deinit(allocator);
 
-    var skins = [_]gltf.importer.Skin{.{ .skeleton = skeleton, .clips = &clips, .index = 0 }};
+    var skins = [_]gltf.importer.Skin{.{ .skeleton = skeleton, .clips = &clips, .prefix_links = &.{} }};
     var vertices = [_]res.Vertex3D{ vertexAt(.{ 0, 0, 0 }), vertexAt(.{ 1, 1, 1 }) };
     var meshes = [_]gltf.importer.Mesh{meshAt(&vertices, 0)};
     meshes[0].streams.skinned = true;
-    meshes[0].skin = 0;
+    meshes[0].skin = .{ .skeleton = 0, .joint_offset = 0, .joint_count = 2 };
     var materials = [_]res.MaterialInfo{material(.@"opaque")};
     var model: gltf.importer.Model = .{
         .meshes = &meshes,
@@ -904,7 +913,7 @@ test "switching a clip moves the skin and the rigid hierarchy together" {
     try testing.expectEqual(@as(?u16, 1), world.activeClip());
 
     try testing.expectEqual(@as(usize, 1), try world.playClip(0));
-    try testing.expectEqual(@as(?u16, 0), world.skins[0].animator.active_clip);
+    try testing.expectEqual(@as(?u16, 0), world.skeletons[0].animator.active_clip);
 
     // An index past what the document holds starts nothing rather than
     // failing: a caller cycling clips should not have to know the count twice.
@@ -1023,14 +1032,15 @@ const OneJoint = struct {
             .inverse_bind = &.{zm.identity()},
             .joint_slot = &.{0},
         });
-        self.skins = .{.{ .skeleton = template, .clips = &.{}, .index = 0 }};
+        self.skins = .{.{ .skeleton = template, .clips = &.{}, .prefix_links = &.{} }};
 
         // Far beyond the near view, which is what makes the exemption visible.
         self.vertices = .{ vertexAt(.{ 0, 0, 40 }), vertexAt(.{ 0, 0, 42 }) };
         self.materials = .{material(.@"opaque")};
         self.meshes = .{meshAt(&self.vertices, 0)};
         self.meshes[0].streams = .{ .skinned = true };
-        self.meshes[0].skin = 0;
+        // One joint, which is what the template above declares.
+        self.meshes[0].skin = .{ .skeleton = 0, .joint_offset = 0, .joint_count = 1 };
         self.model = .{
             .meshes = &self.meshes,
             .materials = &self.materials,
@@ -1122,7 +1132,7 @@ test "culling follows the material and the winding follows the instance matrix" 
     };
     // A skinned draw whose joints could mirror a vertex without the instance
     // matrix saying so.
-    meshes[2].skin = 0;
+    meshes[2].skin = .{ .skeleton = 0, .joint_offset = 0, .joint_count = 2 };
 
     var model: gltf.importer.Model = .{
         .meshes = &meshes,
