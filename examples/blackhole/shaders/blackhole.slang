@@ -48,6 +48,12 @@ struct PushConstants
     // the image.
     float disk_spin;
 
+    // Whether the palette follows the shifted temperature as well as the
+    // brightness. Zero keeps chromaticity on the emitted temperature, so the
+    // shift shows only as beaming; one carries the receding side toward the
+    // warm end of the ramp and the approaching side further into the blue.
+    uint doppler_colour;
+
     // What the disk's radiance is multiplied by before it leaves this shader.
     // The output is scene radiance and the engine's chain and tone operator run
     // after it, so this sets where the disk sits against the value the operator
@@ -498,25 +504,51 @@ float diskColumn(float r)
 // This is an authored display mapping in the spirit of the reference pictures.
 // A physical conversion of the complete spectrum would need CIE
 // colour-matching data, which this repository does not carry.
+//
+// The argument is the observed temperature when `doppler_colour` is set. Heat
+// then runs past one on the beamed side and clamps, which costs less than the
+// same clamp would at the cool end: as the temperature rises the visible bands
+// approach the Rayleigh-Jeans form B ~ T / lambda^4, whose ratios carry no
+// temperature at all, so the locus compresses toward a limiting chromaticity.
+// At this disk's temperature the bands are near hc/(lambda k T) ~ 1 and not yet
+// in that limit, so the clamp is still partly a display choice.
+//
+// The cool end may not clamp the same way, and `ember` is why. The receding
+// side of a beamed disk lands between heat 0.38 and 0.47, which was the floor
+// of a warm-to-ivory ramp: the shift carried it into a stop rather than through
+// a gradient, and a side that should redden across its whole width came out one
+// flat colour. Extending downward is also where extension is worth most, since
+// the argument above runs the other way here. Chromaticity moves fastest at low
+// temperature, so the range below `warm` carries more visible difference per
+// octave than the range above `core_blue` does.
 float3 diskTint(float temperature)
 {
     const float peak_temperature = peak_fraction * push.disk_temperature;
     const float heat = temperature / peak_temperature;
 
+    const float3 ember = float3(1.0, 0.33, 0.14);
     const float3 warm = float3(1.0, 0.52, 0.28);
     const float3 ivory = float3(1.0, 0.86, 0.72);
     const float3 core_blue = float3(0.32, 0.66, 1.0);
 
+    // The lower transition spans the receding side's own range so that side
+    // grades across it. Its top is held under the unshifted outer disk, which
+    // sits near 0.49, so switching the shift off returns almost the palette
+    // that was there before.
+    const float ember_to_warm = smoothstep(0.28, 0.55, heat);
     const float warm_to_ivory = smoothstep(0.35, 0.9, heat);
     const float blue_core = smoothstep(0.65, 1.0, heat);
-    return lerp(lerp(warm, ivory, warm_to_ivory), core_blue, blue_core);
+
+    const float3 cool = lerp(ember, warm, ember_to_warm);
+    return lerp(lerp(cool, ivory, warm_to_ivory), core_blue, blue_core);
 }
 
 // What one sample of the disk emits, before it is weighted by density.
 //
 // The observed blackbody bands carry radial falloff, gravitational shift and
 // Doppler beaming together. Their largest component becomes intensity while
-// `diskTint` supplies a deliberate display chromaticity. Raising normalized
+// `diskTint` supplies the chromaticity, from the shifted temperature or the
+// emitted one according to `doppler_colour`. Raising normalized
 // intensity to 0.86 compresses the visible-band range enough to retain the cool
 // annulus without lifting most of it into the tone mapper's white compression;
 // a value of one at the unshifted thermal peak remains one.
@@ -530,10 +562,12 @@ float3 diskEmission(float r, float structure, float axial_momentum)
     const float temperature = diskTemperature(r);
     if (temperature <= 0.0) return float3(0.0);
 
+    const float shift = redshift(r, axial_momentum);
+
     // The fluctuation is in temperature and not in brightness, so a hot
     // filament moves toward the inner colour as well as becoming brighter.
     const float local = temperature * (1.0 + push.turbulence * (2.0 * structure - 1.0));
-    const float observed = redshift(r, axial_momentum) * local;
+    const float observed = shift * local;
     const float3 bands = blackbodyBands(observed);
 
     const float3 reference = blackbodyBands(peak_fraction * push.disk_temperature);
@@ -544,7 +578,12 @@ float3 diskEmission(float r, float structure, float axial_momentum)
     // Per unit length, and normalized so that integrating it across the disk
     // returns the surface brightness rather than something proportional to the
     // thickness.
-    return diskTint(temperature) * visible_intensity * push.exposure / diskColumn(r);
+    // The shift enters the palette, the turbulence does not: one is a property
+    // of where the parcel is and how it moves, the other is noise, and letting
+    // noise pick the palette scatters blue speckle across the outer disk.
+    const float tinted = push.doppler_colour != 0 ? shift * temperature : temperature;
+
+    return diskTint(tinted) * visible_intensity * push.exposure / diskColumn(r);
 }
 
 // A field of stars in the direction a ray escaped along.

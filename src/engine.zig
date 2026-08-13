@@ -212,6 +212,11 @@ pub const Options = struct {
     shadow_map_size: u32 = 2048,
 
     fps_window_ns: u64 = std.time.ns_per_s,
+
+    // Whether the frame writes timestamps around its passes. Off by default:
+    // the numbers have one reader, and a frame that has none should record no
+    // commands for it.
+    gpu_timing: bool = false,
 };
 
 pub const Engine = struct {
@@ -250,6 +255,12 @@ pub const Engine = struct {
     memory: gpu.MemoryAllocator,
     staging: gpu.StagingPool,
     setup_pool: gpu.OneShotPool,
+    // Declared before the subsystems that borrow it and torn down after them,
+    // which is the ordering the borrow requires. Lifetimes are the engine's to
+    // own, not a subsystem's: the ring this is keyed to is the one the frame
+    // loop below drives, and the texture cache and the morph prepass both hand
+    // their device resources to it.
+    retirement: gpu.ResourceRetirement,
     textures: gpu.TextureCache,
     samplers: gpu.SamplerCache,
     morph_pass: gpu.MorphPass,
@@ -275,6 +286,13 @@ pub const Engine = struct {
     phases: FramePhases,
     phase_window: FramePhases,
     last_phases: FramePhases,
+    // Null where the device cannot carry a timestamp on the graphics queue, or
+    // where nothing asked for one. Absent rather than idle: eight timestamps a
+    // frame is device work, and a frame nobody is measuring should not pay it.
+    gpu_timer: ?gpu.GpuTimer,
+    // The last frame slot's decomposition, read where its fence signalled.
+    // Null until a frame has been submitted and come back.
+    last_gpu: ?gpu.GpuTimings,
     // The last window the counter closed, or null until one has. A driver reads
     // it rather than being called back, because a rate is a thing to look at
     // when convenient and not an event.
@@ -345,8 +363,19 @@ pub const Engine = struct {
         self.setup_pool = try .init(&self.context);
         errdefer self.setup_pool.deinit(&self.context);
 
+        // One list per frame slot, so a resource released mid-frame is destroyed
+        // once the slot that could still be reading it comes round again.
+        self.retirement = try .init(allocator, frames_in_flight);
+        errdefer self.retirement.deinit(allocator);
+
         var cache_setup: gpu.Transfer = try .begin(&self.context, self.setup_pool.handle, &self.staging);
-        self.textures = try .init(&self.context, &self.memory, allocator, &cache_setup);
+        self.textures = try .init(
+            &self.context,
+            &self.memory,
+            allocator,
+            &cache_setup,
+            &self.retirement,
+        );
         errdefer _ = self.textures.deinit();
         try cache_setup.finish();
         cache_setup.deinit();
@@ -369,6 +398,7 @@ pub const Engine = struct {
             frames_in_flight,
             options.morph_capacity,
             shaders.morph,
+            &self.retirement,
         );
         errdefer self.morph_pass.deinit();
 
@@ -390,6 +420,24 @@ pub const Engine = struct {
 
         self.materials = try .init(&self.context, &self.memory, options.material_capacity);
         errdefer self.materials.deinit();
+
+        // Refused rather than faked where the device says a timestamp on this
+        // queue is worth nothing: a pool that cannot be written would report
+        // every pass as taking no time, which reads like an answer.
+        self.gpu_timer = null;
+        self.last_gpu = null;
+        if (options.gpu_timing) {
+            const support = self.context.timestampSupport();
+            if (support.available()) {
+                self.gpu_timer = try .init(&self.context, support, frames_in_flight);
+            } else {
+                log.warn(
+                    "device timings were asked for; this queue reports {d} valid timestamp bits",
+                    .{support.valid_bits},
+                );
+            }
+        }
+        errdefer if (self.gpu_timer) |*timer| timer.deinit(&self.context);
 
         self.frame_index = 0;
         self.surface_extent = extent;
@@ -425,6 +473,7 @@ pub const Engine = struct {
             log.err("device did not drain during teardown: {t}", .{err});
         };
 
+        if (self.gpu_timer) |*timer| timer.deinit(&self.context);
         self.materials.deinit();
         self.renderer.deinit();
         self.morph_pass.deinit();
@@ -434,6 +483,16 @@ pub const Engine = struct {
         // image the run never gave back, and device memory is the one
         // allocation a host leak check does not cover.
         if (self.textures.deinit() == .leak) log.err("texture references outstanding", .{});
+        // After the cache, because releasing anything it still held would have
+        // gone here. The device drained at the top of this function, which is
+        // what makes destroying the remainder correct: at teardown there is no
+        // later frame for it to wait for.
+        //
+        // Nothing is reported. A run that changed levels in its last frames ends
+        // with resources still queued, which is the type working rather than a
+        // fault, and a warning that fires on every clean exit is one nobody
+        // reads.
+        self.retirement.deinit(self.allocator);
         self.setup_pool.deinit(&self.context);
         self.staging.deinit();
         if (self.memory.deinit() == .leak) log.err("device memory leaked", .{});
@@ -488,9 +547,18 @@ pub const Engine = struct {
     // Three things outlive a level and hold something of it. The prepass keeps a
     // registration and a destination buffer per morphed mesh; the renderer keeps
     // a record per material and descriptor sets pointing at that level's images;
-    // the caches hold the images themselves. All three are given back here, and
-    // the drain comes first because every one of them destroys something a
-    // submitted frame may still be reading.
+    // the caches hold the images themselves. All three are given back here.
+    //
+    // The drain is for the meshes, and only for them. Images and the prepass's
+    // destinations go to the frame ring; `Mesh.deinit` still destroys up to six
+    // buffers inline, and any of them may be one a submitted frame is reading.
+    //
+    // It stays that way by decision rather than by omission. Meshes are
+    // destroyed here and on a failed load, both inside a level change, which is
+    // already a moment of reading files and compressing textures; a drain there
+    // is not where stutter comes from. Retiring them would mean changing
+    // `OwningStorage`, whose stated contract is that it destroys what it holds,
+    // to buy nothing that can be measured.
     pub fn unload(self: *Engine, level: *Level) void {
         self.context.waitIdle() catch |err| {
             log.err("device did not drain before unloading: {t}", .{err});
@@ -503,6 +571,23 @@ pub const Engine = struct {
         // `Renderer.plan` enforces that on its own account; this is the map's
         // half of the same statement.
         self.shadow_dirty = true;
+    }
+
+    // Gives a device resource back, to be destroyed once no frame can be reading
+    // it. Takes ownership: the value is moved in and the caller's copy is spent.
+    //
+    // This is how an application frees a buffer or an image it made itself, and
+    // it is correct from any hook. Destroying one directly is correct only where
+    // the device happens to be idle, which is true inside `onResize` because
+    // `recreate` drains first and is true nowhere else the application can see.
+    // Nothing in a signature says which is which, so this exists to make the
+    // question not arise.
+    //
+    // Infallible for the reason `TextureCache.release` is: teardown paths have
+    // nowhere to report, and what happens when the queue will not take the
+    // resource is stated once, at `gpu.retireOrDestroy`.
+    pub fn retire(self: *Engine, resource: gpu.RetiredResource) void {
+        gpu.retireOrDestroy(&self.retirement, self.allocator, resource);
     }
 
     // Re-fits the shadow map to the first directional light in the block.
@@ -614,6 +699,15 @@ pub const Engine = struct {
 
             const frame = self.frames[self.frame_index];
             try frame.waitForGpu(&self.context);
+            // The fence is what makes this safe: everything this slot submitted
+            // has completed, so anything retired while it was recording can go.
+            // Immediately after the wait rather than later in the frame, so a
+            // texture released this frame is not held for an extra round.
+            self.retirement.beginFrame(self.frame_index);
+            // The fence this slot was submitted with has signalled, so its
+            // queries hold results and reading them waits for nothing. Taken
+            // before anything overwrites the slot, which the reset below does.
+            if (self.gpu_timer) |*timer| self.last_gpu = timer.read(&self.context, self.frame_index);
             self.phases.wait_ns = phase.split();
 
             // An acquire that fails this way has signalled nothing and consumed
@@ -682,6 +776,12 @@ pub const Engine = struct {
             self.phases.update_ns = phase.split();
 
             const commands = try frame.beginCommands(&self.context);
+            // Before anything is recorded into the frame and outside any
+            // rendering, which is where a query pool may be reset. Every slot
+            // this frame will write is cleared here, so a pass it skips leaves
+            // its pair unwritten and reads as zero rather than as whatever the
+            // frame two ago left there.
+            if (self.gpu_timer) |*timer| timer.reset(commands, &self.context, self.frame_index);
             // Before any rendering is opened: a dispatch cannot be recorded
             // inside one, and each compute owner ends with the barrier that
             // hands its writes to the stages below. The morph pass is the
@@ -711,8 +811,11 @@ pub const Engine = struct {
             //
             // The bake first, because it opens a rendering of its own and the
             // map it writes is sampled by every fragment the main pass shades.
+            self.mark(commands, .shadow, .begin);
             self.renderer.recordShadowBake(commands, self.shadowBake(level), frame_plan);
+            self.mark(commands, .shadow, .end);
 
+            self.mark(commands, .main, .begin);
             self.renderer.beginMain(commands);
             self.renderer.recordScene(commands, frame_plan);
             // Inside the main pass and after the scene, which is the only place
@@ -728,10 +831,15 @@ pub const Engine = struct {
             // A driver that records nothing costs the call and no commands.
             try driver.onRecord(self, level, commands);
             self.renderer.endMain(commands);
+            self.mark(commands, .main, .end);
 
             // Between the two passes: the chain reads what the main pass wrote
             // and the post pass reads what the chain leaves.
+            self.mark(commands, .bloom, .begin);
             self.renderer.recordBloom(commands, frame_plan);
+            self.mark(commands, .bloom, .end);
+
+            self.mark(commands, .post, .begin);
             self.renderer.recordPost(
                 commands,
                 .{
@@ -741,6 +849,7 @@ pub const Engine = struct {
                 },
                 frame_plan,
             );
+            self.mark(commands, .post, .end);
             self.recorded_frames += 1;
             self.phases.record_ns = phase.split();
 
@@ -753,6 +862,7 @@ pub const Engine = struct {
             }
             try driver.onFrame(self, level, time);
 
+            if (self.gpu_timer) |*timer| timer.markSubmitted(self.frame_index);
             try frame.submit(&self.context, .{
                 .wait = frame.image_acquired,
                 // The first thing the frame does to the presentable image is
@@ -780,6 +890,14 @@ pub const Engine = struct {
         }
 
         try self.context.waitIdle();
+    }
+
+    // One pass boundary, or nothing when no timer exists. Written from here
+    // rather than from inside the renderer because which passes a frame is made
+    // of is composition, and this loop is where that sequence is stated.
+    fn mark(self: *const Engine, commands: gpu.vk.CommandBuffer, pass: gpu.GpuPass, edge: gpu.GpuTimestampEdge) void {
+        const timer = if (self.gpu_timer) |*value| value else return;
+        timer.write(commands, &self.context, self.frame_index, pass, edge);
     }
 
     fn shadowBake(self: *Engine, level: *const Level) gpu.ShadowBake {

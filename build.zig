@@ -6,7 +6,19 @@ pub fn build(b: *std.Build) void {
 
     const platform = b.dependency("lenore_platform", .{ .target = target, .optimize = optimize });
     const platform_import: std.Build.Module.Import = .{ .name = "lenore-platform", .module = platform.module("lenore-platform") };
-    const gpu = b.dependency("lenore_gpu", .{ .target = target, .optimize = optimize });
+    // Forwarded rather than defaulted here: the option belongs to the module
+    // that creates the pipelines, and an umbrella that swallowed it would leave
+    // `-Dshader-stats` accepted and ignored.
+    const shader_stats = b.option(
+        bool,
+        "shader-stats",
+        "Create pipelines so their compiled statistics can be read back",
+    ) orelse false;
+    const gpu = b.dependency("lenore_gpu", .{
+        .target = target,
+        .optimize = optimize,
+        .@"shader-stats" = shader_stats,
+    });
     const gpu_import: std.Build.Module.Import = .{ .name = "lenore-gpu", .module = gpu.module("lenore-gpu") };
     // The converter is an application's tool and not the engine's: nothing in
     // `src/` imports it. What the engine gained for it is the ability to upload
@@ -42,11 +54,6 @@ pub fn build(b: *std.Build) void {
         .name = "example-orbit",
         .module = example_orbit,
     };
-    const mandelbox_reference = b.createModule(.{
-        .root_source_file = b.path("examples/mandelbox/reference.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
     // The engine is a module and not only an executable root. Two things follow
     // from that and neither is available without it: an example can consume the
     // composition instead of reassembling it, and a test binary can be built
@@ -152,8 +159,6 @@ pub fn build(b: *std.Build) void {
     // frame-rate invariance and unconstrained orbit cannot stay uncompiled.
     const orbit_tests = b.addTest(.{ .root_module = example_orbit });
     test_step.dependOn(&b.addRunArtifact(orbit_tests).step);
-    const mandelbox_tests = b.addTest(.{ .root_module = mandelbox_reference });
-    test_step.dependOn(&b.addRunArtifact(mandelbox_tests).step);
     // addTest collects test blocks from the root module of its compilation only.
     // The suite above imports the engine rather than being it, so a `test`
     // written beside the code in src/ would never run and would stay green

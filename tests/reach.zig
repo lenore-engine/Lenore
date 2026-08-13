@@ -17,6 +17,8 @@ test "the device-facing surface is compiled" {
     _ = &lenore.Engine.install;
     _ = &lenore.Engine.frameCamera;
     _ = &lenore.Engine.unload;
+    // Its fallback drains the device, so nothing host-side reaches the body.
+    _ = &lenore.Engine.retire;
     _ = &lenore.Engine.refitSun;
     // The loop is generic over its driver, and `_ = &fn` does not instantiate a
     // generic function. `tests/engine.zig` calls it with a driver instead, which

@@ -77,3 +77,116 @@ test "the environment names three files and holds each under its own key" {
         }
     }
 }
+
+// Six faces of `extent` square, every texel the same colour, in the layout a
+// cube level is stored in.
+fn constantCube(allocator: std.mem.Allocator, extent: u32, colour: [4]f16) ![]u8 {
+    const texels = @as(usize, extent) * extent * 6;
+    const bytes = try allocator.alloc(u8, texels * 8);
+    var at: usize = 0;
+    while (at < bytes.len) : (at += 8) {
+        for (colour, 0..) |channel, index|
+            std.mem.writeInt(u16, bytes[at + index * 2 ..][0..2], @bitCast(channel), .little);
+    }
+    return bytes;
+}
+
+fn texelAt(bytes: []const u8, index: usize, channel: usize) f16 {
+    return @bitCast(std.mem.readInt(u16, bytes[index * 8 + channel * 2 ..][0..2], .little));
+}
+
+test "a constant cube reduces to the same constant" {
+    // The mean of equal values is that value, so anything the filter does to the
+    // indexing shows up as a texel that is not the colour it started as.
+    const allocator = std.testing.allocator;
+    const source = try constantCube(allocator, 8, .{ 0.25, 0.5, 1.0, 2.0 });
+    defer allocator.free(source);
+
+    const reduced = try lenore.reduceCube(allocator, source, 8, 2);
+    defer allocator.free(reduced);
+
+    try std.testing.expectEqual(@as(usize, 6 * 2 * 2 * 8), reduced.len);
+    for (0..6 * 2 * 2) |index| {
+        try std.testing.expectEqual(@as(f16, 0.25), texelAt(reduced, index, 0));
+        try std.testing.expectEqual(@as(f16, 0.5), texelAt(reduced, index, 1));
+        try std.testing.expectEqual(@as(f16, 1.0), texelAt(reduced, index, 2));
+        try std.testing.expectEqual(@as(f16, 2.0), texelAt(reduced, index, 3));
+    }
+}
+
+test "a block averages into one texel" {
+    // Two by two down to one, with values chosen so the mean is exact in f16 and
+    // the test does not rest on a tolerance. Only the first face is filled with
+    // anything interesting, which also pins that faces are not read across.
+    const allocator = std.testing.allocator;
+    const source = try constantCube(allocator, 2, .{ 0, 0, 0, 0 });
+    defer allocator.free(source);
+    const values = [_]f16{ 1, 2, 3, 4 };
+    for (values, 0..) |value, index|
+        std.mem.writeInt(u16, source[index * 8 ..][0..2], @bitCast(value), .little);
+
+    const reduced = try lenore.reduceCube(allocator, source, 2, 1);
+    defer allocator.free(reduced);
+
+    try std.testing.expectEqual(@as(usize, 6 * 8), reduced.len);
+    try std.testing.expectEqual(@as(f16, 2.5), texelAt(reduced, 0, 0));
+    // The faces after it were zero and stay zero.
+    for (1..6) |face| try std.testing.expectEqual(@as(f16, 0), texelAt(reduced, face, 0));
+}
+
+test "rows and columns are not transposed" {
+    // A face whose two halves differ by row. Transposing the block walk would
+    // still average four values and would still be a plausible picture.
+    const allocator = std.testing.allocator;
+    const source = try constantCube(allocator, 4, .{ 0, 0, 0, 0 });
+    defer allocator.free(source);
+    for (0..4) |row| {
+        for (0..4) |column| {
+            const value: f16 = if (row < 2) 1.0 else 5.0;
+            const at = (row * 4 + column) * 8;
+            std.mem.writeInt(u16, source[at..][0..2], @bitCast(value), .little);
+        }
+    }
+
+    const reduced = try lenore.reduceCube(allocator, source, 4, 2);
+    defer allocator.free(reduced);
+
+    // The top row of the result comes from the top half and the bottom from the
+    // bottom, so they differ; a transpose would make all four equal to three.
+    try std.testing.expectEqual(@as(f16, 1.0), texelAt(reduced, 0, 0));
+    try std.testing.expectEqual(@as(f16, 1.0), texelAt(reduced, 1, 0));
+    try std.testing.expectEqual(@as(f16, 5.0), texelAt(reduced, 2, 0));
+    try std.testing.expectEqual(@as(f16, 5.0), texelAt(reduced, 3, 0));
+}
+
+test "an extent that does not divide is refused" {
+    const allocator = std.testing.allocator;
+    const source = try constantCube(allocator, 6, .{ 1, 1, 1, 1 });
+    defer allocator.free(source);
+
+    try std.testing.expectError(
+        error.ExtentNotDivisible,
+        lenore.reduceCube(allocator, source, 6, 4),
+    );
+    try std.testing.expectError(
+        error.ExtentNotDivisible,
+        lenore.reduceCube(allocator, source, 6, 0),
+    );
+}
+
+test "a payload that is not six square faces is refused" {
+    // Caught before anything is allocated or read, because the length is what
+    // every index below is derived from.
+    const allocator = std.testing.allocator;
+    const source = try constantCube(allocator, 4, .{ 1, 1, 1, 1 });
+    defer allocator.free(source);
+
+    try std.testing.expectError(
+        error.FaceBytesMismatch,
+        lenore.reduceCube(allocator, source[0 .. source.len - 8], 4, 2),
+    );
+    try std.testing.expectError(
+        error.FaceBytesMismatch,
+        lenore.reduceCube(allocator, source, 8, 2),
+    );
+}

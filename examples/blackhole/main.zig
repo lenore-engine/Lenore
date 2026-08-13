@@ -28,6 +28,7 @@ const usage =
     \\  left drag     orbit; release to throw
     \\  mouse wheel   smooth optical zoom toward the centre
     \\  r             reverse the disk
+    \\  c             doppler colour on / off
     \\  - / =         exposure down / up
     \\  t / o         disk thickness / opacity
     \\  d             cycle the debug picture
@@ -97,8 +98,8 @@ const debugNames = [_][]const u8{
 // Mirrors `PushConstants` in blackhole.slang.
 //
 // The offsets are the compiler's, read from the reflection JSON slangc emits
-// beside the words: 0, 16, 32, 48 for the four vectors and then ten scalars
-// from 64 to 112, for 116 bytes. The asserts below hold this declaration to them,
+// beside the words: 0, 16, 32, 48 for the four vectors and then eleven scalars
+// from 64 to 116, for 120 bytes. The asserts below hold this declaration to them,
 // so a field inserted here fails the build instead of shifting every value the
 // shader reads after it.
 //
@@ -115,6 +116,7 @@ const Push = extern struct {
     disk_outer: f32,
     disk_temperature: f32,
     disk_spin: f32,
+    doppler_colour: u32,
     exposure: f32,
     star_intensity: f32,
     time: f32,
@@ -135,14 +137,15 @@ comptime {
     std.debug.assert(@offsetOf(Push, "disk_outer") == 76);
     std.debug.assert(@offsetOf(Push, "disk_temperature") == 80);
     std.debug.assert(@offsetOf(Push, "disk_spin") == 84);
-    std.debug.assert(@offsetOf(Push, "exposure") == 88);
-    std.debug.assert(@offsetOf(Push, "star_intensity") == 92);
-    std.debug.assert(@offsetOf(Push, "time") == 96);
-    std.debug.assert(@offsetOf(Push, "turbulence") == 100);
-    std.debug.assert(@offsetOf(Push, "disk_thickness") == 104);
-    std.debug.assert(@offsetOf(Push, "disk_opacity") == 108);
-    std.debug.assert(@offsetOf(Push, "debug") == 112);
-    std.debug.assert(@sizeOf(Push) == 116);
+    std.debug.assert(@offsetOf(Push, "doppler_colour") == 88);
+    std.debug.assert(@offsetOf(Push, "exposure") == 92);
+    std.debug.assert(@offsetOf(Push, "star_intensity") == 96);
+    std.debug.assert(@offsetOf(Push, "time") == 100);
+    std.debug.assert(@offsetOf(Push, "turbulence") == 104);
+    std.debug.assert(@offsetOf(Push, "disk_thickness") == 108);
+    std.debug.assert(@offsetOf(Push, "disk_opacity") == 112);
+    std.debug.assert(@offsetOf(Push, "debug") == 116);
+    std.debug.assert(@sizeOf(Push) == 120);
 }
 
 // Both stages read the block. The vertex stage builds the ray from the basis
@@ -179,52 +182,51 @@ fn words(comptime bytes: anytype) []const u32 {
 // convenience. The draw sits at the far plane and tests depth without writing
 // it, so it appears exactly where no opaque surface stands and a scene drawn
 // alongside would occlude it.
+// One module, one layout, one fullscreen pass. The table is the whole of what
+// this example builds on the device.
+const Spec = gpu.ShaderEffectSpec;
+const LayoutConfig = gpu.PipelineLayoutConfig;
+const Shaders = gpu.ShaderEffect(.{
+    .modules = .{"blackhole"},
+    .layouts = .{"blackhole"},
+    .pipelines = .{
+        .disk = Spec{ .module = "blackhole", .layout = "blackhole", .stage = .{ .graphics = .{
+            .vertex = "vertexMain",
+            .fragment = "fragmentMain",
+            .mode = .background,
+            .culling = .{ .fixed = .{} },
+        } } },
+    },
+});
+
 const Effect = struct {
     context: *const gpu.Context,
-    module: gpu.vk.ShaderModule,
-    layout: gpu.vk.PipelineLayout,
-    pipeline: gpu.vk.Pipeline,
+    shaders: Shaders,
 
     fn init(context: *const gpu.Context, formats: gpu.PipelineFormats) !Effect {
-        const module = try gpu.Pipeline.createModule(context, words(@embedFile("blackhole").*));
-        errdefer context.device.destroyShaderModule(module, null);
-
-        const layout = try gpu.Pipeline.createLayout(context, .{
-            .push_constants = &.{push_range},
-        });
-        errdefer context.device.destroyPipelineLayout(layout, null);
-
-        const pipeline = try gpu.Pipeline.create(context, .{
-            .mode = .background,
-            .streams = null,
-            .culling = .{ .fixed = .{} },
-            .formats = formats,
-            .layout = layout,
-            .stages = .{
-                .vertex = .{ .module = module, .entry_point = "vertexMain" },
-                .fragment = .{ .module = module, .entry_point = "fragmentMain" },
-            },
-        });
-
-        return .{ .context = context, .module = module, .layout = layout, .pipeline = pipeline };
+        return .{
+            .context = context,
+            .shaders = try .init(context, .{
+                .modules = .{ .blackhole = words(@embedFile("blackhole").*) },
+                .layouts = .{ .blackhole = LayoutConfig{ .push_constants = &.{push_range} } },
+                .formats = formats,
+            }),
+        };
     }
 
     // Vulkan specification, vkDestroyPipeline and the rest: every submission
     // naming any of these must have completed. The caller drains the device.
     fn deinit(self: *Effect) void {
-        const device = self.context.device;
-        device.destroyPipeline(self.pipeline, null);
-        device.destroyPipelineLayout(self.layout, null);
-        device.destroyShaderModule(self.module, null);
+        self.shaders.deinit(self.context);
         self.* = undefined;
     }
 
     fn record(self: *const Effect, commands: gpu.vk.CommandBuffer, push: Push) void {
         const device = self.context.device;
-        device.cmdBindPipeline(commands, .graphics, self.pipeline);
+        device.cmdBindPipeline(commands, .graphics, self.shaders.get(.disk));
         device.cmdPushConstants(
             commands,
-            self.layout,
+            self.shaders.layoutFor(.disk),
             push_range.stage_flags,
             push_range.offset,
             push_range.size,
@@ -333,6 +335,12 @@ const Driver = struct {
     thickness: f32 = disk_thickness,
     opacity: f32 = disk_opacity,
 
+    // Whether the palette follows the shifted temperature. On, because the
+    // colour split across the inner edge is the physical statement; off is the
+    // authored look, kept on a key because the two are worth comparing side by
+    // side and the difference is the whole point of the control.
+    doppler_colour: bool = true,
+
     // Accumulated from the frame deltas rather than read from the clock. The
     // hook that carries a time runs after the one that records, so this is the
     // previous frame's total, one frame stale and invisible at any rate the
@@ -417,6 +425,10 @@ const Driver = struct {
             .r => {
                 self.spin = -self.spin;
                 log.info("disk reversed: spin {d}", .{self.spin});
+            },
+            .c => {
+                self.doppler_colour = !self.doppler_colour;
+                log.info("doppler colour {s}", .{if (self.doppler_colour) "on" else "off"});
             },
             .escape => engine.requestExit(),
             else => {},
@@ -505,6 +517,7 @@ const Driver = struct {
             .disk_outer = disk_outer,
             .disk_temperature = disk_temperature,
             .disk_spin = self.spin,
+            .doppler_colour = @intFromBool(self.doppler_colour),
             .exposure = self.exposure,
             .star_intensity = self.star_intensity,
             .time = self.elapsed,

@@ -63,6 +63,13 @@ pub fn recordBatches(
                 .back => .{ .back_bit = true },
                 .front => .{ .front_bit = true },
             },
+            // The two enumerations name the same two windings, and the sense of
+            // `counter_clockwise` is the same on both sides: `rasterizationState`
+            // records why the glTF convention survives `vulkanClip` unchanged.
+            .front_face = switch (batch.front_face) {
+                .counter_clockwise => .counter_clockwise,
+                .clockwise => .clockwise,
+            },
             .first_instance = batch.first_instance,
             .instance_count = batch.instance_count,
             .vertex_source = sources[draw],

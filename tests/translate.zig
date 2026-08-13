@@ -41,9 +41,9 @@ test "a batch keeps its mesh, material, run and face policy" {
     // different length. Equal values anywhere here would let a translation that
     // copied the wrong field pass.
     const batches = [_]lenore.RecordPlan.Batch{
-        .{ .mesh = &mesh_a, .material = 7, .face_culling = .none, .first_instance = 0, .instance_count = 2 },
-        .{ .mesh = &mesh_b, .material = 3, .face_culling = .back, .first_instance = 2, .instance_count = 1 },
-        .{ .mesh = &mesh_a, .material = 5, .face_culling = .front, .first_instance = 3, .instance_count = 4 },
+        .{ .mesh = &mesh_a, .material = 7, .face_culling = .none, .front_face = .counter_clockwise, .first_instance = 0, .instance_count = 2 },
+        .{ .mesh = &mesh_b, .material = 3, .face_culling = .back, .front_face = .counter_clockwise, .first_instance = 2, .instance_count = 1 },
+        .{ .mesh = &mesh_a, .material = 5, .face_culling = .front, .front_face = .clockwise, .first_instance = 3, .instance_count = 4 },
     };
     const ordered = [_]u32{ 0, 1, 2, 3, 4, 5, 6 };
     const sources = [_]?gpu.MeshVertexSource{null} ** 7;
@@ -57,6 +57,10 @@ test "a batch keeps its mesh, material, run and face policy" {
     try testing.expectEqual(@as(u32, 0), records[0].first_instance);
     try testing.expectEqual(@as(u32, 2), records[0].instance_count);
     try testing.expect(!records[0].cull_mode.front_bit and !records[0].cull_mode.back_bit);
+    // The winding is its own state and not a second reading of the cull mode:
+    // the third batch below culls the front and is wound the other way, and the
+    // first culls nothing and is wound the usual way.
+    try testing.expectEqual(gpu.vk.FrontFace.counter_clockwise, records[0].front_face);
 
     try testing.expectEqual(&mesh_b, records[1].mesh);
     try testing.expectEqual(@as(u32, 3), records[1].material_index);
@@ -68,6 +72,7 @@ test "a batch keeps its mesh, material, run and face policy" {
     try testing.expectEqual(@as(u32, 3), records[2].first_instance);
     try testing.expectEqual(@as(u32, 4), records[2].instance_count);
     try testing.expect(records[2].cull_mode.front_bit and !records[2].cull_mode.back_bit);
+    try testing.expectEqual(gpu.vk.FrontFace.clockwise, records[2].front_face);
 }
 
 test "the vertex source is the batch's first draw, through the order" {
@@ -75,9 +80,9 @@ test "the vertex source is the batch's first draw, through the order" {
     // instead of by `ordered[first_instance]` reads a different slot. The two
     // are told apart by giving every mesh a distinguishable offset.
     const batches = [_]lenore.RecordPlan.Batch{
-        .{ .mesh = &mesh_a, .material = 0, .face_culling = .none, .first_instance = 0, .instance_count = 1 },
-        .{ .mesh = &mesh_b, .material = 1, .face_culling = .none, .first_instance = 1, .instance_count = 1 },
-        .{ .mesh = &mesh_a, .material = 2, .face_culling = .none, .first_instance = 2, .instance_count = 1 },
+        .{ .mesh = &mesh_a, .material = 0, .face_culling = .none, .front_face = .counter_clockwise, .first_instance = 0, .instance_count = 1 },
+        .{ .mesh = &mesh_b, .material = 1, .face_culling = .none, .front_face = .counter_clockwise, .first_instance = 1, .instance_count = 1 },
+        .{ .mesh = &mesh_a, .material = 2, .face_culling = .none, .front_face = .counter_clockwise, .first_instance = 2, .instance_count = 1 },
     };
     const ordered = [_]u32{ 2, 0, 1 };
     const sources = [_]?gpu.MeshVertexSource{
@@ -95,8 +100,8 @@ test "the vertex source is the batch's first draw, through the order" {
 
 test "a destination shorter than the batch list is refused" {
     const batches = [_]lenore.RecordPlan.Batch{
-        .{ .mesh = &mesh_a, .material = 0, .face_culling = .none, .first_instance = 0, .instance_count = 1 },
-        .{ .mesh = &mesh_b, .material = 1, .face_culling = .none, .first_instance = 1, .instance_count = 1 },
+        .{ .mesh = &mesh_a, .material = 0, .face_culling = .none, .front_face = .counter_clockwise, .first_instance = 0, .instance_count = 1 },
+        .{ .mesh = &mesh_b, .material = 1, .face_culling = .none, .front_face = .counter_clockwise, .first_instance = 1, .instance_count = 1 },
     };
     const ordered = [_]u32{ 0, 1 };
     const sources = [_]?gpu.MeshVertexSource{ null, null };
@@ -113,7 +118,7 @@ test "a batch reaching past the order or the sources is refused" {
     var destination: [1]gpu.RecordBatch = undefined;
 
     const past_order = [_]lenore.RecordPlan.Batch{
-        .{ .mesh = &mesh_a, .material = 0, .face_culling = .none, .first_instance = 4, .instance_count = 1 },
+        .{ .mesh = &mesh_a, .material = 0, .face_culling = .none, .front_face = .counter_clockwise, .first_instance = 4, .instance_count = 1 },
     };
     const short_order = [_]u32{ 0, 1 };
     try testing.expectError(
@@ -123,7 +128,7 @@ test "a batch reaching past the order or the sources is refused" {
 
     // In range for the order, and the draw it names is past the sources.
     const in_order = [_]lenore.RecordPlan.Batch{
-        .{ .mesh = &mesh_a, .material = 0, .face_culling = .none, .first_instance = 0, .instance_count = 1 },
+        .{ .mesh = &mesh_a, .material = 0, .face_culling = .none, .front_face = .counter_clockwise, .first_instance = 0, .instance_count = 1 },
     };
     const wide_draw = [_]u32{9};
     try testing.expectError(
@@ -135,7 +140,7 @@ test "a batch reaching past the order or the sources is refused" {
     // observable: a guard written with `>` admits these and reads one past the
     // end of the caller's slice.
     const at_order_end = [_]lenore.RecordPlan.Batch{
-        .{ .mesh = &mesh_a, .material = 0, .face_culling = .none, .first_instance = 2, .instance_count = 1 },
+        .{ .mesh = &mesh_a, .material = 0, .face_culling = .none, .front_face = .counter_clockwise, .first_instance = 2, .instance_count = 1 },
     };
     try testing.expectError(
         error.BatchDrawOutOfRange,

@@ -90,8 +90,10 @@ pub fn skinForIndex(skins: []Skin, source_index: u32) ?*Skin {
 // Nothing here allocates. Every buffer belongs to the `World` that owns the
 // plan, which is what lets this sit in the frame loop.
 pub const DrawPlan = struct {
-    // Read, in mesh order, and never written here.
-    candidates: []const RecordPlan.Draw,
+    // In mesh order. Everything but `front_face` is settled when the level is
+    // built; that one follows the sign of the instance matrix and is rewritten
+    // every frame beside the matrix it comes from.
+    candidates: []RecordPlan.Draw,
     // The centre of each draw in the space its instance matrix maps from. A
     // skinned mesh carries its bind placement here instead, because its instance
     // matrix is identity and the joint matrices hold its motion.
@@ -156,8 +158,22 @@ pub const DrawPlan = struct {
             self.cullable,
             self.matrices,
             self.keys,
-        ) |*mesh, centre, bounds, cullable, *matrix, *key| {
+            self.candidates,
+        ) |*mesh, centre, bounds, cullable, *matrix, *key, *candidate| {
             matrix.* = instanceMatrix(mesh.anchor, animator, placement);
+            // glTF 2.0, section 3.7.4: the determinant of the node's global
+            // transform decides the winding. The importer settled the part it
+            // baked into the vertices, so what is left is exactly this matrix,
+            // and it is per instance and per frame because an animated node or
+            // the application's own placement can mirror.
+            //
+            // A skinned draw's joint matrices can mirror it again per vertex,
+            // which no plan can answer for. That is why such a draw keeps its
+            // culling off rather than being trusted to one winding.
+            candidate.front_face = if (zm.determinant(matrix.*)[0] < 0)
+                .clockwise
+            else
+                .counter_clockwise;
             key.depth = scene.depthOf(eye, placePoint(centre, matrix.*));
             // The box is carried into world space rather than the frustum into
             // the mesh's: six planes against one box either way, and this
@@ -662,12 +678,28 @@ pub const World = struct {
             candidate.* = .{
                 .mesh = resident,
                 .material = mesh.material,
-                // Imported static geometry may combine nodes whose baked
-                // transforms have opposite determinant signs, and that sign is
-                // not retained in the mesh product. Skinning has the same
-                // problem per deformation. No culling is the only conservative
-                // state until scene input can prove one winding for a batch.
-                .face_culling = .none,
+                // Section 3.9.5: doubleSided false means the back faces are
+                // culled, and true means neither side is. What makes reading it
+                // safe is that the winding is now settled on both sides of the
+                // load: the importer reverses a mirrored primitive's corners,
+                // and `rebuild` carries the instance matrix's sign into
+                // `front_face` for the recorder to set.
+                //
+                // Skinned geometry is the exception and keeps both sides. Its
+                // joint matrices can mirror a vertex without the instance
+                // matrix saying so, and they are per vertex, so no state on
+                // this draw can answer for its winding. Dropping a side there
+                // would drop parts of a character rather than the back of a
+                // surface.
+                .face_culling = if (mesh.skin != null or
+                    model.materials[mesh.material].rendering.double_sided)
+                    .none
+                else
+                    .back,
+                // Overwritten every frame by `rebuild` before anything reads
+                // it. Named rather than left undefined so that a plan built and
+                // never rebuilt is still a plan and not a trap.
+                .front_face = .counter_clockwise,
             };
             key.* = .{
                 .layer = switch (model.materials[mesh.material].rendering.alpha_mode) {

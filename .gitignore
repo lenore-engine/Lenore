@@ -7,3 +7,6 @@ zig-pkg/
 .mcp.json
 CLAUDE.md
 .README.md
+examples/atoms/
+examples/mandelbox/
+examples/wet_sand/

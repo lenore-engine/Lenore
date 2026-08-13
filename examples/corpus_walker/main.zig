@@ -20,7 +20,7 @@ const log = std.log.scoped(.walker);
 // change a judgement, and a report of what a frame costs.
 //
 // Usage: run-corpus_walker -- <assets-root> [environment/] [--start=<name>]
-//                            [--present=fifo|mailbox|immediate]
+//                            [--present=fifo|mailbox|immediate] [--gpu-timing]
 //                            [--compress] [--cache=<dir>]
 //
 // The present mode is here because a rate measured under `fifo` is the
@@ -534,6 +534,22 @@ const Walker = struct {
                 milliseconds(phases.present_ns),
             },
         );
+        // The device's own account of the same frame, which the host's cannot
+        // give: `wait` is how long the host stood still, not what the device was
+        // doing. One frame's slots rather than a mean over the window, so this
+        // is a sample and the line above is an average.
+        if (engine.last_gpu) |device_time| {
+            log.info(
+                "  device {d:.3} ms: shadow {d:.3}, main {d:.3}, bloom {d:.3}, post {d:.3}",
+                .{
+                    milliseconds(device_time.total()),
+                    milliseconds(device_time.get(.shadow)),
+                    milliseconds(device_time.get(.main)),
+                    milliseconds(device_time.get(.bloom)),
+                    milliseconds(device_time.get(.post)),
+                },
+            );
+        }
     }
 };
 
@@ -570,6 +586,9 @@ pub fn main(process: std.process.Init.Minimal) !void {
     var environment_path: ?[]const u8 = null;
     var start_name: ?[]const u8 = null;
     var present: gpu.PresentModePreference = .fifo;
+    // Off unless asked for. The timestamps are device commands, so a walk that
+    // is not being measured records none of them.
+    var gpu_timing = false;
     var compress = false;
     var cache_path: ?[]const u8 = null;
     var bloom_scatter = (gpu.BloomSettings{}).scatter;
@@ -599,6 +618,10 @@ pub fn main(process: std.process.Init.Minimal) !void {
                 log.err("--bloom-scatter takes 0 <= s < 1, got '{s}'", .{value});
                 return error.InvalidArgument;
             }
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "--gpu-timing")) {
+            gpu_timing = true;
             continue;
         }
         if (std.mem.startsWith(u8, argument, "--present=")) {
@@ -657,6 +680,7 @@ pub fn main(process: std.process.Init.Minimal) !void {
         .frame_capacity = walk_capacity,
         .material_capacity = walk_materials,
         .present = present,
+        .gpu_timing = gpu_timing,
     });
     defer engine.deinit();
     log.info("device: {s}", .{engine.context.deviceName()});

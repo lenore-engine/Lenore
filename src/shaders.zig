@@ -31,19 +31,28 @@ fn words(comptime bytes: anytype) []const u32 {
 
 // The main pass: one instanced mesh, transformed, lit and textured.
 //
-// The four vertex entry points are the product of the two optional streams a
-// shader path exists for, the skin and the second UV set, and they are listed
-// in the order `gpu.sceneVariantIndex` computes: skinning is the significant
-// axis, so the pair without a skin comes first.
+// The eight vertex entry points are the product of the three optional streams a
+// shader path exists for, the skin, the second UV set and the vertex colour,
+// listed in the order `gpu.sceneVariantIndex` computes: skinning is the most
+// significant axis and the colour the least.
+//
+// Two fragment entry points, on the colour axis alone. A fragment stage's input
+// is the vertex stage's output, so the variants that carry COLOR_0 need the one
+// that declares it.
 pub const scene: gpu.SceneShader = .{
     .spirv = words(@embedFile("scene").*),
     .vertex_entry = .{
         "vertexMain",
+        "colourVertexMain",
         "uv1VertexMain",
+        "uv1ColourVertexMain",
         "skinnedVertexMain",
+        "skinnedColourVertexMain",
         "skinnedUv1VertexMain",
+        "skinnedUv1ColourVertexMain",
     },
     .fragment_entry = "fragmentMain",
+    .colour_fragment_entry = "colourFragmentMain",
 };
 
 // The background: one screen-covering triangle sampling the environment cube
@@ -150,7 +159,12 @@ pub const all = [_]Module{
             .{ .name = scene.vertex_entry[1], .stage = .vertex },
             .{ .name = scene.vertex_entry[2], .stage = .vertex },
             .{ .name = scene.vertex_entry[3], .stage = .vertex },
+            .{ .name = scene.vertex_entry[4], .stage = .vertex },
+            .{ .name = scene.vertex_entry[5], .stage = .vertex },
+            .{ .name = scene.vertex_entry[6], .stage = .vertex },
+            .{ .name = scene.vertex_entry[7], .stage = .vertex },
             .{ .name = scene.fragment_entry, .stage = .fragment },
+            .{ .name = scene.colour_fragment_entry, .stage = .fragment },
         },
     },
     .{

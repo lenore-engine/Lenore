@@ -239,10 +239,15 @@ pub fn main(process: std.process.Init.Minimal) !void {
     var frame: gpu.Frame = try .init(&context);
     defer frame.deinit(&context);
 
+    // Where a released texture waits out the frames that could still be
+    // sampling it. One slot here, because this example drives a single frame.
+    var retirement: gpu.ResourceRetirement = try .init(gpa, 1);
+    defer retirement.deinit(gpa);
+
     // The texture cache records one upload per fallback, so it needs a transfer
     // of its own to finish before anything can bind them.
     var cache_setup: gpu.Transfer = try .begin(&context, setup_pool.handle, &staging);
-    var textures: gpu.TextureCache = try .init(&context, &allocator, gpa, &cache_setup);
+    var textures: gpu.TextureCache = try .init(&context, &allocator, gpa, &cache_setup, &retirement);
     defer if (textures.deinit() == .leak) std.log.err("texture references outstanding", .{});
     try cache_setup.finish();
     cache_setup.deinit();

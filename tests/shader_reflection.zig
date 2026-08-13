@@ -617,7 +617,10 @@ test "the prefiltered level count is queried from the descriptor" {
         if (opcode == 106) queries += 1;
         index += length;
     }
-    try testing.expectEqual(@as(usize, 1), queries);
+    // One per fragment entry point. Both shade through the same function, and
+    // the compiler emits the query into each of the two rather than sharing it,
+    // so the count follows the entry points and not the call sites.
+    try testing.expectEqual(@as(usize, 2), queries);
 }
 
 test "the material record strides at the size the host packs" {
@@ -964,12 +967,24 @@ test "the second UV set reaches the entry points that read it, and only those" {
         try testing.expectError(error.MissingSemantic, varyingLocation(entry, "TEXCOORD"));
     }
 
-    // The colour stream is not an axis. A mesh carrying it selects the same
-    // entry point as one that does not, and nothing in the module reads it.
-    try testing.expectEqualStrings(
+    // The colour stream is an axis of its own, so a mesh carrying it resolves
+    // to a different entry point, and that entry point declares the attribute
+    // at the location `GpuColourVertex` gives it.
+    const coloured = try sceneVertexEntry(parsed, .{ .colour = true });
+    try testing.expectEqualStrings("vertex", coloured.stage);
+    try testing.expect(!std.mem.eql(
+        u8,
         std.mem.span(sceneVertexName(.{})),
         std.mem.span(sceneVertexName(.{ .colour = true })),
-    );
+    ));
+
+    // And the variants without the stream declare no such input: `vertexInput`
+    // gives them no binding 2, so an attribute at location 6 would be fed by
+    // nothing.
+    for ([_]res.VertexStreams{ .{}, .{ .skinned = true }, .{ .uv1 = true } }) |streams| {
+        const entry = try sceneVertexEntry(parsed, streams);
+        try testing.expectError(error.MissingSemantic, varyingLocation(entry, "COLOR"));
+    }
 }
 
 test "the skinned entry point takes the skinning stream at the locations the mesh declares" {

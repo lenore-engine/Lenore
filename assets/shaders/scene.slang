@@ -168,6 +168,21 @@ struct Varying
     nointerpolation uint material_index : MATERIAL;
 };
 
+// The same set with COLOR_0 on it, for the meshes that declare the stream.
+//
+// A second structure rather than a lane on the first: section 3.9.2 makes the
+// vertex colour a multiplier of the base colour, so a mesh without one would
+// have to interpolate a constant white across every fragment to be shaded by
+// the same code. It is nested rather than restated so that the two cannot
+// describe different varyings.
+struct VaryingColour
+{
+    Varying base;
+    // Delivered as unorm8 and expanded by the vertex input stage, which is the
+    // range section 3.7.2 clamps COLOR_0 to.
+    float4 colour : COLOR;
+};
+
 // `SV_InstanceID` is the index within the draw, not within the buffer: Slang
 // declares both `InstanceIndex` and `BaseInstance` and subtracts them, which is
 // the D3D semantic. Adding `SV_StartInstanceLocation` back is what makes a
@@ -176,6 +191,29 @@ struct Varying
 uint instanceIndex(uint local_instance, uint first_instance)
 {
     return first_instance + local_instance;
+}
+
+// A normal carried by the linear part of a transform that need not be rigid.
+//
+// A normal is defined by staying perpendicular to its surface, and only the
+// inverse transpose preserves that: a non-uniform scale stretches the surface
+// one way and tilts the normal the other. The instance matrix carries whatever
+// scale the asset's node hierarchy declares, and the corpus declares both
+// non-uniform and negative ones.
+//
+// The cofactor matrix is the inverse transpose times the determinant, and the
+// fragment stage normalizes what it receives, so only the determinant's sign
+// has to be put back. Two things follow from writing it this way. There is no
+// division, so a collapsed transform gives a zero normal rather than an
+// infinity, and no matrix inverse is needed: this version of Slang has none.
+float3 carryNormal(float3 local_normal, float3x3 linear)
+{
+    const float3x3 cofactor = float3x3(
+        cross(linear[1], linear[2]),
+        cross(linear[2], linear[0]),
+        cross(linear[0], linear[1]));
+    const float determinant = dot(linear[0], cofactor[0]);
+    return mul(local_normal, cofactor) * (determinant < 0.0 ? -1.0 : 1.0);
 }
 
 // The half both entry points share, from a position and a normal already in the
@@ -195,10 +233,9 @@ Varying place(
     Varying varying;
     varying.position = mul(world, camera.view_projection);
     varying.world_position = world.xyz;
-    // The model's linear part, not its inverse transpose. A normal stays
-    // perpendicular only under the latter, and this is where a non-uniform
-    // scale would show; the transforms this pass is given are rigid.
-    varying.normal = mul(local_normal, (float3x3)instance.model);
+    varying.normal = carryNormal(local_normal, (float3x3)instance.model);
+    // A tangent follows an edge of the surface rather than standing off it, so
+    // it takes the plain matrix and not the one above.
     varying.tangent = float4(
         mul(local_tangent.xyz, (float3x3)instance.model),
         local_tangent.w);
@@ -233,9 +270,10 @@ Varying placeSkinned(
     // places them, and `model` carries the engine's placement of the whole model
     // and nothing from the asset's mesh node.
     const float3 skinned_position = mul(float4(vertex.position, 1.0), skin).xyz;
-    // The same matrix on the normal, which is wrong under a non-uniform scale in
-    // a joint, for the reason the unskinned path is.
-    const float3 skinned_normal = mul(vertex.normal.xyz, (float3x3)skin);
+    // The weighted sum is a per-vertex matrix, so the normal's is per vertex
+    // too. A joint carrying a non-uniform scale makes the two differ, and a
+    // blend of two joints can be non-uniform where neither of them is.
+    const float3 skinned_normal = carryNormal(vertex.normal.xyz, (float3x3)skin);
     const float4 skinned_tangent = float4(
         mul(vertex.tangent.xyz, (float3x3)skin),
         vertex.tangent.w);
@@ -289,6 +327,51 @@ Varying uv1VertexMain(
         instance);
 }
 
+// The four above with COLOR_0 on binding 2 at location 6. The stream is an axis
+// of the pipeline variant rather than something every mesh carries: a mesh
+// without it would otherwise interpolate a constant white to every fragment,
+// and the parameter that carries it is not free.
+[shader("vertex")]
+VaryingColour colourVertexMain(
+    Vertex vertex,
+    [[vk::location(6)]] float4 colour : COLOR,
+    uint local_instance : SV_InstanceID,
+    uint first_instance : SV_StartInstanceLocation)
+{
+    const Instance instance = instances[instanceIndex(local_instance, first_instance)];
+    VaryingColour varying;
+    varying.base = place(
+        vertex.position,
+        vertex.normal.xyz,
+        vertex.tangent,
+        vertex.uv,
+        float2(0.0),
+        instance);
+    varying.colour = colour;
+    return varying;
+}
+
+[shader("vertex")]
+VaryingColour uv1ColourVertexMain(
+    Vertex vertex,
+    [[vk::location(6)]] float4 colour : COLOR,
+    [[vk::location(7)]] float2 uv1 : TEXCOORD1,
+    uint local_instance : SV_InstanceID,
+    uint first_instance : SV_StartInstanceLocation)
+{
+    const Instance instance = instances[instanceIndex(local_instance, first_instance)];
+    VaryingColour varying;
+    varying.base = place(
+        vertex.position,
+        vertex.normal.xyz,
+        vertex.tangent,
+        vertex.uv,
+        uv1,
+        instance);
+    varying.colour = colour;
+    return varying;
+}
+
 [shader("vertex")]
 Varying skinnedVertexMain(
     Vertex vertex,
@@ -312,6 +395,39 @@ Varying skinnedUv1VertexMain(
 {
     const Instance instance = instances[instanceIndex(local_instance, first_instance)];
     return placeSkinned(vertex, joint_indices, joint_weights, uv1, instance);
+}
+
+[shader("vertex")]
+VaryingColour skinnedColourVertexMain(
+    Vertex vertex,
+    uint4 joint_indices : JOINTS,
+    float4 joint_weights : WEIGHTS,
+    [[vk::location(6)]] float4 colour : COLOR,
+    uint local_instance : SV_InstanceID,
+    uint first_instance : SV_StartInstanceLocation)
+{
+    const Instance instance = instances[instanceIndex(local_instance, first_instance)];
+    VaryingColour varying;
+    varying.base = placeSkinned(vertex, joint_indices, joint_weights, float2(0.0), instance);
+    varying.colour = colour;
+    return varying;
+}
+
+[shader("vertex")]
+VaryingColour skinnedUv1ColourVertexMain(
+    Vertex vertex,
+    uint4 joint_indices : JOINTS,
+    float4 joint_weights : WEIGHTS,
+    [[vk::location(6)]] float4 colour : COLOR,
+    [[vk::location(7)]] float2 uv1 : TEXCOORD1,
+    uint local_instance : SV_InstanceID,
+    uint first_instance : SV_StartInstanceLocation)
+{
+    const Instance instance = instances[instanceIndex(local_instance, first_instance)];
+    VaryingColour varying;
+    varying.base = placeSkinned(vertex, joint_indices, joint_weights, uv1, instance);
+    varying.colour = colour;
+    return varying;
 }
 
 // Windowed inverse-square falloff: pure 1/d^2 over most of the radius, reaching
@@ -591,7 +707,9 @@ float3 imageBasedLight(
     // so the level is the roughness times the last index. The count is asked of
     // the descriptor rather than carried as a constant beside it: a constant
     // here and a chain of another depth in the file is a silent mismatch that
-    // returns a correctly filtered value of the wrong roughness.
+    // returns a correctly filtered value of the wrong roughness. What it costs
+    // to ask was measured rather than assumed: forty bytes of code and no
+    // register, against a mismatch nothing would report.
     uint width, height, levels;
     ggx_environment.GetDimensions(0, width, height, levels);
     const float lod = roughness * float(max(levels, 1u) - 1u);
@@ -617,17 +735,23 @@ float3 imageBasedLight(
 // and the reflection is all it has.
 //
 // Alpha modes are not sampled: this pass has a pipeline for OPAQUE alone.
-[shader("fragment")]
-float4 fragmentMain(Varying varying, bool front_facing : SV_IsFrontFace) : SV_Target
+// The shading both fragment entry points below run, with the vertex colour as a
+// parameter rather than as a field of what is interpolated. A mesh without the
+// stream passes white, which is the identity of the product section 3.9.2
+// defines and costs nothing to write here.
+float4 shade(Varying varying, float4 vertex_colour, bool front_facing)
 {
     const MaterialData material = materials[varying.material_index];
 
     // Section 3.9.2: where both are present the factor is a linear multiplier of
     // the texture. A material with no base-colour image is bound to the neutral
     // white fallback, which is that same rule with the texture at 1.0.
+    // The vertex colour is the third term of that product, and section 3.9.2
+    // names all three: it is a linear multiplier like the factor, not a tint
+    // applied afterwards.
     const float4 sampled = base_colour.Sample(
         transformedUv(material.tex[texture_slot_base_colour], varying.uv, varying.uv1));
-    const float3 base = sampled.rgb * material.base_colour_factor.rgb;
+    const float3 base = sampled.rgb * material.base_colour_factor.rgb * vertex_colour.rgb;
 
     // Section 3.9.4: the alpha is the fourth component of the base colour, so
     // the factor multiplies the texture here as it does for the other three
@@ -637,9 +761,23 @@ float4 fragmentMain(Varying varying, bool front_facing : SV_IsFrontFace) : SV_Ta
     // Named for the base colour it comes from: `alpha` below is the GGX
     // distribution's parameter and the two are unrelated.
     const uint alpha_mode = material.flags.x;
-    const float base_alpha = sampled.a * material.base_colour_factor.a;
+    const float base_alpha = sampled.a * material.base_colour_factor.a * vertex_colour.a;
     if (alpha_mode == alpha_mode_mask && base_alpha < material.metallic_roughness_cutoff.z)
         discard;
+
+    // KHR_materials_unlit, Definition: the colour is the base-colour term alone
+    // and every property of the PBR model bearing on lighting is ignored. So the
+    // return is here, above the normal map and the light loop, rather than as a
+    // select at the end: the extension exists so that a surface can cost less,
+    // and shading it first would keep the cost and throw the result away.
+    //
+    // Alpha coverage and doubleSided still apply, in the extension's own words.
+    // Coverage was decided by the cutoff test above and the alpha is carried out
+    // by the same rule as below; doubleSided is a pipeline state and a face that
+    // reaches here was not culled. What the reversed normal would have been for
+    // is the lighting this material does not have.
+    if (material.flags.w != 0)
+        return float4(base, alpha_mode == alpha_mode_blend ? base_alpha : 1.0);
 
     // Section 3.9.2: roughness is green, metalness is blue, and each multiplies
     // its factor. An absent texture has value 1.0. Select that value from the
@@ -808,4 +946,19 @@ float4 fragmentMain(Varying varying, bool front_facing : SV_IsFrontFace) : SV_Ta
     // value out, and only a blended pipeline enables blending, so what the other
     // two write into this lane is never read.
     return float4(radiance, alpha_mode == alpha_mode_blend ? base_alpha : 1.0);
+}
+
+// White for the meshes with no COLOR_0, which is the product's identity. The
+// alternative is a constant varying interpolated across every fragment of every
+// mesh in the scene, and a packed parameter is not free.
+[shader("fragment")]
+float4 fragmentMain(Varying varying, bool front_facing : SV_IsFrontFace) : SV_Target
+{
+    return shade(varying, float4(1.0), front_facing);
+}
+
+[shader("fragment")]
+float4 colourFragmentMain(VaryingColour varying, bool front_facing : SV_IsFrontFace) : SV_Target
+{
+    return shade(varying.base, varying.colour, front_facing);
 }

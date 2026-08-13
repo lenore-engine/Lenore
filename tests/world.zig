@@ -3,6 +3,7 @@ const gltf = @import("lenore-gltf");
 const gpu = @import("lenore-gpu");
 const lenore = @import("lenore");
 const res = @import("lenore-resources");
+const scene = @import("lenore-scene");
 const zm = @import("zmath");
 
 const testing = std.testing;
@@ -1103,4 +1104,65 @@ test "the empty world plans no draws and moves no casters" {
     try world.plan.rebuild(world.meshes, null, zm.identity(), .{ 0, 0, 0 }, zm.identity());
     try testing.expectEqual(@as(usize, 0), world.plan.records.len);
     try testing.expectEqual(@as(usize, 0), world.plan.visible_records);
+}
+
+test "culling follows the material and the winding follows the instance matrix" {
+    var vertices = [_][2]res.Vertex3D{
+        .{ vertexAt(.{ 0, 0, 4 }), vertexAt(.{ 0, 0, 6 }) },
+        .{ vertexAt(.{ 0, 0, 4 }), vertexAt(.{ 0, 0, 6 }) },
+        .{ vertexAt(.{ 0, 0, 4 }), vertexAt(.{ 0, 0, 6 }) },
+    };
+    var materials = [_]res.MaterialInfo{ material(.@"opaque"), material(.@"opaque") };
+    materials[1].rendering.double_sided = true;
+
+    var meshes = [_]gltf.importer.Mesh{
+        meshAt(&vertices[0], 0),
+        meshAt(&vertices[1], 1),
+        meshAt(&vertices[2], 0),
+    };
+    // A skinned draw whose joints could mirror a vertex without the instance
+    // matrix saying so.
+    meshes[2].skin = 0;
+
+    var model: gltf.importer.Model = .{
+        .meshes = &meshes,
+        .materials = &materials,
+        .images = &.{},
+        .lights = &.{},
+        .skins = &.{},
+        .node_animation = null,
+        .morph_templates = &.{},
+    };
+    const resident = [_]*const gpu.Mesh{ &mesh_a, &mesh_a, &mesh_a };
+
+    var world = try lenore.World.init(
+        testing.allocator,
+        &model,
+        &resident,
+        &.{ null, null, null },
+        .{ .capacity = capacity, .placement = zm.identity() },
+    );
+    defer world.deinit();
+
+    try testing.expectEqual(scene.FaceCulling.back, world.plan.candidates[0].face_culling);
+    // Section 3.9.5: a double-sided material culls neither side.
+    try testing.expectEqual(scene.FaceCulling.none, world.plan.candidates[1].face_culling);
+    try testing.expectEqual(scene.FaceCulling.none, world.plan.candidates[2].face_culling);
+
+    // An unmirrored placement leaves every draw wound the way glTF defines.
+    try world.plan.rebuild(world.meshes, null, zm.identity(), .{ 0, 0, 0 }, seesEverything());
+    for (world.plan.candidates) |candidate|
+        try testing.expectEqual(scene.FrontFace.counter_clockwise, candidate.front_face);
+
+    // Section 3.7.4: a negative determinant is the other winding, and it is the
+    // instance matrix that carries it here rather than anything in the mesh.
+    try world.plan.rebuild(
+        world.meshes,
+        null,
+        zm.scaling(-1, 1, 1),
+        .{ 0, 0, 0 },
+        seesEverything(),
+    );
+    for (world.plan.candidates) |candidate|
+        try testing.expectEqual(scene.FrontFace.clockwise, candidate.front_face);
 }
