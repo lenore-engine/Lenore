@@ -1129,3 +1129,71 @@ test "every vertex variant is in the module the pipeline names" {
     }) |streams| _ = try sceneVertexEntry(parsed, streams);
     try testing.expect(entryPoint(parsed, "fragmentMain") != null);
 }
+
+// SPIR-V specification, 3.20 Decoration, `Index`: what makes a second fragment
+// output the second *source* of one attachment rather than a second
+// attachment. The number is `SpvDecorationIndex` in the Khronos SPIR-V headers,
+// beside the two above.
+const decoration_index: u32 = 32;
+
+// Every variable the module decorates with `Index`, paired with the location it
+// was also given.
+fn dualSourceOutputs(
+    spirv: []const u32,
+    out: *std.ArrayList([2]u32),
+    allocator: std.mem.Allocator,
+) !void {
+    var indexed: std.ArrayList([2]u32) = .empty;
+    defer indexed.deinit(allocator);
+    var located: std.ArrayList([2]u32) = .empty;
+    defer located.deinit(allocator);
+
+    var index: usize = 5;
+    while (index < spirv.len) : (index += spirv[index] >> 16) {
+        const length = spirv[index] >> 16;
+        if ((spirv[index] & 0xFFFF) != op_decorate) continue;
+        if (length != 4) continue;
+        if (spirv[index + 2] == decoration_index)
+            try indexed.append(allocator, .{ spirv[index + 1], spirv[index + 3] });
+        if (spirv[index + 2] == decoration_location)
+            try located.append(allocator, .{ spirv[index + 1], spirv[index + 3] });
+    }
+
+    for (indexed.items) |pair| {
+        for (located.items) |location| {
+            if (location[0] == pair[0]) try out.append(allocator, .{ location[1], pair[1] });
+        }
+    }
+}
+
+// The overlay blends against a second source, and the whole of what makes that
+// legal is two decorations on one output.
+//
+// Slang does not produce them from `SV_Target1` alone: measured on this
+// module, it decorated the second output as location 1, which names a second
+// colour attachment the overlay pipeline does not have. The shader states
+// `vk::location` and `vk::index` explicitly, and this is what says it still
+// does. Nothing else in the tree can: the reflection JSON reports neither
+// decoration, and a wrong one is a picture that is wrong at every glyph edge
+// rather than a failure.
+test "the overlay writes two sources into one attachment" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var outputs: std.ArrayList([2]u32) = .empty;
+    try dualSourceOutputs(lenore.Shaders.ui.spirv, &outputs, allocator);
+
+    // Exactly one output carries an index, and it is the second source of the
+    // first attachment.
+    try testing.expectEqual(@as(usize, 1), outputs.items.len);
+    try testing.expectEqual([2]u32{ 0, 1 }, outputs.items[0]);
+
+    // And no other module has one, because no other pipeline asks the blend
+    // unit for a second source.
+    inline for (.{ "scene", "shadow", "sky", "bloom", "post", "morph" }) |name| {
+        var others: std.ArrayList([2]u32) = .empty;
+        try dualSourceOutputs(@field(lenore.Shaders, name).spirv, &others, allocator);
+        try testing.expectEqual(@as(usize, 0), others.items.len);
+    }
+}

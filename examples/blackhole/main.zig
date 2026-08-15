@@ -1,5 +1,6 @@
 const std = @import("std");
 const gpu = @import("lenore-gpu");
+const imui = @import("lenore-imui");
 const lenore = @import("lenore");
 const platform = @import("lenore-platform");
 const OrbitControl = @import("example-orbit").OrbitControl;
@@ -354,7 +355,7 @@ const Driver = struct {
     // identity, since two windows can measure the same duration.
     reported_windows: u64 = 0,
 
-    pub fn onEvent(self: *Driver, engine: *lenore.Engine, event: platform.Event) !void {
+    pub fn onEvent(self: *Driver, engine: *lenore.Engine, event: platform.Event, _: bool) !void {
         switch (event.payload) {
             .cursor => |cursor| self.orbit.dragTo(
                 &engine.camera,
@@ -477,6 +478,12 @@ const Driver = struct {
     pub fn onResize(_: *Driver, _: *lenore.Engine, _: platform.Extent2D) !void {}
     pub fn onCompute(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
 
+    // Nothing to draw over the picture. The hook is required of every
+
+    // driver, so declining it is a declaration rather than an omission.
+    pub fn onUiRegions(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
+    pub fn onUiDraw(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
+
     pub fn onRecord(
         self: *Driver,
         engine: *lenore.Engine,
@@ -528,7 +535,7 @@ const Driver = struct {
         });
     }
 
-    pub fn onFrame(
+    pub fn onUpdate(
         self: *Driver,
         engine: *lenore.Engine,
         _: *lenore.Level,
@@ -543,10 +550,10 @@ const Driver = struct {
         // Reported per closed window rather than per frame, and only when the
         // window is one this has not seen: the report's own numbers are not an
         // identity, since two windows can measure the same duration.
-        if (engine.fps_windows == self.reported_windows) return;
-        self.reported_windows = engine.fps_windows;
+        if (engine.metrics.closed_windows == self.reported_windows) return;
+        self.reported_windows = engine.metrics.closed_windows;
 
-        const report = engine.last_fps orelse return;
+        const report = engine.metrics.last_fps orelse return;
         // The chain's own counter, not the setting: what a look asked for and
         // what was recorded are two different things, and this is the one that
         // can be read from outside a frame. A glow that is not there is either
@@ -613,12 +620,10 @@ pub fn main(process: std.process.Init.Minimal) !void {
     try engine.init(gpa, .{
         .title = "Lenore: Schwarzschild",
         .extent = .{ .width = 1280, .height = 720 },
-        // Nothing is drawn from an asset, so the rings and the material table
-        // hold the smallest thing their types allow rather than a capacity this
-        // application would never fill.
-        .frame_capacity = .{ .instances = 1, .joints = 1 },
-        .morph_capacity = .{ .meshes = 1, .weights = 1 },
-        .material_capacity = 1,
+        // Nothing is drawn from an asset, and zero is how that is said.
+        .frame_capacity = .{ .instances = 0, .joints = 0 },
+        .morph_capacity = .{ .meshes = 0, .weights = 0 },
+        .material_capacity = 0,
     });
     defer engine.deinit();
 

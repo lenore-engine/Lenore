@@ -1,7 +1,9 @@
 const std = @import("std");
 const gltf = @import("lenore-gltf");
 const gpu = @import("lenore-gpu");
+const imui = @import("lenore-imui");
 const lenore = @import("lenore");
+const platform = @import("lenore-platform");
 const scene = @import("lenore-scene");
 const zm = @import("zmath");
 
@@ -284,4 +286,149 @@ test "a document with more lights than the block holds fills it and stops" {
     try testing.expectEqual(@as(usize, gpu.max_lights), live.len);
     try testing.expectEqual(@as(f32, 1), live[0].intensity);
     try testing.expectEqual(@as(f32, gpu.max_lights), live[gpu.max_lights - 1].intensity);
+}
+
+fn uiEvent(payload: platform.Payload) platform.Event {
+    return .{ .sequence = 0, .timestamp_ns = 0, .payload = payload };
+}
+
+fn uiMetrics(generation: u32) platform.Payload {
+    return .{ .surface_metrics = .{
+        .logical_size = .{ 1000, 700 },
+        .framebuffer_extent = .{ .width = 1501, .height = 1051 },
+        .scale = .{ 1.5, 1.5 },
+        .generation = generation,
+    } };
+}
+
+fn uiTranslator(generation: u32) lenore.UiEvents {
+    var state: platform.InputState = .{};
+    state.apply(uiMetrics(generation));
+    return .init(state.metrics);
+}
+
+test "a pointer position crosses in framebuffer pixels" {
+    var events = uiTranslator(1);
+
+    const moved = events.translate(uiEvent(.{ .cursor = .{
+        .logical_position = .{ 500, 350 },
+        .metrics_generation = 1,
+    } }));
+    try testing.expectEqual(
+        imui.Event{ .pointer_move = .{ .x = 750.5, .y = 525.5 } },
+        moved.?,
+    );
+
+    const pressed = events.translate(uiEvent(.{ .mouse_button = .{
+        .button = .right,
+        .action = .press,
+        .modifiers = .{ .shift = true },
+        .logical_position = .{ 0, 700 },
+        .metrics_generation = 1,
+    } }));
+    try testing.expectEqual(imui.Event{ .pointer_button = .{
+        .position = .{ .x = 0, .y = 1051 },
+        .button = .secondary,
+        .action = .press,
+        .shift = true,
+    } }, pressed.?);
+}
+
+test "the surface configuration is folded where it arrives in the batch" {
+    var events = uiTranslator(1);
+    const moved = uiEvent(.{ .cursor = .{
+        .logical_position = .{ 500, 350 },
+        .metrics_generation = 2,
+    } });
+
+    // The window has resized and the event says so, but the metrics that
+    // describe the new surface are still ahead of it in the batch.
+    try testing.expectEqual(null, events.translate(moved));
+
+    try testing.expectEqual(null, events.translate(uiEvent(uiMetrics(2))));
+    try testing.expect(events.translate(moved) != null);
+}
+
+test "a transition that cannot be placed cancels the gesture and a motion does not" {
+    var events = uiTranslator(4);
+
+    // Both carry a generation the translator has not seen. The motion is
+    // dropped, because the pointer keeps the last position it was known at;
+    // the transition becomes a cancel, because the release it might be is the
+    // one thing that must not go missing.
+    try testing.expectEqual(null, events.translate(uiEvent(.{ .cursor = .{
+        .logical_position = .{ 500, 350 },
+        .metrics_generation = 9,
+    } })));
+    try testing.expectEqual(imui.Event.cancel, events.translate(uiEvent(.{ .mouse_button = .{
+        .button = .left,
+        .action = .release,
+        .logical_position = .{ 500, 350 },
+        .metrics_generation = 9,
+    } })).?);
+}
+
+test "what the UI has no word for does not cross" {
+    var events = uiTranslator(1);
+
+    for ([_]platform.MouseButton{ .back, .forward, .other }) |button| {
+        try testing.expectEqual(null, events.translate(uiEvent(.{ .mouse_button = .{
+            .button = button,
+            .action = .press,
+            .logical_position = .{ 500, 350 },
+            .metrics_generation = 1,
+        } })));
+    }
+    // A held mouse button does not repeat: the action type is shared with the
+    // keyboard, where it does.
+    try testing.expectEqual(null, events.translate(uiEvent(.{ .mouse_button = .{
+        .button = .left,
+        .action = .repeat,
+        .logical_position = .{ 500, 350 },
+        .metrics_generation = 1,
+    } })));
+
+    try testing.expectEqual(null, events.translate(uiEvent(.{ .key = .{
+        .physical = .q,
+        .action = .press,
+    } })));
+    try testing.expectEqual(null, events.translate(uiEvent(.{ .scroll = .{
+        .line_delta = .{ 0, 1 },
+    } })));
+    try testing.expectEqual(null, events.translate(uiEvent(.{ .text = .{
+        .transaction = 1,
+        .kind = .commit,
+        .begin = true,
+        .end = true,
+        .len = 1,
+        .bytes = [_]u8{'a'} ++ [_]u8{0} ** 15,
+    } })));
+}
+
+test "the keys a widget acts on keep their action and their shift" {
+    var events = uiTranslator(1);
+
+    try testing.expectEqual(imui.Event{ .key = .{
+        .key = .enter,
+        .action = .repeat,
+        .shift = false,
+    } }, events.translate(uiEvent(.{ .key = .{
+        .physical = .numpad_enter,
+        .action = .repeat,
+    } })).?);
+
+    try testing.expectEqual(imui.Event{ .key = .{
+        .key = .tab,
+        .action = .press,
+        .shift = true,
+    } }, events.translate(uiEvent(.{ .key = .{
+        .physical = .tab,
+        .action = .press,
+        .modifiers = .{ .shift = true },
+    } })).?);
+
+    try testing.expectEqual(
+        imui.Event{ .focus = false },
+        events.translate(uiEvent(.{ .focus = .{ .focused = false } })).?,
+    );
 }

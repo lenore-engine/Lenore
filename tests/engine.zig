@@ -1,5 +1,6 @@
 const std = @import("std");
 const gpu = @import("lenore-gpu");
+const imui = @import("lenore-imui");
 const lenore = @import("lenore");
 const platform = @import("lenore-platform");
 
@@ -19,11 +20,13 @@ const testing = std.testing;
 // invisible to the engine's file, and before the hooks were made required that
 // compiled into a loop that called nothing.
 const Full = struct {
-    pub fn onEvent(_: *Full, _: *lenore.Engine, _: platform.Event) !void {}
+    pub fn onEvent(_: *Full, _: *lenore.Engine, _: platform.Event, _: bool) !void {}
     pub fn onResize(_: *Full, _: *lenore.Engine, _: platform.Extent2D) !void {}
+    pub fn onUpdate(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: lenore.FrameTime) !void {}
     pub fn onCompute(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onRecord(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onFrame(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: lenore.FrameTime) !void {}
+    pub fn onUiRegions(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
+    pub fn onUiDraw(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
 };
 
 test "the loop compiles for a driver that declares every hook" {
@@ -98,29 +101,4 @@ test "animated casters re-record under a sun that has not moved" {
         .map_stale = false,
         .casters_move = true,
     }));
-}
-
-test "the phase window averages over the frames it summed" {
-    var window: lenore.FramePhases = .{};
-    // Three frames of different shapes, so a mean taken over the wrong count or
-    // a field summed into its neighbour is visible.
-    for ([_]lenore.FramePhases{
-        .{ .wait_ns = 100, .world_ns = 20, .record_ns = 6 },
-        .{ .wait_ns = 200, .world_ns = 40, .record_ns = 9 },
-        .{ .wait_ns = 300, .world_ns = 60, .record_ns = 15 },
-    }) |frame| window.add(frame);
-
-    const mean = window.mean(3);
-    try testing.expectEqual(@as(u64, 200), mean.wait_ns);
-    try testing.expectEqual(@as(u64, 40), mean.world_ns);
-    try testing.expectEqual(@as(u64, 10), mean.record_ns);
-    // A phase nothing spent time in stays zero rather than picking up a
-    // neighbour's total.
-    try testing.expectEqual(@as(u64, 0), mean.acquire_ns);
-    try testing.expectEqual(@as(u64, 250), mean.total());
-}
-
-test "a window of no frames divides nothing" {
-    const window: lenore.FramePhases = .{ .wait_ns = 7 };
-    try testing.expectEqual(@as(u64, 0), window.mean(0).wait_ns);
 }

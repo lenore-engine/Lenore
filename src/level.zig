@@ -176,6 +176,15 @@ pub const Level = struct {
         return self;
     }
 
+    // Releases a level the engine never took. The cache is named because a
+    // level holds references into it and gives them back here, not because
+    // ownership is split: the images belong to the cache, which counts them,
+    // and a level that drew no asset gives back none.
+    //
+    // A level that was installed goes back through `Engine.unload` instead,
+    // which has three other owners to ask first. The two are not
+    // interchangeable in either direction: unloading one the renderer never
+    // took would clear material records belonging to whatever is installed.
     pub fn deinit(self: *Level, textures: *gpu.TextureCache) void {
         self.release(textures, true);
     }

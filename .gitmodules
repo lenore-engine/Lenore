@@ -16,3 +16,9 @@
 [submodule "lenore-ktx"]
 	path = lenore-ktx
 	url = https://github.com/lenore-engine/lenore-ktx.git
+[submodule "lenore-imui"]
+	path = lenore-imui
+	url = https://github.com/lenore-engine/lenore-imui.git
+[submodule "lenore-text"]
+	path = lenore-text
+	url = https://github.com/lenore-engine/lenore-text.git

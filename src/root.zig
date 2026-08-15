@@ -13,10 +13,12 @@
 const time = @import("time.zig");
 const engine = @import("engine.zig");
 const environment = @import("environment.zig");
+const font = @import("font.zig");
 const images = @import("images.zig");
 const level = @import("level.zig");
 const shaders = @import("shaders.zig");
 const translate = @import("translate.zig");
+const ui = @import("ui.zig");
 const world = @import("world.zig");
 
 pub const Engine = engine.Engine;
@@ -24,13 +26,15 @@ pub const EngineOptions = engine.Options;
 pub const Look = engine.Look;
 pub const NoDriver = engine.NoDriver;
 pub const Sun = engine.Sun;
-pub const FramePhases = engine.FramePhases;
+pub const FramePhases = time.FramePhases;
 pub const ShadowBakeRequest = engine.ShadowBakeRequest;
 
 pub const FrameClock = time.FrameClock;
 pub const FrameTime = time.FrameTime;
 pub const FpsCounter = time.FpsCounter;
 pub const PhaseTimer = time.PhaseTimer;
+pub const Phase = time.Phase;
+pub const FrameMetrics = time.FrameMetrics;
 pub const max_frame_delta_ns = time.max_frame_delta_ns;
 pub const seconds = time.seconds;
 
@@ -45,6 +49,18 @@ pub const fillVertexSources = translate.fillVertexSources;
 pub const sceneLight = translate.sceneLight;
 pub const packLight = translate.packLight;
 pub const packDocumentLights = translate.packDocumentLights;
+pub const UiEvents = translate.UiEvents;
+pub const uiScale = translate.uiScale;
+
+pub const UiHost = ui.Host;
+pub const WidgetCapacity = ui.Capacity;
+
+pub const Fonts = font.Fonts;
+pub const FontCapacity = font.Capacity;
+pub const FontError = font.Error;
+pub const FontId = font.FontId;
+pub const FontRendering = font.Rendering;
+pub const fontAdvance = font.advance;
 
 pub const World = world.World;
 pub const WorldError = world.WorldError;

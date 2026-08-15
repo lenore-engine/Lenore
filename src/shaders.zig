@@ -97,6 +97,15 @@ pub const shadow: gpu.ShadowShader = .{
     .masked_fragment_entry = "fragmentMain",
 };
 
+// The overlay: a two-dimensional draw list composited onto the presentable
+// image after the tone operator. One pipeline, because the fragment stage
+// multiplies the vertex colour by the sampled texel whatever the image holds.
+pub const ui: gpu.UiShader = .{
+    .spirv = words(@embedFile("ui").*),
+    .vertex_entry = "vertexMain",
+    .fragment_entry = "fragmentMain",
+};
+
 // The morph prepass: shape targets resolved into a vertex buffer the main pass
 // draws in place of the mesh's own. Compute only, and it shares no binding with
 // any pass above.
@@ -204,6 +213,15 @@ pub const all = [_]Module{
             .{ .name = shadow.vertex_entry, .stage = .vertex },
             .{ .name = shadow.skinned_vertex_entry, .stage = .vertex },
             .{ .name = shadow.masked_fragment_entry, .stage = .fragment },
+        },
+    },
+    .{
+        .name = "ui",
+        .spirv = ui.spirv,
+        .reflection = @embedFile("ui_reflection"),
+        .entry_points = &.{
+            .{ .name = ui.vertex_entry, .stage = .vertex },
+            .{ .name = ui.fragment_entry, .stage = .fragment },
         },
     },
     .{

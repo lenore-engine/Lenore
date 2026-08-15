@@ -73,11 +73,38 @@ float3 toneMapPbrNeutral(float3 colour)
     return lerp(colour, float3(compressed_peak), desaturation);
 }
 
+// Linear light to what the display shows.
+//
+// Khronos Data Format Specification v1.3, section 13.3.2 "sRGB EOTF^-1": below
+// the threshold the linear value is scaled by 12.92, above it the root is taken
+// and the offset applied.
+//
+// It is here rather than in the attachment's format, and that is what makes the
+// overlay composite the way a UI expects. Blending against an `_SRGB`
+// attachment happens in linear light by specification, which spreads a glyph's
+// half-covered edge much further up the display's scale than half. The target
+// therefore carries no transfer function and this is the only place the picture
+// is encoded.
+float encodeChannel(float linear_value)
+{
+    return linear_value <= 0.0031308
+        ? linear_value * 12.92
+        : 1.055 * pow(linear_value, 1.0 / 2.4) - 0.055;
+}
+
+float3 encodeSrgb(float3 linear_value)
+{
+    return float3(
+        encodeChannel(linear_value.x),
+        encodeChannel(linear_value.y),
+        encodeChannel(linear_value.z));
+}
+
 // The operator's input is non-negative linear radiance, so the clamp is where
 // the two entry points below meet rather than something either repeats.
 float4 present(float3 radiance)
 {
-    return float4(toneMapPbrNeutral(max(radiance, 0.0)), 1.0);
+    return float4(encodeSrgb(toneMapPbrNeutral(max(radiance, 0.0))), 1.0);
 }
 
 [shader("fragment")]

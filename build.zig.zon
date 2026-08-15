@@ -9,7 +9,9 @@
         .lenore_ktx = .{ .path = "lenore-ktx" },
         .lenore_platform = .{ .path = "lenore-platform" },
         .lenore_resources = .{ .path = "lenore-resources" },
+        .lenore_imui = .{ .path = "lenore-imui" },
         .lenore_scene = .{ .path = "lenore-scene" },
+        .lenore_text = .{ .path = "lenore-text" },
         .zignal = .{
             .url = "https://github.com/arrufat/zignal/archive/refs/tags/0.10.0.tar.gz",
             .hash = "zignal-0.10.0-OrZ3syf3JwDM3rBtoTFDXQT4iUJeoPqVaAJDHAjtM7jN",

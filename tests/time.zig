@@ -189,3 +189,118 @@ test "the total excludes a phase that is still running" {
 
     try testing.expectEqual(@as(u64, 5 * ms), timer.total());
 }
+
+test "the phase window averages over the frames it summed" {
+    var window: lenore.FramePhases = .{};
+    // Three frames of different shapes, so a mean taken over the wrong count or
+    // a field summed into its neighbour is visible.
+    for ([_]lenore.FramePhases{
+        .{ .wait_ns = 100, .world_ns = 20, .record_ns = 6 },
+        .{ .wait_ns = 200, .world_ns = 40, .record_ns = 9 },
+        .{ .wait_ns = 300, .world_ns = 60, .record_ns = 15 },
+    }) |frame| window.add(frame);
+
+    const mean = window.mean(3);
+    try testing.expectEqual(@as(u64, 200), mean.wait_ns);
+    try testing.expectEqual(@as(u64, 40), mean.world_ns);
+    try testing.expectEqual(@as(u64, 10), mean.record_ns);
+    // A phase nothing spent time in stays zero rather than picking up a
+    // neighbour's total.
+    try testing.expectEqual(@as(u64, 0), mean.acquire_ns);
+    try testing.expectEqual(@as(u64, 250), mean.total());
+}
+
+test "a window of no frames divides nothing" {
+    const window: lenore.FramePhases = .{ .wait_ns = 7 };
+    try testing.expectEqual(@as(u64, 0), window.mean(0).wait_ns);
+}
+
+// One whole frame: every phase closed in order, then the frame ended. The value
+// a phase gets is a function of its position, so a split written into its
+// neighbour's field moves a number the assertions name.
+fn wholeFrame(metrics: *lenore.FrameMetrics, weight: u64, interval_ns: u64) void {
+    metrics.beginFrame();
+    inline for (@typeInfo(lenore.Phase).@"enum".fields) |field| {
+        metrics.record(@enumFromInt(field.value), weight * (field.value + 1));
+    }
+    metrics.endFrame(.{
+        .elapsed_ns = 0,
+        .interval_ns = interval_ns,
+        .delta = 0,
+        .index = 0,
+    });
+}
+
+test "every phase closes its own field" {
+    var metrics: lenore.FrameMetrics = .init(std.time.ns_per_s);
+    metrics.beginFrame();
+    inline for (@typeInfo(lenore.Phase).@"enum".fields) |field| {
+        metrics.record(@enumFromInt(field.value), field.value + 1);
+    }
+
+    try testing.expectEqual(@as(u64, 1), metrics.phases.events_ns);
+    try testing.expectEqual(@as(u64, 2), metrics.phases.ui_ns);
+    try testing.expectEqual(@as(u64, 3), metrics.phases.wait_ns);
+    try testing.expectEqual(@as(u64, 4), metrics.phases.acquire_ns);
+    try testing.expectEqual(@as(u64, 5), metrics.phases.update_ns);
+    try testing.expectEqual(@as(u64, 6), metrics.phases.world_ns);
+    try testing.expectEqual(@as(u64, 7), metrics.phases.rings_ns);
+    try testing.expectEqual(@as(u64, 8), metrics.phases.record_ns);
+    try testing.expectEqual(@as(u64, 9), metrics.phases.submit_ns);
+    try testing.expectEqual(@as(u64, 10), metrics.phases.present_ns);
+    // Ten phases numbered one to ten.
+    try testing.expectEqual(@as(u64, 55), metrics.phases.total());
+}
+
+test "a window reports the phases of exactly the frames it counted" {
+    var metrics: lenore.FrameMetrics = .init(100 * ms);
+
+    // Three frames of different weights, so a mean taken over the wrong count
+    // is visible rather than cancelling.
+    wholeFrame(&metrics, 1, 30 * ms);
+    try testing.expectEqual(@as(?lenore.FpsCounter.Report, null), metrics.last_fps);
+    wholeFrame(&metrics, 2, 30 * ms);
+    try testing.expectEqual(@as(u64, 0), metrics.closed_windows);
+
+    wholeFrame(&metrics, 3, 40 * ms);
+    const report = metrics.last_fps.?;
+    try testing.expectEqual(@as(u32, 3), report.frames);
+    try testing.expectEqual(@as(u64, 1), metrics.closed_windows);
+
+    // Weights 1, 2 and 3 sum to 6 per unit of position, so the mean is 2.
+    try testing.expectEqual(@as(u64, 2), metrics.last_phases.events_ns);
+    try testing.expectEqual(@as(u64, 10), metrics.last_phases.update_ns);
+    // The last phase of the frame, which is the one a window closed too early
+    // reports as nothing.
+    try testing.expectEqual(@as(u64, 20), metrics.last_phases.present_ns);
+    try testing.expectEqual(@as(u64, 110), metrics.last_phases.total());
+}
+
+test "a frame the loop abandoned is in no window" {
+    var metrics: lenore.FrameMetrics = .init(ms);
+
+    // Opened, four phases closed, and then dropped where the loop takes an
+    // early exit. Its numbers are large enough to be unmistakable in the answer.
+    metrics.beginFrame();
+    metrics.record(.events, 1000);
+    metrics.record(.ui, 1000);
+    metrics.record(.wait, 1000);
+    metrics.record(.acquire, 1000);
+
+    wholeFrame(&metrics, 1, 2 * ms);
+    try testing.expectEqual(@as(u64, 1), metrics.closed_windows);
+    try testing.expectEqual(@as(u32, 1), metrics.last_fps.?.frames);
+    try testing.expectEqual(@as(u64, 1), metrics.last_phases.events_ns);
+    try testing.expectEqual(@as(u64, 55), metrics.last_phases.total());
+}
+
+test "a closed window carries no phases into the next one" {
+    var metrics: lenore.FrameMetrics = .init(ms);
+
+    wholeFrame(&metrics, 4, 2 * ms);
+    try testing.expectEqual(@as(u64, 4 * 55), metrics.last_phases.total());
+
+    wholeFrame(&metrics, 1, 2 * ms);
+    try testing.expectEqual(@as(u64, 2), metrics.closed_windows);
+    try testing.expectEqual(@as(u64, 55), metrics.last_phases.total());
+}

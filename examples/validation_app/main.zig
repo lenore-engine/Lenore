@@ -1,6 +1,7 @@
 const std = @import("std");
 const gltf = @import("lenore-gltf");
 const gpu = @import("lenore-gpu");
+const imui = @import("lenore-imui");
 const lenore = @import("lenore");
 const platform = @import("lenore-platform");
 const res = @import("lenore-resources");
@@ -319,7 +320,7 @@ const Harness = struct {
     weight_start: ?struct { elapsed: u64, weights: [8]f32, count: usize } = null,
     weight_reported: bool = false,
 
-    pub fn onEvent(self: *Harness, engine: *lenore.Engine, event: platform.Event) !void {
+    pub fn onEvent(self: *Harness, engine: *lenore.Engine, event: platform.Event, _: bool) !void {
         _ = engine;
         switch (event.payload) {
             // Presses only. A repeat would reapply a view already applied, and
@@ -351,21 +352,28 @@ const Harness = struct {
         reportUpAxis(gpu.vulkanClip(view_projection), self.bounds, extent);
     }
     pub fn onCompute(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
+    // Nothing to draw over the picture. The hook is required of every
+    // driver, so declining it is a declaration rather than an omission.
+    pub fn onUiRegions(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
+    pub fn onUiDraw(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
+
     pub fn onRecord(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
 
-    pub fn onFrame(
+    pub fn onUpdate(
         self: *Harness,
         engine: *lenore.Engine,
         level: *lenore.Level,
         time: lenore.FrameTime,
     ) !void {
         try self.applyRequests(engine, level);
-        self.probeMotion(level, time);
+        self.probeMotion(engine, level, time);
         self.probeWeights(level, time);
         self.probeCounters(engine);
 
-        // The frame is recorded and not yet submitted, so this is the count the
-        // recording produced rather than one a later frame added to.
+        // The layer's counter belongs to the process and only grows, so this is
+        // everything it has reported up to here: the previous frame entire, its
+        // submission and its presentation included. `recorded_frames` is how
+        // many frames had been recorded when that was true.
         const errors = gpu.validationErrorCount();
         if (errors != self.reported_validation) {
             log.err("validation errors after frame {d}: {d}", .{ engine.recorded_frames, errors });
@@ -377,7 +385,7 @@ const Harness = struct {
         }
 
         if (!self.fps_reported) {
-            if (engine.last_fps) |report| {
+            if (engine.metrics.last_fps) |report| {
                 log.info("frames: {d:.1} per second, {d:.2} ms mean, {d:.2} ms worst", .{
                     report.fps, report.mean_ms, report.worst_ms,
                 });
@@ -419,7 +427,17 @@ const Harness = struct {
     // Does the picture actually change? Read off the plan the device was handed
     // rather than off the animator, so a break anywhere between the two shows
     // up here.
-    fn probeMotion(self: *Harness, level: *lenore.Level, time: lenore.FrameTime) void {
+    fn probeMotion(
+        self: *Harness,
+        engine: *lenore.Engine,
+        level: *lenore.Level,
+        time: lenore.FrameTime,
+    ) void {
+        // The plan's matrices are allocated and left to `World.update` to fill,
+        // so before a frame has been recorded they are not a pose. A snapshot
+        // taken from them would differ from every later one and the check below
+        // could not fail, which is worse than not running it.
+        if (engine.recorded_frames == 0) return;
         // A clip with no span holds one pose by definition, so there is nothing
         // to separate and this would only report a still draw as broken.
         if (self.motion_span <= 0) return;

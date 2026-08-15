@@ -2,6 +2,7 @@ const std = @import("std");
 const gltf = @import("lenore-gltf");
 const gpu = @import("lenore-gpu");
 const ktx = @import("lenore-ktx");
+const imui = @import("lenore-imui");
 const lenore = @import("lenore");
 const platform = @import("lenore-platform");
 const res = @import("lenore-resources");
@@ -357,7 +358,7 @@ const Walker = struct {
 
     const Leaving = enum { none, quit, previous, next };
 
-    pub fn onEvent(self: *Walker, engine: *lenore.Engine, event: platform.Event) !void {
+    pub fn onEvent(self: *Walker, engine: *lenore.Engine, event: platform.Event, _: bool) !void {
         switch (event.payload) {
             .cursor => |cursor| self.camera.look(&engine.camera, cursor.logical_position),
             .scroll => |wheel| self.camera.wheel(wheel.line_delta[1]),
@@ -455,8 +456,14 @@ const Walker = struct {
     pub fn onResize(_: *Walker, _: *lenore.Engine, _: platform.Extent2D) !void {}
     pub fn onCompute(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
 
+    // Nothing to draw over the picture. The hook is required of every
+
+    // driver, so declining it is a declaration rather than an omission.
+    pub fn onUiRegions(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
+    pub fn onUiDraw(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
+
     pub fn onRecord(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onFrame(
+    pub fn onUpdate(
         self: *Walker,
         engine: *lenore.Engine,
         level: *lenore.Level,
@@ -464,8 +471,8 @@ const Walker = struct {
     ) !void {
         self.camera.advance(&engine.camera, time.delta);
 
-        // The look is read at the top of every frame, so writing it here is what
-        // the next one draws.
+        // Every read of the look is below this hook, so a key pressed this
+        // frame is answered by the picture this frame draws.
         engine.look.sun_shadow.enabled = self.shadows;
         engine.look.bloom = if (self.bloom) .{ .scatter = self.bloom_scatter } else null;
         engine.look.background = if (self.background and level.hasEnvironment())
@@ -485,9 +492,9 @@ const Walker = struct {
             engine.refitSun(level.world.sphere);
         }
 
-        if (engine.fps_windows != self.reported_windows) {
-            self.reported_windows = engine.fps_windows;
-            if (engine.last_fps) |report| self.reportFrame(engine, report);
+        if (engine.metrics.closed_windows != self.reported_windows) {
+            self.reported_windows = engine.metrics.closed_windows;
+            if (engine.metrics.last_fps) |report| self.reportFrame(engine, report);
         }
     }
 
@@ -496,7 +503,7 @@ const Walker = struct {
         engine: *lenore.Engine,
         report: lenore.FpsCounter.Report,
     ) void {
-        const phases = engine.last_phases;
+        const phases = engine.metrics.last_phases;
         // The target extent belongs beside the rate. A compositor decides what a
         // window's framebuffer measures, and on a scaled output that is not
         // what was asked for; a millisecond count read without it says nothing
@@ -520,15 +527,17 @@ const Walker = struct {
         // most of it is the display: a large `wait` or `events` beside small
         // everything else is a frame with time to spare.
         log.info(
-            "  host {d:.3} of {d:.3} ms: events {d:.3}, wait {d:.3}, acquire {d:.3}, world {d:.3}, rings {d:.3}, record {d:.3}, submit {d:.3}, present {d:.3}",
+            "  host {d:.3} of {d:.3} ms: events {d:.3}, ui {d:.3}, wait {d:.3}, acquire {d:.3}, update {d:.3}, world {d:.3}, rings {d:.3}, record {d:.3}, submit {d:.3}, present {d:.3}",
             .{
                 milliseconds(phases.total()),
                 report.mean_ms,
                 milliseconds(phases.events_ns),
+                milliseconds(phases.ui_ns),
                 milliseconds(phases.wait_ns),
                 milliseconds(phases.acquire_ns),
-                milliseconds(phases.world_ns),
                 milliseconds(phases.update_ns),
+                milliseconds(phases.world_ns),
+                milliseconds(phases.rings_ns),
                 milliseconds(phases.record_ns),
                 milliseconds(phases.submit_ns),
                 milliseconds(phases.present_ns),

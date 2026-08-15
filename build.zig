@@ -29,8 +29,12 @@ pub fn build(b: *std.Build) void {
     const gltf_import: std.Build.Module.Import = .{ .name = "lenore-gltf", .module = gltf.module("lenore-gltf") };
     const resources = b.dependency("lenore_resources", .{ .target = target, .optimize = optimize });
     const resources_import: std.Build.Module.Import = .{ .name = "lenore-resources", .module = resources.module("lenore-resources") };
+    const imui = b.dependency("lenore_imui", .{ .target = target, .optimize = optimize });
+    const imui_import: std.Build.Module.Import = .{ .name = "lenore-imui", .module = imui.module("lenore-imui") };
     const scene = b.dependency("lenore_scene", .{ .target = target, .optimize = optimize });
     const scene_import: std.Build.Module.Import = .{ .name = "lenore-scene", .module = scene.module("lenore-scene") };
+    const text = b.dependency("lenore_text", .{ .target = target, .optimize = optimize });
+    const text_import: std.Build.Module.Import = .{ .name = "lenore-text", .module = text.module("lenore-text") };
     const zignal_import: std.Build.Module.Import = .{
         .name = "zignal",
         .module = b.dependency("zignal", .{ .target = target, .optimize = optimize }).module("zignal"),
@@ -66,8 +70,10 @@ pub fn build(b: *std.Build) void {
             gltf_import,
             gpu_import,
             platform_import,
+            imui_import,
             resources_import,
             scene_import,
+            text_import,
             zignal_import,
             zmath_import,
         },
@@ -93,8 +99,10 @@ pub fn build(b: *std.Build) void {
         ktx_import,
         gpu_import,
         platform_import,
+        imui_import,
         resources_import,
         scene_import,
+        text_import,
         zignal_import,
         zmath_import,
     };
@@ -118,7 +126,11 @@ pub fn build(b: *std.Build) void {
 
         const example = b.addExecutable(.{ .name = name, .root_module = module });
         example.root_module.linkLibrary(platform.artifact("glfw"));
-        examples_step.dependOn(&b.addInstallArtifact(example, .{}).step);
+        const install = b.addInstallArtifact(example, .{});
+        examples_step.dependOn(&install.step);
+        // One example on its own, for when the change being looked at is in the
+        // engine and building the other four is the cost of looking at it.
+        b.step(name, b.fmt("Build the {s} example", .{name})).dependOn(&install.step);
 
         const run = b.addRunArtifact(example);
         if (b.args) |args| run.addArgs(args);
@@ -138,8 +150,10 @@ pub fn build(b: *std.Build) void {
                 ktx_import,
                 gpu_import,
                 platform_import,
+                imui_import,
                 resources_import,
                 scene_import,
+                text_import,
                 zignal_import,
                 zmath_import,
             },
@@ -151,6 +165,13 @@ pub fn build(b: *std.Build) void {
     // module's library links do not reach an artifact that imports it, so this
     // is named here as well as on the engine below.
     unit_tests.root_module.linkLibrary(platform.artifact("glfw"));
+    // The font the suite opens. Ahem's metrics are defined rather than
+    // designed, which is what makes an expected advance or coverage exact, and
+    // it is already `lenore-text`'s test asset. Named where it lies instead of
+    // copied: two copies of a test oracle is how they come to differ.
+    unit_tests.root_module.addAnonymousImport("test-font", .{
+        .root_source_file = b.path("lenore-text/tests/fonts/Ahem.ttf"),
+    });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
