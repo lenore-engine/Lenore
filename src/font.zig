@@ -40,6 +40,29 @@ pub const atlas_channels = text.atlas_channels;
 // one place rather than from wherever a caller happened to need a sum.
 pub const advance = text.advance;
 
+// The raster size a face of `logical` units is opened at, under `scale`.
+//
+// Separate from the engine's `fontPixels` so that it can be tested: what it
+// decides is a rounding and a range, neither of which needs a device, and the
+// method above it is this call and the scale it reads.
+//
+// **Zero for a size no face can be opened at**, which `add` and `addFile` both
+// answer with `error.SizeUnavailable`. Three inputs reach it: a logical size or
+// a scale that is not a number, one that scales below a whole pixel, and one
+// that scales past `max_pixel_size`. A refusal and not a clamp, for the reason
+// `Face.open` refuses instead of clamping: lowering an absurd request to the
+// largest face that can be built hands back a size nobody asked for.
+pub fn pixelsFor(logical: f32, scale: f32) u32 {
+    const pixels = @round(logical * scale);
+    // The narrowing below is unchecked in the shipping build, so the range is
+    // established here rather than left to it. The comparison is negated so
+    // that a NaN takes this branch instead of falling past it, and
+    // `max_pixel_size` is untyped so that the bound is compared in floating
+    // point without a second narrowing to reach it.
+    if (!(pixels >= 1) or pixels > text.max_pixel_size) return 0;
+    return @intFromFloat(pixels);
+}
+
 pub const Capacity = struct {
     // How many faces may be open at once. A face is a face at one size, so an
     // application showing one typeface at three sizes needs three.

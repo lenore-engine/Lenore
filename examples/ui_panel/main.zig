@@ -67,7 +67,14 @@ const usage =
 // A system font, which is the case the engine itself is for: an editor draws
 // with what the host has, where a game ships its own. Which font that is is the
 // host's answer and not this file's, so nothing here names one.
-const font_pixels = 20;
+//
+// Logical units, so the raster size follows the output the window is on:
+// `Engine.fontPixels` is what turns them into one. Fourteen because that is the
+// size a comparison of four rasters put first on the reference display, where
+// the scale is 1.5 and this lands on twenty-one pixels. The ranking was not
+// monotonic in size, so this is a measured preference rather than a rule, and it
+// stays in the application for that reason.
+const label_points: f32 = 14;
 
 // The longer of the two lines is well inside this, and the placements are one
 // per glyph per subpixel bucket. How many buckets a face has is settled when it
@@ -300,13 +307,15 @@ fn loadFont(engine: *lenore.Engine, io: std.Io) ?lenore.FontId {
     // answer carries how the host wants text drawn, which is what the face is
     // opened with: this example asks the host for both or neither.
     const rendering: lenore.FontRendering = .fromHost(found.rendering);
-    const id = engine.loadFontFile(io, .cwd(), found.path, found.index, font_pixels, rendering) catch |err| {
+    const pixels = engine.fontPixels(label_points);
+    const id = engine.loadFontFile(io, .cwd(), found.path, found.index, pixels, rendering) catch |err| {
         log.warn("{s} did not load: {t}", .{ found.path, err });
         return null;
     };
-    log.info("drawing with {s}, face {d}, {t} hinting and {t} coverage", .{
+    log.info("drawing with {s}, face {d} at {d} px, {t} hinting and {t} coverage", .{
         found.path,
         found.index,
+        pixels,
         rendering.hinting,
         rendering.antialias,
     });

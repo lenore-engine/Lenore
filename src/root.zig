@@ -61,6 +61,7 @@ pub const FontError = font.Error;
 pub const FontId = font.FontId;
 pub const FontRendering = font.Rendering;
 pub const fontAdvance = font.advance;
+pub const fontPixelsFor = font.pixelsFor;
 
 pub const World = world.World;
 pub const WorldError = world.WorldError;

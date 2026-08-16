@@ -75,7 +75,12 @@ const label_gap: f32 = 8;
 
 // The caption size in the same logical units the panel is laid out in. It
 // reaches pixels once, where the font is opened.
-const label_points: f32 = 13;
+//
+// Fourteen because that is the size a comparison of four rasters put first on
+// the reference display, where the scale is 1.5 and this lands on twenty-one
+// pixels. The ranking was not monotonic in size, so this is a measured
+// preference rather than a rule.
+const label_points: f32 = 14;
 
 // What the three rows say. The exposure row also carries its value, which is
 // the only text here that changes between frames.
@@ -451,19 +456,16 @@ const Driver = struct {
 
 // The font this host prefers for an interface, or nothing.
 //
-// The size is `label_points` against the scale the engine knows now, which is
-// the output's once the window has reported its metrics and one before that. A
-// face is a face at one size, so this is fixed for the run either way.
+// The size is `label_points` through `Engine.fontPixels`, which is the scale the
+// window has reported. A face is a face at one size, so this is fixed for the
+// run and the captions keep it if the window moves to another output.
 //
 // Nothing is not a failure. A host with no fontconfig and a host whose
 // configuration matches no font both answer that way, and the panel is legible
 // without captions: every control changes the picture, which is what this
 // example is read by.
 fn loadFont(engine: *lenore.Engine, io: std.Io) ?lenore.FontId {
-    const scale = engine.uiScale();
-    const pixels: u32 = @intFromFloat(@round(label_points * scale.y));
-
-    return engine.loadSystemFont(io, .{}, pixels) catch |err| {
+    return engine.loadSystemFont(io, .{}, engine.fontPixels(label_points)) catch |err| {
         log.warn("the host's font did not open: {t}", .{err});
         return null;
     } orelse {

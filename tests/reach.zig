@@ -20,6 +20,9 @@ test "the device-facing surface is compiled" {
     // Its fallback drains the device, so nothing host-side reaches the body.
     _ = &lenore.Engine.retire;
     _ = &lenore.Engine.refitSun;
+    // The scale it reads comes off the window, so the body needs one. The
+    // arithmetic it hands that scale to is `fontPixelsFor`, tested on its own.
+    _ = &lenore.Engine.fontPixels;
     // The loop is generic over its driver, and `_ = &fn` does not instantiate a
     // generic function. `tests/engine.zig` calls it with a driver instead, which
     // is what compiles the body.

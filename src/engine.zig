@@ -1171,6 +1171,31 @@ pub const Engine = struct {
         try self.context.waitIdle();
     }
 
+    // The raster size a face of `logical` units is opened at.
+    //
+    // This is the one place logical units become a size a face can be built at.
+    // An application doing the multiplication itself is sizing text against a
+    // scale this engine already holds, and has to pick an axis and a rounding of
+    // its own to do it; both were picked here once instead.
+    //
+    // **The vertical ratio**, because a size is a vertical measure. The two axes
+    // are not the same number wherever the compositor rounded the logical extent
+    // into whole pixels: on the reference host they read 1.50000 across against
+    // 1.49952 down.
+    //
+    // **A face is a face at one size**, so this is answered once, when a font is
+    // loaded, and the face does not follow the window afterwards. A driver that
+    // wants text to track a scale change hears the change through `onResize` and
+    // reopens the face itself. The engine does not do it for it: `Fonts` appends
+    // faces and never reclaims the atlas room a dropped one held, so reopening
+    // on every change would spend both the face budget and the atlas.
+    //
+    // What a size out of range becomes, and what every `load` below then answers
+    // with, is `pixelsFor`'s to say.
+    pub fn fontPixels(self: *const Engine, logical: f32) u32 {
+        return font_module.pixelsFor(logical, self.uiScale().y);
+    }
+
     // Opens a face over bytes the caller keeps, and over a file this reads.
     //
     // The two are the two kinds of font an application has. A game's is in its

@@ -314,3 +314,44 @@ test "placements too small for the glyphs refuse the run" {
     try testing.expect(run.isValid());
     try testing.expectEqual(@as(usize, 1), run.glyphs.len);
 }
+
+// The reference host's own numbers, which are what this conversion exists for.
+// A scale of 1.49952 is what the compositor reported down the window on the run
+// that settled the ordering question, and fourteen logical units through it is
+// the size that ranked first when four raster sizes were compared on screen.
+//
+// The two axes differed on that run, 1.50000 across against 1.49952 down, which
+// is why a size is taken from the vertical one and why the horizontal is not a
+// second case here.
+test "a logical size becomes the raster size the scale asks for" {
+    try testing.expectEqual(@as(u32, 21), lenore.fontPixelsFor(14, 1.49952));
+    try testing.expectEqual(@as(u32, 14), lenore.fontPixelsFor(14, 1.0));
+
+    // Ties go away from zero, which is `@round`, so a size landing exactly
+    // between two rasters takes the larger. Nothing depends on which way it
+    // goes; what a test buys is that it is one way and not the compiler's.
+    try testing.expectEqual(@as(u32, 11), lenore.fontPixelsFor(10, 1.05));
+}
+
+// Every input that would make the narrowing inside `pixelsFor` undefined, plus
+// the two ends of the range a face can be opened at. This is the test the
+// shipping build has instead of a safety check: none of these traps in
+// ReleaseFast, so the branch is what has to be right.
+test "a size no face can be opened at is refused rather than clamped" {
+    // Not a number, either side of the multiplication.
+    try testing.expectEqual(@as(u32, 0), lenore.fontPixelsFor(std.math.nan(f32), 1.5));
+    try testing.expectEqual(@as(u32, 0), lenore.fontPixelsFor(14, std.math.nan(f32)));
+    try testing.expectEqual(@as(u32, 0), lenore.fontPixelsFor(std.math.inf(f32), 1.5));
+
+    // Below a whole pixel, and at or below nothing.
+    try testing.expectEqual(@as(u32, 0), lenore.fontPixelsFor(0.4, 1.0));
+    try testing.expectEqual(@as(u32, 0), lenore.fontPixelsFor(0, 1.5));
+    try testing.expectEqual(@as(u32, 0), lenore.fontPixelsFor(-14, 1.5));
+
+    // The largest face FreeType will build is admitted; one past it is refused
+    // rather than lowered onto it, which is the whole difference between this
+    // and a clamp.
+    try testing.expectEqual(@as(u32, 0xFFFF), lenore.fontPixelsFor(0xFFFF, 1.0));
+    try testing.expectEqual(@as(u32, 0), lenore.fontPixelsFor(0x10000, 1.0));
+    try testing.expectEqual(@as(u32, 0), lenore.fontPixelsFor(1000, 1000));
+}
