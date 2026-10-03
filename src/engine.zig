@@ -1194,7 +1194,7 @@ pub const Engine = struct {
                 // inside the renderer, so the value a frame is filled with says
                 // which of the two it is.
                 .camera = gpu.vulkanClipCamera(.{
-                    .view_projection = view_projection,
+                    .view_projection = gpu.mat4(view_projection),
                     // The fourth lane is the frame's clock and not a
                     // homogeneous one: nothing multiplies this by a matrix, and
                     // a shader that animates has nowhere else to read a clock.
@@ -1213,7 +1213,7 @@ pub const Engine = struct {
                 // block's strength is what the shader tests, so an absent sun is
                 // one value rather than a branch on both sides.
                 .sun_shadow = if (self.sun) |sun| .{
-                    .view_projection = sun.fit.view_proj,
+                    .view_projection = gpu.mat4(sun.fit.view_proj),
                     .strength = look.sun_shadow.clampedStrength(),
                     .normal_offset = look.sun_shadow.normalOffsetWorld(&sun.fit),
                     .light = sun.index,

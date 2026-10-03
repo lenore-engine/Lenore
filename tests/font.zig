@@ -189,7 +189,7 @@ test "a caption carries its own measurement" {
         .run = run,
         .metrics = metrics,
         .advance = lenore.fontAdvance(run.glyphs),
-        .atlas = @enumFromInt(1),
+        .atlas = @fromBackingInt(@intCast(1)),
     };
 
     // Three glyphs of a face whose every advance is one em, so the width is the

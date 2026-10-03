@@ -14,7 +14,7 @@ const testing = std.testing;
 // to the driver, and that a frame writes the slot it was pointed at rather than
 // the one before it.
 
-const image: res.ImageHandle = @enumFromInt(1);
+const image: res.ImageHandle = @fromBackingInt(@intCast(1));
 const window: platform.SurfaceMetrics = .{
     .logical_size = .{ 400, 300 },
     .framebuffer_extent = .{ .width = 400, .height = 300 },
@@ -158,7 +158,7 @@ test "a typed chunk reaches a focused widget with its bytes intact" {
         .begin = true,
         .end = true,
         .len = 2,
-        .bytes = [_]u8{ 0xc3, 0xa9 } ++ [_]u8{0} ** 14,
+        .bytes = [_]u8{ 0xc3, 0xa9 } ++ @as([14]u8, @splat(0)),
     } })));
     try host.finishRouting();
 

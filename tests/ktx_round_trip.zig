@@ -61,7 +61,7 @@ test "a converted colour texture parses as the format it claims" {
     // name Vulkan, and the code is exactly what the writer wrote.
     try testing.expectEqual(
         ktx.Semantic.colour.vkFormat(),
-        @as(u32, @intCast(@intFromEnum(parsed.format))),
+        @as(u32, @intCast(@backingInt(parsed.format))),
     );
     try testing.expectEqual(@as(u32, 4), parsed.block_height);
 }
@@ -74,7 +74,7 @@ test "a converted data texture parses as linear" {
     const parsed = try gpu.parseKtx2(file);
     try testing.expectEqual(
         ktx.Semantic.data.vkFormat(),
-        @as(u32, @intCast(@intFromEnum(parsed.format))),
+        @as(u32, @intCast(@backingInt(parsed.format))),
     );
 }
 

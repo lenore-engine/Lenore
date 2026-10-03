@@ -48,7 +48,7 @@ test "a batch keeps its mesh, material, run and face policy" {
         .{ .mesh = &mesh_a, .material = 5, .face_culling = .front, .front_face = .clockwise, .first_instance = 3, .instance_count = 4 },
     };
     const ordered = [_]u32{ 0, 1, 2, 3, 4, 5, 6 };
-    const sources = [_]?gpu.MeshVertexSource{null} ** 7;
+    const sources: [7]?gpu.MeshVertexSource = @splat(null);
     var destination: [3]gpu.RecordBatch = undefined;
 
     const records = try lenore.recordBatches(&batches, &ordered, &sources, &destination);
@@ -400,7 +400,7 @@ test "what the UI has no word for does not cross" {
         .begin = true,
         .end = false,
         .len = 1,
-        .bytes = [_]u8{'a'} ++ [_]u8{0} ** 15,
+        .bytes = [_]u8{'a'} ++ @as([15]u8, @splat(0)),
     } })));
 }
 
@@ -416,7 +416,7 @@ test "a committed chunk crosses as the bytes it carries" {
             // Two bytes of the sixteen the chunk carries, so the length and not
             // the array is what says how much is text.
             .len = 2,
-            .bytes = [_]u8{ 0xc3, 0xa9 } ++ [_]u8{0} ** 14,
+            .bytes = [_]u8{ 0xc3, 0xa9 } ++ @as([14]u8, @splat(0)),
         },
     });
     const crossed = events.translate(&chunk).?;

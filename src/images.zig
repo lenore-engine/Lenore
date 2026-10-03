@@ -149,9 +149,9 @@ const DecodedSource = struct {
 // The allocator has to be threadsafe. Both of the engine's are: DebugAllocator's
 // `thread_safe` defaults to `!builtin.single_threaded` and SmpAllocator exists
 // for this case (std/heap/debug_allocator.zig, std/heap/SmpAllocator.zig).
-fn decodeSource(allocator: Allocator, clock: platform.Clock, bytes: []const u8) !DecodedSource {
+fn decodeSource(io: std.Io, allocator: Allocator, clock: platform.Clock, bytes: []const u8) !DecodedSource {
     const started = clock.now();
-    var decoded = DecodedImage.loadFromBytes(allocator, bytes) catch |err| switch (err) {
+    var decoded = DecodedImage.loadFromBytes(io, allocator, bytes) catch |err| switch (err) {
         error.UnsupportedImageFormat => return error.UnsupportedImageEncoding,
         else => return err,
     };
@@ -171,10 +171,11 @@ fn decodeSource(allocator: Allocator, clock: platform.Clock, bytes: []const u8) 
 // overshoots by one image per worker.
 pub fn decodedByteSize(bytes: []const u8) !u64 {
     var reader: std.Io.Reader = .fixed(bytes);
-    const pixels: u64 = switch (zignal.ImageFormat.detectFromBytes(bytes) orelse
+    const pixels: u64 = switch (zignal.image.Format.detectFromBytes(bytes) orelse
         return error.UnsupportedImageEncoding) {
         .png => (try zignal.png.getInfo(&reader, .{})).totalPixels(),
         .jpeg => (try zignal.jpeg.getInfo(&reader, .{})).totalPixels(),
+        .bmp, .gif, .jxl, .webp => return error.UnsupportedImageEncoding,
     };
     return pixels * @sizeOf(SourcePixel);
 }
@@ -251,7 +252,7 @@ const DecodeQueue = struct {
         self.ring[(self.head + self.len) % self.ring.len] = .{
             .index = index,
             .charged = size,
-            .future = self.io.async(decodeSource, .{ allocator, self.clock, bytes }),
+            .future = self.io.async(decodeSource, .{ self.io, allocator, self.clock, bytes }),
         };
         self.len += 1;
         self.charged += size;
@@ -283,7 +284,7 @@ pub const ImageLoader = struct {
     pub fn init(allocator: Allocator, model: *const gltf.importer.Model) !ImageLoader {
         const uses = try allocator.alloc(std.EnumSet(gpu.MaterialSlot), model.images.len);
         errdefer allocator.free(uses);
-        @memset(uses, .initEmpty());
+        @memset(uses, .empty);
 
         const bound = try allocator.alloc(
             std.EnumArray(gpu.MaterialSlot, ?gpu.ResidentTexture),

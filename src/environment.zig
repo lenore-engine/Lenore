@@ -155,7 +155,7 @@ pub fn load(
     // The lookup table is data and not colour: it tabulates a scale and a bias,
     // and reading it through an sRGB transfer function returns wrong numbers
     // that still look like a plausible gradient.
-    var decoded = try DecodedImage.loadFromBytes(allocator, lut_bytes);
+    var decoded = try DecodedImage.loadFromBytes(io, allocator, lut_bytes);
     defer decoded.deinit(allocator);
     if (decoded.stride != decoded.cols) return error.NonContiguousDecodedImage;
 

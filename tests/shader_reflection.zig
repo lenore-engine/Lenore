@@ -169,12 +169,12 @@ fn mirroredScalarName(comptime T: type) !?[]const u8 {
 // padding. And the total and the field count, because a field the mirror does
 // not have would otherwise sit inside the same bytes unnoticed.
 fn expectMirrors(comptime T: type, contents: *const Reflection.Type) !void {
-    inline for (@typeInfo(T).@"struct".fields) |mirrored| {
-        const field = find(contents.fields, mirrored.name) orelse return error.MissingField;
-        try expectField(T, mirrored.name, field);
+    inline for (@typeInfo(T).@"struct".field_names) |mirrored_name| {
+        const field = find(contents.fields, mirrored_name) orelse return error.MissingField;
+        try expectField(T, mirrored_name, field);
     }
     try testing.expectEqual(@as(u32, @intCast(@sizeOf(T))), try uniformSize(contents));
-    try testing.expectEqual(@typeInfo(T).@"struct".fields.len, contents.fields.len);
+    try testing.expectEqual(@typeInfo(T).@"struct".field_names.len, contents.fields.len);
 }
 
 // A mirror the shader declares only part of, and the fields it may not omit.
@@ -192,9 +192,9 @@ fn expectMirrorsPart(
     comptime required: []const []const u8,
 ) !void {
     for (contents.fields) |field| {
-        const mirrored = inline for (@typeInfo(T).@"struct".fields) |candidate| {
-            if (std.mem.eql(u8, candidate.name, field.name)) {
-                try expectField(T, candidate.name, field);
+        const mirrored = inline for (@typeInfo(T).@"struct".field_names) |candidate_name| {
+            if (std.mem.eql(u8, candidate_name, field.name)) {
+                try expectField(T, candidate_name, field);
                 break true;
             }
         } else false;

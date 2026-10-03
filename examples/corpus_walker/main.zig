@@ -148,8 +148,7 @@ fn collect(allocator: Allocator, io: std.Io, root: std.Io.Dir) ![]Entry {
         if (model.kind != .directory) continue;
 
         for (variants) |variant| {
-            const directory = try std.fmt.allocPrint(
-                allocator,
+            const directory = try allocator.print(
                 "Models/{s}/{s}",
                 .{ model.name, variant },
             );
@@ -953,14 +952,14 @@ fn imageSemantics(
     defer allocator.free(claims);
     @memset(claims, .unclaimed);
 
-    const slots = @typeInfo(res.MaterialInfo.TextureMaps).@"struct".fields;
+    const slots = @typeInfo(res.MaterialInfo.TextureMaps).@"struct".field_names;
     for (model.materials) |*material| {
-        inline for (slots) |field| {
-            const reference = @field(material.textures, field.name);
+        inline for (slots) |field_name| {
+            const reference = @field(material.textures, field_name);
             if (reference.path) |key| {
                 for (model.images, claims) |*image, *claim| {
                     if (std.mem.eql(u8, image.key, key))
-                        claim.* = claim.with(semanticOf(field.name));
+                        claim.* = claim.with(semanticOf(field_name));
                 }
             }
         }
@@ -989,7 +988,7 @@ fn cacheName(bytes: []const u8, semantic: ktx.Semantic, out: *[70]u8) []const u8
     var digest: [32]u8 = undefined;
     var hash: std.crypto.hash.Blake3 = .init(.{});
     hash.update(bytes);
-    hash.update(&[_]u8{@intFromEnum(semantic)});
+    hash.update(&[_]u8{@backingInt(semantic)});
     hash.final(&digest);
     return std.fmt.bufPrint(out, "{x}.ktx2", .{&digest}) catch unreachable;
 }
@@ -1042,7 +1041,7 @@ fn compressImages(
         }
 
         if (!from_cache) {
-            var decoded = zignal.Image(zignal.Rgba(u8)).loadFromBytes(allocator, bytes) catch |err| {
+            var decoded = zignal.Image(zignal.Rgba(u8)).loadFromBytes(io, allocator, bytes) catch |err| {
                 log.warn("image {s} left as it is: {t}", .{ source.key, err });
                 continue;
             };

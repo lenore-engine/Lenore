@@ -1748,7 +1748,7 @@ fn transformsDiffer(a: gpu.MaterialData, b: gpu.MaterialData) bool {
         const sampled = a.samplesSlot(slot);
         if (sampled != b.samplesSlot(slot)) return true;
         if (!sampled) continue;
-        const index = @intFromEnum(slot);
+        const index = @backingInt(slot);
         if (!std.meta.eql(a.tex[index], b.tex[index])) return true;
     }
     return false;
@@ -1765,14 +1765,14 @@ fn reportTextureTransforms(
     model: *const gltf.importer.Model,
     packed_materials: []const gpu.MaterialData,
 ) void {
-    const slots = @typeInfo(res.MaterialInfo.TextureMaps).@"struct".fields;
+    const slots = @typeInfo(res.MaterialInfo.TextureMaps).@"struct".field_names;
 
     var transformed: u32 = 0;
     var second_set: u32 = 0;
     var unmipmapped: u32 = 0;
     for (model.materials) |*material| {
-        inline for (slots) |field| {
-            const slot = @field(material.textures, field.name);
+        inline for (slots) |field_name| {
+            const slot = @field(material.textures, field_name);
             if (slot.path != null) {
                 if (!isIdentityTransform(slot.uv)) transformed += 1;
                 if (slot.uv.set != 0) second_set += 1;
@@ -1799,8 +1799,8 @@ fn reportTextureTransforms(
     }
     var expected: u32 = 0;
     for (model.materials) |*material| {
-        inline for (slots) |field| {
-            if (!isIdentityTransform(@field(material.textures, field.name).uv)) expected += 1;
+        inline for (slots) |field_name| {
+            if (!isIdentityTransform(@field(material.textures, field_name).uv)) expected += 1;
         }
     }
     check(
@@ -1817,8 +1817,8 @@ fn reportTextureTransforms(
     for (model.meshes, 0..) |*mesh, index| {
         const material = &model.materials[mesh.material];
         var wants_second_set = false;
-        inline for (slots) |field| {
-            const slot = @field(material.textures, field.name);
+        inline for (slots) |field_name| {
+            const slot = @field(material.textures, field_name);
             if (slot.path != null and slot.uv.set != 0) wants_second_set = true;
         }
         if (!wants_second_set) continue;

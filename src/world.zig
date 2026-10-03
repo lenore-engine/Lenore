@@ -188,7 +188,7 @@ pub const DrawPlan = struct {
 
         for (ordered.draws, self.instances) |draw_index, *instance| {
             instance.* = .{
-                .model = self.matrices[draw_index],
+                .model = gpu.mat4(self.matrices[draw_index]),
                 .joint_base = translate.jointBase(self.joint_bases[draw_index]),
                 .material_index = meshes[draw_index].material,
             };
@@ -550,10 +550,10 @@ pub const World = struct {
             // them: a skeleton shared by several skins holds all of their joints
             // end to end, and the vertex attribute indexes one run.
             const transforms = self.skeletons[skin.skeleton].animator.jointTransforms();
-            @memcpy(
+            for (
                 self.joint_storage[base..][0..skin.joint_count],
                 transforms[skin.joint_offset..][0..skin.joint_count],
-            );
+            ) |*joint, transform| joint.* = gpu.mat4(transform);
         }
     }
 

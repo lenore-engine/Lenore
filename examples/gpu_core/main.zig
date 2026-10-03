@@ -285,7 +285,7 @@ pub fn main(process: std.process.Init.Minimal) !void {
         .{ .position = .{ -1, 1, 0 }, .normal = .{ 0, 0, 1 }, .uv = .{ 0, 1 }, .tangent = .{ 1, 0, 0, 1 } },
     };
     const quad_indices = [_]u16{ 0, 1, 2, 2, 3, 0 };
-    const morph_positions = [_]f32{0.0} ** (quad.len * 2 * 3);
+    const morph_positions: [quad.len * 2 * 3]f32 = @splat(0.0);
 
     // The transaction: every copy through one transfer, and a failure anywhere
     // below rolls the whole thing back, the transfer first.

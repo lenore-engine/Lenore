@@ -185,12 +185,12 @@ const Row = enum(u32) {
     post_ms,
     blades,
 
-    const first = @intFromEnum(Row.exposure);
-    const last_interactive = @intFromEnum(Row.shadows);
-    const count = @intFromEnum(Row.blades) - first + 1;
+    const first = @backingInt(Row.exposure);
+    const last_interactive = @backingInt(Row.shadows);
+    const count = @backingInt(Row.blades) - first + 1;
 
     fn index(self: Row) usize {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

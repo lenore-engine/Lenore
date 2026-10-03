@@ -403,7 +403,7 @@ const Driver = struct {
     fn applyKey(self: *Driver, engine: *lenore.Engine, key: platform.PhysicalKey) void {
         switch (key) {
             .digit_1, .digit_2, .digit_3, .digit_4 => {
-                self.tier = @intFromEnum(key) - @intFromEnum(platform.PhysicalKey.digit_1);
+                self.tier = @backingInt(key) - @backingInt(platform.PhysicalKey.digit_1);
                 const chosen = tiers[self.tier];
                 log.info("tier {s}: {d} steps at {d:.3} rad, {d:.1} windings of budget", .{
                     chosen.name, chosen.max_steps, chosen.max_turn, chosen.windings(),
@@ -507,7 +507,7 @@ const Driver = struct {
         // horizon, which on this subject looks like the near half of the disk
         // being cut away and the shadow standing in front of it.
         const framebuffer = gpu.vulkanClipCamera(.{
-            .view_projection = zm.identity(),
+            .view_projection = gpu.mat4(zm.identity()),
             .position = .{ eye[0], eye[1], eye[2], 1 },
             .ray_right = lane(basis.right),
             .ray_up = lane(basis.up),

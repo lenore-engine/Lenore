@@ -467,7 +467,7 @@ pub fn bake(allocator: Allocator, terrain: Terrain) Allocator.Error!Map {
             // Three quarters of full scale is `wheat`, the largest member, so
             // the quantisation step is a value the reader can compare against
             // exactly after multiplying by three.
-            writeUnorm16(texels[offset..], Map.cover_channel, @as(f32, @floatFromInt(@intFromEnum(sample.cover))) / 3.0);
+            writeUnorm16(texels[offset..], Map.cover_channel, @as(f32, @floatFromInt(@backingInt(sample.cover))) / 3.0);
         }
     }
 

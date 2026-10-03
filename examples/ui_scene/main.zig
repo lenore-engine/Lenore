@@ -178,7 +178,7 @@ const layout_nodes = [node_count]imui.LayoutNode{
     .{ .height = .{ .fixed = row_height } },
 };
 
-const layout_children = [_]imui.NodeIndex{ 1, @intFromEnum(Row.exposure), @intFromEnum(Row.bloom), @intFromEnum(Row.frame) };
+const layout_children = [_]imui.NodeIndex{ 1, @backingInt(Row.exposure), @backingInt(Row.bloom), @backingInt(Row.frame) };
 
 const panel_node: u32 = 1;
 
@@ -272,18 +272,18 @@ const Driver = struct {
         defer ui.popClip();
 
         try ui.register(
-            .{ .integer = @intFromEnum(Row.exposure) },
-            try self.rects[@intFromEnum(Row.exposure)].toFramebufferFilled(self.scale),
+            .{ .integer = @backingInt(Row.exposure) },
+            try self.rects[@backingInt(Row.exposure)].toFramebufferFilled(self.scale),
             .{ .focusable = true },
         );
         try ui.register(
-            .{ .integer = @intFromEnum(Row.bloom) },
-            try boxOf(self.rects[@intFromEnum(Row.bloom)]).toFramebufferFilled(self.scale),
+            .{ .integer = @backingInt(Row.bloom) },
+            try boxOf(self.rects[@backingInt(Row.bloom)]).toFramebufferFilled(self.scale),
             .{ .focusable = true },
         );
         try ui.register(
-            .{ .integer = @intFromEnum(Row.frame) },
-            try self.rects[@intFromEnum(Row.frame)].toFramebufferFilled(self.scale),
+            .{ .integer = @backingInt(Row.frame) },
+            try self.rects[@backingInt(Row.frame)].toFramebufferFilled(self.scale),
             .{ .focusable = true },
         );
     }
@@ -354,8 +354,8 @@ const Driver = struct {
         defer ui.popClip();
 
         if (try ui.slider(
-            .{ .integer = @intFromEnum(Row.exposure) },
-            try self.rects[@intFromEnum(Row.exposure)].toFramebufferFilled(self.scale),
+            .{ .integer = @backingInt(Row.exposure) },
+            try self.rects[@backingInt(Row.exposure)].toFramebufferFilled(self.scale),
             &self.exposure,
             exposure_range,
             slider_style,
@@ -365,7 +365,7 @@ const Driver = struct {
         // Over the track, which is where a value belongs when the control it
         // belongs to is the whole row: the word at one end, the number the drag
         // produced at the other.
-        const exposure_row = self.rects[@intFromEnum(Row.exposure)];
+        const exposure_row = self.rects[@backingInt(Row.exposure)];
         try self.caption(engine, ui, exposure_row, exposure_caption, .start);
         var reading: [16]u8 = undefined;
         try self.caption(engine, ui, exposure_row, try std.fmt.bufPrint(
@@ -375,8 +375,8 @@ const Driver = struct {
         ), .end);
 
         if (try ui.checkbox(
-            .{ .integer = @intFromEnum(Row.bloom) },
-            try boxOf(self.rects[@intFromEnum(Row.bloom)]).toFramebufferFilled(self.scale),
+            .{ .integer = @backingInt(Row.bloom) },
+            try boxOf(self.rects[@backingInt(Row.bloom)]).toFramebufferFilled(self.scale),
             &self.bloom,
             checkbox_style,
             true,
@@ -385,7 +385,7 @@ const Driver = struct {
         try self.caption(
             engine,
             ui,
-            captionOf(self.rects[@intFromEnum(Row.bloom)]),
+            captionOf(self.rects[@backingInt(Row.bloom)]),
             bloom_caption,
             .start,
         );
@@ -394,8 +394,8 @@ const Driver = struct {
         // responds. Its lower edge is where a clip that is not being applied
         // announces itself.
         if (try ui.button(
-            .{ .integer = @intFromEnum(Row.frame) },
-            try self.rects[@intFromEnum(Row.frame)].toFramebufferFilled(self.scale),
+            .{ .integer = @backingInt(Row.frame) },
+            try self.rects[@backingInt(Row.frame)].toFramebufferFilled(self.scale),
             control_style,
             true,
         )) {
@@ -409,7 +409,7 @@ const Driver = struct {
         try self.caption(
             engine,
             ui,
-            self.rects[@intFromEnum(Row.frame)],
+            self.rects[@backingInt(Row.frame)],
             frame_caption,
             .center,
         );

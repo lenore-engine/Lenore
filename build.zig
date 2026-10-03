@@ -158,7 +158,7 @@ pub fn build(b: *std.Build) void {
         b.step(name, b.fmt("Build the {s} example", .{name})).dependOn(&install.step);
 
         const run = b.addRunArtifact(example);
-        if (b.args) |args| run.addArgs(args);
+        run.addPassthruArgs();
         b.step(b.fmt("run-{s}", .{name}), b.fmt("Run the {s} example", .{name}))
             .dependOn(&run.step);
     }
@@ -190,7 +190,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&b.addInstallArtifact(editor, .{}).step);
 
     const editor_run = b.addRunArtifact(editor);
-    if (b.args) |args| editor_run.addArgs(args);
+    editor_run.addPassthruArgs();
     b.step("run-editor", "Run the editor").dependOn(&editor_run.step);
 
     // The umbrella's suite covers what the umbrella owns. Every module carries
@@ -353,12 +353,21 @@ fn zigFilesIn(b: *std.Build, dir_path: []const u8) [][]const u8 {
 
 fn directoriesIn(b: *std.Build, dir_path: []const u8) [][]const u8 {
     var names: std.ArrayList([]const u8) = .empty;
+    // The listing is configuration, and the build system reuses a configuration
+    // while the inputs it recorded are unchanged. Declaring the directory as one
+    // makes a file added or removed a cache miss rather than a stale list. A
+    // directory that does not exist is recorded through its parent, whose
+    // entries are what say so (std.Build.dependOnDirectoryContents).
     const io = b.graph.io;
-    var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return names.items,
+    var dir = b.root.openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            b.dependOnDirectoryContents(b.path(std.fs.path.dirname(dir_path) orelse "."));
+            return names.items;
+        },
         else => std.debug.panic("cannot open {s}/: {t}", .{ dir_path, err }),
     };
     defer dir.close(io);
+    b.dependOnDirectoryContents(b.path(dir_path));
 
     var iterator = dir.iterate();
     while (iterator.next(io) catch @panic("cannot list the directory")) |entry| {
@@ -372,12 +381,21 @@ fn directoriesIn(b: *std.Build, dir_path: []const u8) [][]const u8 {
 
 fn filesIn(b: *std.Build, dir_path: []const u8, extension: []const u8) [][]const u8 {
     var names: std.ArrayList([]const u8) = .empty;
+    // The listing is configuration, and the build system reuses a configuration
+    // while the inputs it recorded are unchanged. Declaring the directory as one
+    // makes a file added or removed a cache miss rather than a stale list. A
+    // directory that does not exist is recorded through its parent, whose
+    // entries are what say so (std.Build.dependOnDirectoryContents).
     const io = b.graph.io;
-    var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return names.items,
+    var dir = b.root.openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            b.dependOnDirectoryContents(b.path(std.fs.path.dirname(dir_path) orelse "."));
+            return names.items;
+        },
         else => std.debug.panic("cannot open {s}/: {t}", .{ dir_path, err }),
     };
     defer dir.close(io);
+    b.dependOnDirectoryContents(b.path(dir_path));
 
     var iterator = dir.iterate();
     while (iterator.next(io) catch @panic("cannot list the directory")) |entry| {

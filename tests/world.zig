@@ -286,7 +286,7 @@ test "an instance record carries its draw's matrix" {
     // record filled with the identity, or with a matrix belonging to another
     // draw, is only visible once the placement is not the identity.
     for (fixture.world.plan.instances) |instance| {
-        try testing.expectEqual(placement, instance.model);
+        try testing.expectEqual(gpu.mat4(placement), instance.model);
     }
 }
 
@@ -703,19 +703,19 @@ test "each skin's joints land in the run the offsets gave it" {
     }
     // Poison, so a slot nothing writes is not mistaken for a slot written
     // correctly.
-    for (world.joint_storage) |*joint| joint.* = zm.translation(-1, -1, -1);
+    for (world.joint_storage) |*joint| joint.* = gpu.mat4(zm.translation(-1, -1, -1));
 
     world.packJoints();
 
     for (0..2) |slot| {
         try testing.expectEqual(
-            zm.translation(1, @floatFromInt(slot), 0),
+            gpu.mat4(zm.translation(1, @floatFromInt(slot), 0)),
             world.joint_storage[slot],
         );
     }
     for (0..3) |slot| {
         try testing.expectEqual(
-            zm.translation(2, @floatFromInt(slot), 0),
+            gpu.mat4(zm.translation(2, @floatFromInt(slot), 0)),
             world.joint_storage[2 + slot],
         );
     }

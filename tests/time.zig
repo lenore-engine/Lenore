@@ -220,8 +220,8 @@ test "a window of no frames divides nothing" {
 // neighbour's field moves a number the assertions name.
 fn wholeFrame(metrics: *lenore.FrameMetrics, weight: u64, interval_ns: u64) void {
     metrics.beginFrame();
-    inline for (@typeInfo(lenore.Phase).@"enum".fields) |field| {
-        metrics.record(@enumFromInt(field.value), weight * (field.value + 1));
+    inline for (@typeInfo(lenore.Phase).@"enum".field_values) |field_value| {
+        metrics.record(@fromBackingInt(@intCast(field_value)), weight * (field_value + 1));
     }
     metrics.endFrame(.{
         .elapsed_ns = 0,
@@ -234,8 +234,8 @@ fn wholeFrame(metrics: *lenore.FrameMetrics, weight: u64, interval_ns: u64) void
 test "every phase closes its own field" {
     var metrics: lenore.FrameMetrics = .init(std.time.ns_per_s);
     metrics.beginFrame();
-    inline for (@typeInfo(lenore.Phase).@"enum".fields) |field| {
-        metrics.record(@enumFromInt(field.value), field.value + 1);
+    inline for (@typeInfo(lenore.Phase).@"enum".field_values) |field_value| {
+        metrics.record(@fromBackingInt(@intCast(field_value)), field_value + 1);
     }
 
     try testing.expectEqual(@as(u64, 1), metrics.phases.events_ns);

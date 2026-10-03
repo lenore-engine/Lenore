@@ -288,8 +288,8 @@ pub const FramePhases = struct {
     }
 
     pub fn add(self: *FramePhases, other: FramePhases) void {
-        inline for (@typeInfo(FramePhases).@"struct".fields) |field| {
-            @field(self, field.name) += @field(other, field.name);
+        inline for (@typeInfo(FramePhases).@"struct".field_names) |field_name| {
+            @field(self, field_name) += @field(other, field_name);
         }
     }
 
@@ -298,16 +298,16 @@ pub const FramePhases = struct {
     pub fn mean(self: FramePhases, frames: u32) FramePhases {
         if (frames == 0) return .{};
         var out: FramePhases = .{};
-        inline for (@typeInfo(FramePhases).@"struct".fields) |field| {
-            @field(out, field.name) = @field(self, field.name) / frames;
+        inline for (@typeInfo(FramePhases).@"struct".field_names) |field_name| {
+            @field(out, field_name) = @field(self, field_name) / frames;
         }
         return out;
     }
 
     pub fn total(self: FramePhases) u64 {
         var sum: u64 = 0;
-        inline for (@typeInfo(FramePhases).@"struct".fields) |field| {
-            sum += @field(self, field.name);
+        inline for (@typeInfo(FramePhases).@"struct".field_names) |field_name| {
+            sum += @field(self, field_name);
         }
         return sum;
     }
@@ -372,8 +372,8 @@ pub const FrameMetrics = struct {
     // Closes one phase with what the timer measured for it.
     pub fn record(self: *FrameMetrics, phase: Phase, elapsed_ns: u64) void {
         if (checking) {
-            std.debug.assert(@intFromEnum(phase) == self.phases_closed);
-            self.phases_closed = @intFromEnum(phase) + 1;
+            std.debug.assert(@backingInt(phase) == self.phases_closed);
+            self.phases_closed = @backingInt(phase) + 1;
         }
         self.phases.of(phase).* = elapsed_ns;
     }
@@ -385,7 +385,7 @@ pub const FrameMetrics = struct {
     // The alternative is a report whose phases are short by however much of the
     // frame came after the call.
     pub fn endFrame(self: *FrameMetrics, time: FrameTime) void {
-        if (checking) std.debug.assert(self.phases_closed == @typeInfo(Phase).@"enum".fields.len);
+        if (checking) std.debug.assert(self.phases_closed == @typeInfo(Phase).@"enum".field_names.len);
 
         self.window.add(self.phases);
         if (self.fps.record(time)) |report| {
