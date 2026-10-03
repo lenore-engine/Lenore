@@ -1108,6 +1108,68 @@ test "the skinned entry point takes the skinning stream at the locations the mes
     );
 }
 
+// Every location an entry point reads as a vertex attribute, a struct
+// parameter's fields one by one. A system value has no binding and takes no
+// attribute, so it is not among them.
+fn attributeLocations(
+    entry: Reflection.EntryPoint,
+    out: *std.ArrayList(u32),
+    allocator: std.mem.Allocator,
+) !void {
+    for (entry.parameters) |parameter| {
+        if (!std.mem.eql(u8, parameter.binding.kind, "varyingInput")) continue;
+        if (parameter.type.fields.len == 0) {
+            try out.append(allocator, parameter.binding.index);
+            continue;
+        }
+        for (parameter.type.fields) |field| {
+            if (std.mem.eql(u8, field.binding.kind, "varyingInput"))
+                try out.append(allocator, field.binding.index);
+        }
+    }
+}
+
+test "a shadow caster declares exactly the attributes its vertex stage reads" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const parsed = try parse(allocator, reflectionFor("shadow"));
+    const shader = lenore.Shaders.shadow;
+
+    // An attribute the stage does not read is what the validation layer
+    // reports as not consumed, and a location it reads that no attribute
+    // declares is fed by nothing. Equality rules out both.
+    for ([_]bool{ false, true }) |skinned| {
+        const name = if (skinned) shader.skinned_vertex_entry else shader.vertex_entry;
+        const entry = entryPoint(parsed, std.mem.span(name)) orelse return error.EntryPointMissing;
+
+        var read: std.ArrayList(u32) = .empty;
+        try attributeLocations(entry, &read, allocator);
+        std.mem.sort(u32, read.items, {}, std.sort.asc(u32));
+
+        var declared: std.ArrayList(u32) = .empty;
+        for (gpu.Shadow.vertexInput(skinned).declaredAttributes()) |attribute|
+            try declared.append(allocator, attribute.location);
+        std.mem.sort(u32, declared.items, {}, std.sort.asc(u32));
+
+        try testing.expectEqualSlices(u32, read.items, declared.items);
+    }
+
+    // And each location carries the field the shader means by it. The shadow
+    // shader states its locations by hand, and a stated location is the one
+    // that can say UV while landing on the normal.
+    const skinned = entryPoint(
+        parsed,
+        std.mem.span(shader.skinned_vertex_entry),
+    ) orelse return error.EntryPointMissing;
+    const base = find(skinned.parameters, "vertex") orelse return error.MissingBaseVertex;
+    try testing.expectEqual(try baseLocation("position"), try varyingLocationIn(base.type.fields, "POSITION"));
+    try testing.expectEqual(try baseLocation("uv"), try varyingLocationIn(base.type.fields, "TEXCOORD"));
+    try testing.expectEqual(try skinLocation("joints"), try varyingLocation(skinned, "JOINTS"));
+    try testing.expectEqual(try skinLocation("weights"), try varyingLocation(skinned, "WEIGHTS"));
+}
+
 test "the prepass dispatches over the workgroup the shader declares" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

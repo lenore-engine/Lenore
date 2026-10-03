@@ -824,22 +824,9 @@ const Driver = struct {
 };
 
 // The example's own background, in place of the engine's environment cube.
-//
-// `@embedFile` yields bytes and SPIR-V is words, so the array is copied into an
-// aligned constant: an embedded file carries no alignment of its own and the
-// reinterpretation has to be valid rather than merely likely. The engine does
-// the same for its own shading, for the same reason.
 fn skyShader() gpu.SkyShader {
-    const bytes = @embedFile("sky").*;
-    const aligned: [bytes.len]u8 align(@alignOf(u32)) = bytes;
-    const count = aligned.len / @sizeOf(u32);
-    // Vulkan specification, VkShaderModuleCreateInfo: codeSize is a multiple of
-    // four. Dividing without this would drop a partial word and hand the driver
-    // a module shorter than the file.
-    comptime std.debug.assert(count * @sizeOf(u32) == aligned.len);
-    const words = @as([*]const u32, @ptrCast(&aligned))[0..count];
     return .{
-        .spirv = words,
+        .spirv = gpu.spirvWords(@embedFile("sky")),
         .vertex_entry = "vertexMain",
         .fragment_entry = "fragmentMain",
     };
