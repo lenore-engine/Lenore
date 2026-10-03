@@ -346,3 +346,53 @@ test "the shader clock folds into its period and keeps its resolution" {
     try std.testing.expect(value <= 3600.0);
     try std.testing.expect(std.math.floatEps(f32) * value < 1.0e-3);
 }
+
+test "a fixed tick is due at its start and then once a period" {
+    var ticks: lenore.FixedTick = .start(10 * ms, 4, 1_000);
+
+    try testing.expect(ticks.take(1_000));
+    try testing.expect(!ticks.take(1_000));
+    try testing.expectEqual(@as(?u64, 1_000 + 10 * ms), ticks.deadline(1_000));
+    try testing.expect(!ticks.take(1_000 + 10 * ms - 1));
+    try testing.expect(ticks.take(1_000 + 10 * ms));
+}
+
+test "a late tick does not push back the ones after it" {
+    var ticks: lenore.FixedTick = .start(10, 4, 0);
+
+    try testing.expect(ticks.take(0));
+    // Seven late. The next is still due at twenty, not at twenty-seven.
+    try testing.expect(ticks.take(17));
+    try testing.expectEqual(@as(?u64, 20), ticks.deadline(19));
+    try testing.expect(ticks.take(20));
+}
+
+test "a schedule past its backlog starts over at the present and counts what it gave up" {
+    // Due at ten. Four periods behind that is fifty, which is still a backlog
+    // to catch up rather than one to drop.
+    var at_bound: lenore.FixedTick = .start(10, 4, 0);
+    try testing.expect(at_bound.take(0));
+    try testing.expectEqual(@as(?u64, null), at_bound.deadline(50));
+    try testing.expectEqual(@as(u64, 0), at_bound.dropped);
+    try testing.expectEqual(@as(u64, 10), at_bound.next_ns);
+
+    // One nanosecond past it. Ticks were due at 10 through 50; one runs now and
+    // the four before it are dropped.
+    var past: lenore.FixedTick = .start(10, 4, 0);
+    try testing.expect(past.take(0));
+    try testing.expectEqual(@as(?u64, null), past.deadline(51));
+    try testing.expectEqual(@as(u64, 4), past.dropped);
+    try testing.expect(past.take(51));
+    try testing.expectEqual(@as(?u64, 61), past.deadline(51));
+}
+
+test "a restarted schedule is due at once and drops nothing for the pause" {
+    var ticks: lenore.FixedTick = .start(10, 4, 0);
+    try testing.expect(ticks.take(0));
+
+    // A thread that slept a second: the gap is a pause, not a backlog.
+    ticks.restart(1_000);
+    try testing.expect(ticks.take(1_000));
+    try testing.expectEqual(@as(?u64, 1_010), ticks.deadline(1_000));
+    try testing.expectEqual(@as(u64, 0), ticks.dropped);
+}

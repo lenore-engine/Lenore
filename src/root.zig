@@ -39,6 +39,7 @@ pub const ShadowBakeRequest = engine.ShadowBakeRequest;
 pub const scaledExtent = engine.scaledExtent;
 
 pub const FrameClock = time.FrameClock;
+pub const FixedTick = time.FixedTick;
 pub const FrameTime = time.FrameTime;
 pub const FpsCounter = time.FpsCounter;
 pub const PhaseTimer = time.PhaseTimer;

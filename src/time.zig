@@ -129,6 +129,57 @@ pub const FrameClock = struct {
     }
 };
 
+// A schedule of ticks at a fixed period, for work that steps the world rather
+// than following the frame.
+//
+// It reads no clock. Each call takes a time the caller read from
+// `platform.Clock.now`, so the policy is arithmetic a test drives by hand, and
+// the caller chooses how to wait: a thread that also answers messages waits on
+// its event, bounded by `Clock.deadline` of what `deadline` returns.
+pub const FixedTick = struct {
+    period_ns: u64,
+    // How many periods late the schedule may fall before it starts over at the
+    // present. Up to that many ticks run back to back to catch up; past it the
+    // world runs slower than the wall clock, the same trade `max_frame_delta_ns`
+    // makes for the frame.
+    max_backlog: u32,
+    next_ns: u64,
+    // Ticks given up to the backlog bound over the schedule's life.
+    dropped: u64,
+
+    pub fn start(period_ns: u64, max_backlog: u32, now_ns: u64) FixedTick {
+        std.debug.assert(period_ns > 0);
+        return .{ .period_ns = period_ns, .max_backlog = max_backlog, .next_ns = now_ns, .dropped = 0 };
+    }
+
+    // Whether a tick is due at `now_ns`, taking it if so. The next one is a
+    // period after this one was due rather than after `now_ns`, so a late tick
+    // does not delay every tick after it.
+    pub fn take(self: *FixedTick, now_ns: u64) bool {
+        if (now_ns < self.next_ns) return false;
+        self.next_ns += self.period_ns;
+        return true;
+    }
+
+    // Due at `now_ns`. For a schedule resuming after it slept or stood idle,
+    // whose next tick is the present rather than the one the last tick before
+    // the pause would have been followed by.
+    pub fn restart(self: *FixedTick, now_ns: u64) void {
+        self.next_ns = now_ns;
+    }
+
+    // When the next tick is due, or null when one is due already. A schedule
+    // more than `max_backlog` periods behind starts over at `now_ns` first, and
+    // the whole periods it skipped are added to `dropped`.
+    pub fn deadline(self: *FixedTick, now_ns: u64) ?u64 {
+        if (now_ns > self.next_ns + @as(u64, self.max_backlog) * self.period_ns) {
+            self.dropped += (now_ns - self.next_ns) / self.period_ns;
+            self.next_ns = now_ns;
+        }
+        return if (now_ns < self.next_ns) self.next_ns else null;
+    }
+};
+
 // A window over frame intervals, reported when the window fills.
 //
 // Measured in time rather than in a count of frames: the question is how the
