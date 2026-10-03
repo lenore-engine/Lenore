@@ -285,43 +285,6 @@ const Driver = struct {
     }
 };
 
-// The host's preferred sans-serif, or nothing. Reported rather than returned as
-// an error: the four figures that need no font are the ones this example was
-// written for, and a host with no font at all should still be able to read them.
-//
-// Asked in two steps rather than through `Engine.loadSystemFont`, because which
-// file the host chose belongs in an instrument's log. A line of empty boxes is
-// a font without those characters in it, and nothing on the screen says which
-// font that was.
-fn loadFont(engine: *lenore.Engine, io: std.Io) ?lenore.FontId {
-    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const found = (platform.findSystemFont(&path, .{}) catch |err| {
-        log.warn("the host's font could not be asked for: {t}", .{err});
-        return null;
-    }) orelse {
-        log.warn("the host offers no font, so the text figure is not drawn", .{});
-        return null;
-    };
-
-    // Absolute, so the directory it is opened against is not read. The same
-    // answer carries how the host wants text drawn, which is what the face is
-    // opened with: this example asks the host for both or neither.
-    const rendering: lenore.FontRendering = .fromHost(found.rendering);
-    const pixels = engine.fontPixels(label_points);
-    const id = engine.loadFontFile(io, .cwd(), found.path, found.index, pixels, rendering) catch |err| {
-        log.warn("{s} did not load: {t}", .{ found.path, err });
-        return null;
-    };
-    log.info("drawing with {s}, face {d} at {d} px, {t} hinting and {t} coverage", .{
-        found.path,
-        found.index,
-        pixels,
-        rendering.hinting,
-        rendering.antialias,
-    });
-    return id;
-}
-
 const checking = std.debug.runtime_safety;
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 
@@ -331,10 +294,6 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
 
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
     var engine: lenore.Engine = undefined;
     try engine.init(gpa, .{
         .title = "Lenore: overlay",
@@ -343,6 +302,10 @@ pub fn main() !void {
         .frame_capacity = .{ .instances = 0, .joints = 0 },
         .morph_capacity = .{ .meshes = 0, .weights = 0 },
         .material_capacity = 0,
+        // Without it the text figure is not drawn. The four that need no font
+        // are the ones this example was written for, and a host with no font at
+        // all should still be able to read them.
+        .interface_font = .{ .points = label_points },
     });
     defer engine.deinit();
 
@@ -351,7 +314,7 @@ pub fn main() !void {
     var level: lenore.Level = .empty(gpa);
     defer level.deinit(&engine.textures);
 
-    var driver: Driver = .{ .white = engine.ui_white, .font = loadFont(&engine, io) };
+    var driver: Driver = .{ .white = engine.ui_white, .font = engine.interface_font };
     log.info("{s}", .{usage});
 
     try engine.run(&level, .{&driver});

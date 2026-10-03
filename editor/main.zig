@@ -1157,21 +1157,6 @@ fn equalsFold(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-// The host's preferred interface font, or nothing.
-//
-// Nothing is not a failure. The panels, the rows and the routing all stand
-// without captions, and an editor that refused to open because fontconfig
-// answered nothing would be harder to diagnose than one that opens silent.
-fn loadFont(engine: *lenore.Engine, io: std.Io) ?lenore.FontId {
-    return engine.loadSystemFont(io, .{}, engine.fontPixels(label_points)) catch |err| {
-        log.warn("the host's font did not open: {t}", .{err});
-        return null;
-    } orelse {
-        log.warn("the host offers no interface font, so nothing is captioned", .{});
-        return null;
-    };
-}
-
 const checking = std.debug.runtime_safety;
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 
@@ -1229,6 +1214,10 @@ pub fn main(process: std.process.Init.Minimal) !void {
             .meshes = capacities.morph_meshes,
             .weights = capacities.morph_weights,
         },
+        // Without it the panels, the rows and the routing all stand with no
+        // captions. An editor that refused to open because fontconfig answered
+        // nothing would be harder to diagnose than one that opens silent.
+        .interface_font = .{ .points = label_points },
     });
     defer engine.deinit();
     log.info("device: {s}", .{engine.context.deviceName()});
@@ -1289,7 +1278,7 @@ pub fn main(process: std.process.Init.Minimal) !void {
 
     var driver: Driver = .{
         .white = engine.ui_white,
-        .font = loadFont(&engine, io),
+        .font = engine.interface_font,
         .materials = materials,
         .matched = matched,
         .framing = framing,

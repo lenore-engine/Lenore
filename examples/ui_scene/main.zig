@@ -425,26 +425,6 @@ const Driver = struct {
     }
 };
 
-// The font this host prefers for an interface, or nothing.
-//
-// The size is `label_points` through `Engine.fontPixels`, which is the scale the
-// window has reported. A face is a face at one size, so this is fixed for the
-// run and the captions keep it if the window moves to another output.
-//
-// Nothing is not a failure. A host with no fontconfig and a host whose
-// configuration matches no font both answer that way, and the panel is legible
-// without captions: every control changes the picture, which is what this
-// example is read by.
-fn loadFont(engine: *lenore.Engine, io: std.Io) ?lenore.FontId {
-    return engine.loadSystemFont(io, .{}, engine.fontPixels(label_points)) catch |err| {
-        log.warn("the host's font did not open: {t}", .{err});
-        return null;
-    } orelse {
-        log.warn("the host offers no font, so the panel draws no captions", .{});
-        return null;
-    };
-}
-
 pub fn main(process: std.process.Init.Minimal) !void {
     const gpa = if (checking) debug_allocator.allocator() else std.heap.smp_allocator;
     defer if (checking) {
@@ -480,6 +460,9 @@ pub fn main(process: std.process.Init.Minimal) !void {
     try engine.init(gpa, .{
         .title = "Lenore UI",
         .material_capacity = @intCast(@max(model.materials.len, 1)),
+        // Without it the panel draws no captions and is still legible: every
+        // control changes the picture, which is what this example is read by.
+        .interface_font = .{ .points = label_points },
     });
     defer engine.deinit();
     log.info("device: {s}", .{engine.context.deviceName()});
@@ -503,6 +486,6 @@ pub fn main(process: std.process.Init.Minimal) !void {
     defer level.deinit(&engine.textures);
     try engine.install(&level, &model);
 
-    var driver: Driver = .{ .framing = level.world.sphere, .font = loadFont(&engine, io) };
+    var driver: Driver = .{ .framing = level.world.sphere, .font = engine.interface_font };
     try engine.run(&level, .{ &driver.orbit, &driver });
 }

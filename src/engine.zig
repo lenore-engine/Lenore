@@ -36,6 +36,7 @@ const RendererOptions = struct {
     ui_capacity: gpu.UiCapacity,
     ui_widgets: ui_module.Capacity,
     font_capacity: font_module.Capacity,
+    interface_font: ?InterfaceFont,
     fps_window_ns: u64,
     gpu_timing: bool,
     metering: bool,
@@ -234,6 +235,15 @@ pub const ShadowBakeRequest = struct {
     }
 };
 
+// The face interface text is drawn with, asked of the host by role.
+pub const InterfaceFont = struct {
+    // Logical points, turned into pixels once at the scale the window reports
+    // when the renderer is built. A face is a face at one size, so the text
+    // keeps it if the window later moves to an output of another scale.
+    points: f32,
+    request: platform.SystemFontRequest = .{},
+};
+
 pub const Options = struct {
     title: [:0]const u8 = "Lenore",
     // Which application the window belongs to; `platform.WindowOptions.app_id`
@@ -296,6 +306,9 @@ pub const Options = struct {
     // draws no text is the atlas twice over, once on the host and once on the
     // device, plus one staging copy of it per frame slot.
     font_capacity: font_module.Capacity = .{},
+    // Opened by `initRenderer` into `Engine.interface_font`. Null opens none,
+    // so an application that draws no text reads no font file.
+    interface_font: ?InterfaceFont = null,
 
     fps_window_ns: u64 = std.time.ns_per_s,
 
@@ -413,6 +426,9 @@ pub const Engine = struct {
     // splitting that across frames would be a mechanism serving one event.
     glyph_staging: gpu.PerFrame(u32),
     glyph_atlas: res.ImageHandle,
+    // What `Options.interface_font` opened. Null when it asked for none, when
+    // the host had no font to give, and when the one it named did not open.
+    interface_font: ?font_module.FontId,
 
     // The overlay's host side: the widget tree's arrays, the façade over them
     // and the translation from what the window says. It names no device, and
@@ -611,6 +627,7 @@ pub const Engine = struct {
             .ui_capacity = options.ui_capacity,
             .ui_widgets = options.ui_widgets,
             .font_capacity = options.font_capacity,
+            .interface_font = options.interface_font,
             .fps_window_ns = options.fps_window_ns,
             .gpu_timing = options.gpu_timing,
             .metering = options.metering,
@@ -747,6 +764,11 @@ pub const Engine = struct {
         );
         try atlas_setup.finish();
         atlas_setup.deinit();
+
+        self.interface_font = if (options.interface_font) |wanted|
+            try self.openInterfaceFont(wanted)
+        else
+            null;
 
         // Over the first slot, which the loop replaces with the slot it is
         // about to fill before anything is appended.
@@ -1484,15 +1506,38 @@ pub const Engine = struct {
         // The same answer carries how the host wants text drawn, so asking for
         // the file and asking for the mode is one question. A caller that opens
         // a font of its own is the one that has to ask separately.
-        // Absolute, so the directory the path is resolved against is not read.
-        return try self.loadFontFile(
-            io,
-            .cwd(),
+        const rendering: font_module.Rendering = .fromHost(found.rendering);
+
+        // Before the open, so a file that fails names itself. Nothing on the
+        // screen says which face the host chose, and a line of empty boxes is
+        // a face without those characters in it.
+        log.info("opening {s}, face {d} at {d} px, {t} hinting and {t} coverage", .{
             found.path,
             found.index,
             pixel_size,
-            .fromHost(found.rendering),
-        );
+            rendering.hinting,
+            rendering.antialias,
+        });
+        // Absolute, so the directory the path is resolved against is not read.
+        return try self.loadFontFile(io, .cwd(), found.path, found.index, pixel_size, rendering);
+    }
+
+    // A host without a usable font costs the application its interface text
+    // and not its window. Running out of memory and a face budget of zero are
+    // the application's own limits rather than the host's, and are returned.
+    fn openInterfaceFont(self: *Engine, wanted: InterfaceFont) !?font_module.FontId {
+        const pixels = self.fontPixels(wanted.points);
+        const id = self.loadSystemFont(self.io, wanted.request, pixels) catch |err| switch (err) {
+            error.OutOfMemory, error.TooManyFaces => |budget| return budget,
+            else => {
+                log.warn("the interface font did not open, so no interface text is drawn: {t}", .{err});
+                return null;
+            },
+        };
+        if (id == null) {
+            log.warn("the host offers no {s} font, so no interface text is drawn", .{wanted.request.family});
+        }
+        return id;
     }
 
     // The image a run of glyphs is drawn from. `ui_white` is its counterpart

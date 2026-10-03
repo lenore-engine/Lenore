@@ -845,29 +845,12 @@ fn skyShader() gpu.SkyShader {
     };
 }
 
-// The font this host prefers for an interface, or nothing. A host with no
-// fontconfig and a host whose configuration matches no font both answer that
-// way, and the panel is still usable: every control changes the picture.
-fn loadFont(engine: *lenore.Engine, io: std.Io) ?lenore.FontId {
-    return engine.loadSystemFont(io, .{}, engine.fontPixels(label_points)) catch |err| {
-        log.warn("the host's font did not open: {t}", .{err});
-        return null;
-    } orelse {
-        log.warn("the host offers no font, so the panel draws no captions", .{});
-        return null;
-    };
-}
-
 pub fn main(process: std.process.Init.Minimal) !void {
     _ = process;
     const gpa = if (checking) debug_allocator.allocator() else std.heap.smp_allocator;
     defer if (checking) {
         if (debug_allocator.deinit() == .leak) log.err("host memory leaked", .{});
     };
-
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
 
     const field: terrain.Terrain = try .init(.{});
 
@@ -890,6 +873,9 @@ pub fn main(process: std.process.Init.Minimal) !void {
         // read from the same light block the ground is lit by, so the two cannot
         // be on separate scales.
         .background_shader = skyShader(),
+        // Without it the panel draws no captions and is still usable: every
+        // control changes the picture.
+        .interface_font = .{ .points = label_points },
     });
     defer engine.deinit();
     log.info("device: {s}", .{engine.context.deviceName()});
@@ -935,7 +921,7 @@ pub fn main(process: std.process.Init.Minimal) !void {
         grass.settings.capacity,
     });
 
-    var driver: Driver = .{ .field = field, .grass = &grass, .font = loadFont(&engine, io) };
+    var driver: Driver = .{ .field = field, .grass = &grass, .font = engine.interface_font };
     // Placed before the first frame so that the ground is under the camera on
     // frame zero rather than a fall onto it from wherever the camera was
     // constructed.
