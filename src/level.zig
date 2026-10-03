@@ -27,6 +27,7 @@ const World = world_module.World;
 // prepass needs that, and it belongs to `lenore-gpu`.
 
 pub const LevelError = error{
+    LightmapExtentMismatch,
     NoMaterials,
     TooManyMeshes,
     TooManyMaterials,
@@ -43,6 +44,7 @@ pub const Timings = struct {
     upload_stalls: u32 = 0,
     world_ns: u64 = 0,
     environment_ns: u64 = 0,
+    lightmap_ns: u64 = 0,
 };
 
 // What the level needs from the device that outlives it.
@@ -61,6 +63,18 @@ pub const Options = struct {
     capacity: gpu.FrameCapacity,
     placement: zm.Mat = zm.identity(),
     clip: ?u16 = 0,
+};
+
+const LoadedLightmap = struct {
+    source: gpu.Lightmap,
+    keys: [2][]u8,
+
+    fn release(self: *const LoadedLightmap, allocator: Allocator, textures: *gpu.TextureCache) void {
+        for (self.keys) |key| {
+            textures.release(key);
+            allocator.free(key);
+        }
+    }
 };
 
 pub const Level = struct {
@@ -88,6 +102,18 @@ pub const Level = struct {
 
     world: World,
     environment: ?env.Loaded,
+
+    // Light computed somewhere other than this frame, for the surfaces that
+    // carry a second UV set. Irradiance and its signed directional correction
+    // are separate images with the same extent. The engine neither produces
+    // them nor knows how they were produced: an application sets them before
+    // the level is installed, and what they name may be images baked offline or
+    // ones a pass is still writing into.
+    //
+    // Null is a level lit entirely by the lights it declares, which is what
+    // every application that does not bake gets without saying anything.
+    lightmap: ?LoadedLightmap = null,
+
     timings: Timings,
 
     // A level that holds nothing, for an application that draws without an
@@ -193,6 +219,7 @@ pub const Level = struct {
         const allocator = self.allocator;
 
         if (self.environment) |*loaded| loaded.release(textures);
+        if (self.lightmap) |*loaded| loaded.release(allocator, textures);
         if (world_built) self.world.deinit();
 
         allocator.free(self.morph_registrations);
@@ -223,6 +250,78 @@ pub const Level = struct {
             directory,
         );
         self.timings.environment_ns = timer.split();
+    }
+
+    // Takes a lighting cache into device memory and binds it as this level's.
+    //
+    // The formats are fixed rather than asked for. Irradiance is RGBA16F because
+    // an eight-bit value clamps at one, which is a small fraction of what a lit
+    // surface receives. Direction is packed RGB10 so three coefficients cost
+    // four bytes per texel; the coefficients are signed but the format is the
+    // unsigned one, because the signed form of this packed format is optional
+    // for sampled images and RDNA3 does not offer it. The producer stores the
+    // same signed lattice biased by half its range, which keeps decoding affine
+    // and so lets hardware bilinear filtering stay correct. Byte counts that
+    // disagree with either format are refused by the upload path rather than
+    // uploaded askew.
+    //
+    // The keys are the caller's because identity is: the cache returns the image
+    // already under that name, and two different bakes under one name is a
+    // mistake only the caller can see. They are copied because release happens
+    // with the level, after the caller's slices may have gone away.
+    //
+    // Call before `install`, which is what writes the descriptor.
+    pub fn uploadLightmap(
+        self: *Level,
+        deps: Deps,
+        keys: [2][]const u8,
+        irradiance: gpu.Raw,
+        direction: gpu.Raw,
+    ) !void {
+        if (irradiance.width != direction.width or irradiance.height != direction.height)
+            return error.LightmapExtentMismatch;
+
+        var owned_keys: [2][]u8 = undefined;
+        owned_keys[0] = try self.allocator.dupe(u8, keys[0]);
+        errdefer self.allocator.free(owned_keys[0]);
+        owned_keys[1] = try self.allocator.dupe(u8, keys[1]);
+        errdefer self.allocator.free(owned_keys[1]);
+
+        var timer: PhaseTimer = .begin(deps.clock);
+        var setup: gpu.Transfer = try .begin(
+            deps.context,
+            deps.setup_pool.handle,
+            deps.staging,
+        );
+        defer setup.deinit();
+
+        const irradiance_bound = try deps.textures.acquireRaw(
+            keys[0],
+            irradiance,
+            .r16g16b16a16_sfloat,
+            gpu.lightmapSampler,
+            &setup,
+        );
+        errdefer deps.textures.release(keys[0]);
+        const direction_bound = try deps.textures.acquireRaw(
+            keys[1],
+            direction,
+            .a2b10g10r10_unorm_pack32,
+            gpu.lightmapSampler,
+            &setup,
+        );
+        errdefer deps.textures.release(keys[1]);
+
+        // Both references have to outlive this submission: releasing either one
+        // sooner destroys an image a recorded copy still names.
+        try setup.finish();
+
+        if (self.lightmap) |*loaded| loaded.release(self.allocator, deps.textures);
+        self.lightmap = .{
+            .source = .{ .irradiance = irradiance_bound, .direction = direction_bound },
+            .keys = owned_keys,
+        };
+        self.timings.lightmap_ns = timer.split();
     }
 
     // Writes this level into the device objects that outlive it: one descriptor
@@ -261,6 +360,15 @@ pub const Level = struct {
             loaded.environment
         else
             try gpu.Environment.neutral(textures));
+
+        // Without a cache the term is exactly zero rather than approximately so,
+        // on the same footing as the environment above. The descriptor is
+        // written either way, because one a fragment can reach has to name a
+        // real image whether or not the value is used.
+        renderer.setLightmap(if (self.lightmap) |loaded|
+            loaded.source
+        else
+            try gpu.Lightmap.none(textures));
     }
 
     // Whether the environment is something to draw behind the model. With none

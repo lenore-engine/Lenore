@@ -438,7 +438,7 @@ pub const ImageLoader = struct {
 
         const request: gpu.TextureRequest = .{
             .key = model.images[index].key,
-            .source = .{ .rgba8 = .{
+            .source = .{ .raw = .{
                 .width = produced.image.cols,
                 .height = produced.image.rows,
                 .bytes = std.mem.sliceAsBytes(produced.image.data),

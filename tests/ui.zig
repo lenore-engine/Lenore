@@ -67,19 +67,19 @@ test "a window event reaches the widget under it, and one the UI cannot name doe
 
     // Off the widget and with nothing held: no widget wanted it, which is what
     // lets a camera act on the same press.
-    try testing.expect(!try host.route(pointer(10, 10, .press)));
+    try testing.expect(!try host.route(&pointer(10, 10, .press)));
     // A key the UI declares nothing for. False rather than an error: most of
     // what a window says is not for the UI.
-    try testing.expect(!try host.route(event(.{ .key = .{ .physical = .q, .action = .press } })));
+    try testing.expect(!try host.route(&event(.{ .key = .{ .physical = .q, .action = .press } })));
 
     // On the widget, so the UI takes it. The position crosses through the
     // surface metrics rather than being passed through: at this scale the two
     // spaces agree, and the conversion has its own tests.
-    try testing.expect(try host.route(pointer(120, 110, .press)));
+    try testing.expect(try host.route(&pointer(120, 110, .press)));
     // Taken as well, and not because of where it is: a release of the button
     // being held ends the gesture wherever the pointer has got to, which is
     // what stops a drag from ending in whatever is behind the widget.
-    try testing.expect(try host.route(pointer(10, 10, .release)));
+    try testing.expect(try host.route(&pointer(10, 10, .release)));
 
     try host.finishRouting();
 }
@@ -136,6 +136,36 @@ test "a frame the caller failed in does not refuse the next one" {
     try small.beginFrame(slots.storage(0), root);
     try small.widgets.register(.{ .string = "first" }, box, .{});
     try small.beginRouting();
-    try testing.expect(try small.route(pointer(120, 110, .press)));
+    try testing.expect(try small.route(&pointer(120, 110, .press)));
     try small.finishRouting();
+}
+
+test "a typed chunk reaches a focused widget with its bytes intact" {
+    var slots: Slots = .{};
+    var host: lenore.UiHost = undefined;
+    try host.init(testing.allocator, .{}, slots.storage(0), window, image);
+    defer host.deinit(testing.allocator);
+
+    try host.beginFrame(slots.storage(0), root);
+    try host.widgets.register(.{ .string = "field" }, box, .{ .focusable = true });
+    try host.beginRouting();
+    // Focus it, then type into it.
+    _ = try host.route(&pointer(120, 110, .press));
+    _ = try host.route(&pointer(120, 110, .release));
+    try testing.expect(try host.route(&event(.{ .text = .{
+        .transaction = 1,
+        .kind = .commit,
+        .begin = true,
+        .end = true,
+        .len = 2,
+        .bytes = [_]u8{ 0xc3, 0xa9 } ++ [_]u8{0} ** 14,
+    } })));
+    try host.finishRouting();
+
+    // The chunk carries its bytes inside the event, and the UI's own event is
+    // a slice of them. What this checks is that the slice still names those
+    // bytes by the time a widget reads it.
+    const edits = try host.input.editsForId(host.widgets.ids.id(.{ .string = "field" }));
+    try testing.expectEqual(@as(usize, 1), edits.len);
+    try testing.expectEqualStrings("é", edits[0].insert);
 }

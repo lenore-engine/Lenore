@@ -9,6 +9,18 @@ const testing = std.testing;
 // does is verified by running it against a device. What can be checked here is
 // the one refusal that happens before the device is reached, which is the
 // point of it happening there.
+test "a directional lightmap must match the irradiance extent" {
+    var level = lenore.Level.empty(testing.allocator);
+    const deps: lenore.LevelDeps = undefined;
+    try testing.expectError(error.LightmapExtentMismatch, level.uploadLightmap(
+        deps,
+        .{ "irradiance", "direction" },
+        .{ .width = 4, .height = 4, .bytes = &.{} },
+        .{ .width = 2, .height = 4, .bytes = &.{} },
+    ));
+    level.world.deinit();
+}
+
 test "a model with no materials is refused before the device is reached" {
     var vertices = [_]res.Vertex3D{.{
         .position = .{ 0, 0, 0 },

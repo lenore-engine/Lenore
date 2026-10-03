@@ -31,15 +31,22 @@ struct CameraUbo
 // are zero, so no lane means one thing here and another there.
 struct Light
 {
-    float3 position; // point and spot
-    uint kind;       // 0 = directional, 1 = point, 2 = spot
+    float3 position; // the centre for rect, the source for point and spot
+    uint kind;       // 0 = directional, 1 = point, 2 = spot, 3 = rect
     float3 colour;
     float intensity;
-    float3 direction; // unit, the way the light travels; directional and spot
-    float range;      // point and spot
+    // Unit, the way the light travels. For rect it is the face the rectangle
+    // emits from. Directional, spot and rect.
+    float3 direction;
+    float range;      // point, spot and rect
     float cos_inner;  // spot
     float cos_outer;  // spot
     float2 padding;
+    // The rectangle, for rect. `half_edge` is half of one edge as a vector from
+    // the centre; the other edge is perpendicular to it and to `direction`, with
+    // `half_extent` for its half length.
+    float3 half_edge;
+    float half_extent;
 };
 
 // Mirrors `uniforms.max_lights`. The array bounds the loop; `count.x` is how
@@ -127,6 +134,20 @@ struct MaterialData
 [[vk::binding(1, 1)]] SamplerCube lambertian_environment;
 [[vk::binding(2, 1)]] SamplerCube ggx_environment;
 [[vk::binding(3, 1)]] Sampler2D ggx_lut;
+// The lighting cache: irradiance arriving at each patch of static surface,
+// addressed by the second UV set.
+//
+// A mesh with no second set has a zero coordinate in it, and the sampler is
+// clamped, so it reads the texel at the origin. That texel is black by the
+// binding's own contract, which is what lets one shader serve both without a
+// flag deciding between them.
+[[vk::binding(4, 1)]] Sampler2D lightmap;
+// Reserved beside irradiance for application-owned surface shading. Lenore's
+// default glTF path does not reinterpret its normal-mapped PBR indirect term as
+// Backrooms' achromatic directional cache, but both shaders share one scene-set
+// layout and every slot in that layout is declared here for reflection.
+[[vk::binding(5, 1)]] Sampler2D lightmap_direction;
+
 [[vk::binding(0, 2)]] Sampler2D base_colour;
 [[vk::binding(1, 2)]] Sampler2D metallic_roughness;
 [[vk::binding(2, 2)]] Sampler2D normal_texture;
@@ -699,7 +720,8 @@ float3 imageBasedLight(
     float metallic,
     float roughness,
     float3 normal,
-    float3 to_eye)
+    float3 to_eye,
+    float2 uv1)
 {
     const float n_dot_v = max(dot(normal, to_eye), 0.0);
 
@@ -719,7 +741,13 @@ float3 imageBasedLight(
     const float3 irradiance = lambertian_environment.Sample(normal).rgb;
     const float2 f_ab = ggx_lut.Sample(float2(n_dot_v, roughness)).rg;
 
-    const float3 diffuse = irradiance * base;
+    // Two sources of the same quantity, summed before the albedo multiplies
+    // them: what the world outside sends this normal, and what was computed for
+    // this patch of surface and stored. The cache holds irradiance, and what
+    // leaves a diffuse surface is that over pi, which is the convention the
+    // environment's prefiltered map already arrives in.
+    const float3 stored = lightmap.Sample(uv1).rgb * (1.0 / 3.14159265358979);
+    const float3 diffuse = (irradiance + stored) * base;
     const float3 metal = iblFresnel(base, roughness, n_dot_v, f_ab) * specular;
     const float3 dielectric = lerp(
         diffuse,
@@ -729,13 +757,34 @@ float3 imageBasedLight(
     return lerp(dielectric, metal, metallic);
 }
 
+// The alpha arithmetic shared by the depth prepass and the shaded pass. Keeping
+// the cutoff in one function makes a MASK surface write depth for exactly the
+// fragments the colour pass later accepts.
+float baseAlpha(MaterialData material, float sampled_alpha, float vertex_alpha)
+{
+    return sampled_alpha * material.base_colour_factor.a * vertex_alpha;
+}
+
+void applyAlphaCutoff(MaterialData material, float alpha)
+{
+    if (material.flags.x == alpha_mode_mask && alpha < material.metallic_roughness_cutoff.z)
+        discard;
+}
+
+void maskDepth(Varying varying, float vertex_alpha)
+{
+    const MaterialData material = materials[varying.material_index];
+    const float sampled_alpha = base_colour.Sample(
+        transformedUv(material.tex[texture_slot_base_colour], varying.uv, varying.uv1)).a;
+    applyAlphaCutoff(material, baseAlpha(material, sampled_alpha, vertex_alpha));
+}
+
 // Direct lighting plus the environment. A surface facing away from every light
 // is no longer black: it still receives whatever the environment sends it, which
 // is also what makes a metal read as metal, since a metal has no diffuse lobe
 // and the reflection is all it has.
 //
-// Alpha modes are not sampled: this pass has a pipeline for OPAQUE alone.
-// The shading both fragment entry points below run, with the vertex colour as a
+// Both shaded fragment entry points run this body, with the vertex colour as a
 // parameter rather than as a field of what is interpolated. A mesh without the
 // stream passes white, which is the identity of the product section 3.9.2
 // defines and costs nothing to write here.
@@ -755,15 +804,13 @@ float4 shade(Varying varying, float4 vertex_colour, bool front_facing)
 
     // Section 3.9.4: the alpha is the fourth component of the base colour, so
     // the factor multiplies the texture here as it does for the other three
-    // channels. MASK is fully opaque at or above the cutoff and fully
-    // transparent below it, and the test is made here rather than after the
-    // lighting that a dropped fragment would never have needed.
+    // channels. MASK coverage was already applied by the depth prepass. Keeping
+    // `discard` out of these shaded entry points lets their early depth test
+    // reject hidden surfaces before any lighting runs.
     // Named for the base colour it comes from: `alpha` below is the GGX
     // distribution's parameter and the two are unrelated.
     const uint alpha_mode = material.flags.x;
-    const float base_alpha = sampled.a * material.base_colour_factor.a * vertex_colour.a;
-    if (alpha_mode == alpha_mode_mask && base_alpha < material.metallic_roughness_cutoff.z)
-        discard;
+    const float base_alpha = baseAlpha(material, sampled.a, vertex_colour.a);
 
     // KHR_materials_unlit, Definition: the colour is the base-colour term alone
     // and every property of the PBR model bearing on lighting is ignored. So the
@@ -930,7 +977,13 @@ float4 shade(Varying varying, float4 vertex_colour, bool front_facing)
             transformedUv(material.tex[texture_slot_occlusion], varying.uv, varying.uv1)).r;
         occlusion = 1.0 + material.emissive_factor.w * (sampled_occlusion - 1.0);
     }
-    radiance += occlusion * imageBasedLight(base, metallic, roughness, normal, to_eye);
+    radiance += occlusion * imageBasedLight(
+        base,
+        metallic,
+        roughness,
+        normal,
+        to_eye,
+        varying.uv1);
 
     // Radiance the surface adds on its own, so it is outside the light loop and
     // unlit by construction. Section 3.9.3 makes the decoded linear sample a
@@ -948,15 +1001,32 @@ float4 shade(Varying varying, float4 vertex_colour, bool front_facing)
     return float4(radiance, alpha_mode == alpha_mode_blend ? base_alpha : 1.0);
 }
 
+// The MASK half of the camera depth prepass. Opaque geometry has no fragment
+// stage at all; these exist only where the cutoff decides whether the rasterizer
+// may write depth. There is no colour output because that pass declares none.
+[shader("fragment")]
+void maskFragmentMain(Varying varying)
+{
+    maskDepth(varying, 1.0);
+}
+
+[shader("fragment")]
+void colourMaskFragmentMain(VaryingColour varying)
+{
+    maskDepth(varying.base, varying.colour.a);
+}
+
 // White for the meshes with no COLOR_0, which is the product's identity. The
 // alternative is a constant varying interpolated across every fragment of every
 // mesh in the scene, and a packed parameter is not free.
+[earlydepthstencil]
 [shader("fragment")]
 float4 fragmentMain(Varying varying, bool front_facing : SV_IsFrontFace) : SV_Target
 {
     return shade(varying, float4(1.0), front_facing);
 }
 
+[earlydepthstencil]
 [shader("fragment")]
 float4 colourFragmentMain(VaryingColour varying, bool front_facing : SV_IsFrontFace) : SV_Target
 {

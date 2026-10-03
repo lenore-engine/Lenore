@@ -53,7 +53,41 @@ pub const FrameTime = struct {
     pub fn stalled(self: FrameTime) bool {
         return self.interval_ns > max_frame_delta_ns;
     }
+
+    // The clock a shader animates on, in seconds, folded into
+    // `shader_clock_period_ns`.
+    //
+    // Folded, because f32 seconds of uptime run out of resolution: the spacing
+    // at one hour is 0.244 ms and at ten hours 3.906 ms, which is the same
+    // measurement the interval above is taken in nanoseconds to avoid. A
+    // surface animated on `sin(k * t)` does not merely lose precision as `t`
+    // grows, it quantises: the phase steps instead of turning, and water that
+    // ran smoothly at start-up stutters an hour in. That is a defect nobody
+    // reproduces, because nobody leaves the level running for an hour twice.
+    //
+    // The fold is taken on the exact nanosecond count and converted once, so
+    // the value handed to a shader is always a small number of seconds and the
+    // conversion never sees a large one.
+    //
+    // What it costs is that anything animated on this must be periodic in the
+    // period, or it jumps when the clock wraps. Scrolling and rotating are; a
+    // ramp is not.
+    pub fn shaderSeconds(self: FrameTime) f32 {
+        return @floatCast(seconds(self.elapsed_ns % shader_clock_period_ns));
+    }
 };
+
+// How long the shader clock runs before it starts again, in nanoseconds.
+//
+// An hour, which f32 seconds still resolve to a quarter of a millisecond, and
+// which is long enough that nothing periodic in it is seen to repeat. Godot
+// folds its own shader clock at the same interval and exposes the period as a
+// project setting, `rendering/limits/time/time_rollover_secs`, defaulting to
+// 3600 (`servers/rendering/rendering_server.cpp`, and the fold itself in
+// `RendererCompositorRD::begin_frame`). One constant here rather than a
+// setting: an application that needs a different period has one number to
+// change and no interface to keep working.
+pub const shader_clock_period_ns: u64 = 3600 * std.time.ns_per_s;
 
 // The frame's clock, and the only place an interval becomes a delta.
 pub const FrameClock = struct {

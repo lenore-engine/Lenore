@@ -23,6 +23,7 @@ const Full = struct {
     pub fn onEvent(_: *Full, _: *lenore.Engine, _: platform.Event, _: bool) !void {}
     pub fn onResize(_: *Full, _: *lenore.Engine, _: platform.Extent2D) !void {}
     pub fn onUpdate(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: lenore.FrameTime) !void {}
+    pub fn onDepth(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onCompute(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onRecord(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onUiRegions(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
@@ -41,6 +42,18 @@ test "the loop compiles for the driver that does nothing" {
     const engine: *lenore.Engine = undefined;
     const level: *lenore.Level = undefined;
     _ = @TypeOf(engine.run(level, &driver));
+}
+
+test "the device phase is independently destructible" {
+    var engine: lenore.Engine = undefined;
+    try engine.initDevice(testing.allocator, .{
+        .title = "Lenore device initialization test",
+        .extent = .{ .width = 64, .height = 64 },
+        .frame_capacity = .{ .instances = 0, .joints = 0 },
+        .morph_capacity = .{ .meshes = 0, .weights = 0 },
+        .material_capacity = 0,
+    });
+    defer engine.deinit();
 }
 
 fn bake(request: lenore.ShadowBakeRequest) gpu.ShadowBake {
@@ -101,4 +114,36 @@ test "animated casters re-record under a sun that has not moved" {
         .map_stale = false,
         .casters_move = true,
     }));
+}
+
+// The render scale's arithmetic, which decides how many pixels every pass
+// before the presenting one is charged for.
+
+test "a scale of one leaves the surface untouched" {
+    const surface: platform.Extent2D = .{ .width = 2560, .height = 1600 };
+    try testing.expectEqual(surface, lenore.scaledExtent(surface, 1.0));
+}
+
+test "two thirds of a side is four ninths of the pixels" {
+    const scaled = lenore.scaledExtent(.{ .width = 2560, .height = 1600 }, 2.0 / 3.0);
+    try testing.expectEqual(@as(u32, 1707), scaled.width);
+    try testing.expectEqual(@as(u32, 1067), scaled.height);
+
+    // The ratio survives the rounding to within a thousandth, which is what
+    // lets the camera's projection be taken from either extent.
+    const surface_ratio = 2560.0 / 1600.0;
+    const target_ratio = @as(f64, @floatFromInt(scaled.width)) /
+        @as(f64, @floatFromInt(scaled.height));
+    try testing.expect(@abs(target_ratio - surface_ratio) < 1.0e-3);
+}
+
+test "a side is rounded rather than truncated" {
+    // 3 * 0.5 is 1.5, which floors to one and rounds to two.
+    try testing.expectEqual(@as(u32, 2), lenore.scaledExtent(.{ .width = 3, .height = 3 }, 0.5).width);
+}
+
+test "no side scales away to nothing" {
+    const scaled = lenore.scaledExtent(.{ .width = 1, .height = 1 }, 0.01);
+    try testing.expectEqual(@as(u32, 1), scaled.width);
+    try testing.expectEqual(@as(u32, 1), scaled.height);
 }

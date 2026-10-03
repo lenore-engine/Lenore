@@ -160,7 +160,7 @@ pub fn load(
     if (decoded.stride != decoded.cols) return error.NonContiguousDecodedImage;
 
     var lut_setup: gpu.Transfer = try .begin(context, pool.handle, staging);
-    const lut = try textures.acquireRgba8(
+    const lut = try textures.acquireRaw(
         environment_keys[2],
         .{
             .width = decoded.cols,

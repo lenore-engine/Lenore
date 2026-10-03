@@ -218,6 +218,16 @@ pub fn uiScale(metrics: platform.SurfaceMetrics) ?imui.ScaleFactor {
     ) catch null;
 }
 
+// How far one turn of the wheel moves a view, in logical units.
+//
+// DECIDE: the number and the sign are both settled by a run rather than by
+// argument. Scroll a list on the host: a wheel pushed away from the user should
+// move the view up its content, and one turn should cover about three lines of
+// text. The negation in the arm below is what flips the direction; this is what
+// changes the distance. Three lines at a nominal sixteen logical units is where
+// the number starts.
+const wheel_step: f32 = 48;
+
 pub const UiEvents = struct {
     metrics: ?platform.SurfaceMetrics,
 
@@ -229,7 +239,12 @@ pub const UiEvents = struct {
     }
 
     // One event in the UI's terms, or null where the UI has no word for it.
-    pub fn translate(self: *UiEvents, event: platform.Event) ?imui.Event {
+    //
+    // Taken by pointer because one arm borrows from it. A text chunk carries
+    // its bytes inline, and the UI's own text event is a slice, so the event
+    // has to outlive the call that translated it. Every caller has it in the
+    // ring it was read from, which lives for the batch.
+    pub fn translate(self: *UiEvents, event: *const platform.Event) ?imui.Event {
         switch (event.payload) {
             .surface_metrics => |metrics| {
                 self.metrics = metrics;
@@ -286,6 +301,10 @@ pub const UiEvents = struct {
                     .arrow_right => .right,
                     .arrow_up => .up,
                     .arrow_down => .down,
+                    .backspace => .backspace,
+                    .delete => .delete,
+                    .home => .home,
+                    .end => .end,
                     else => return null,
                 };
                 return .{ .key = .{
@@ -296,15 +315,34 @@ pub const UiEvents = struct {
                         .release => .release,
                     },
                     .shift = key.modifiers.shift,
+                    .control = key.modifiers.control,
                 } };
             },
             .focus => |focus| return .{ .focus = focus.focused },
-            // The UI declares no event for either. A wheel needs a scrollable
-            // region and a character needs a text target, and a translation
-            // that invented one here would be answering for a widget that does
-            // not exist.
-            .text, .scroll => return null,
+            .text => |*chunk| {
+                // Committed text only. A composition still being edited is a
+                // word the UI does not have, and nothing produces one: every
+                // chunk the window layer builds is a commit. When a backend
+                // brings preedit, this arm is where it enters.
+                if (chunk.kind != .commit) return null;
+                return .{ .text = chunk.bytes[0..chunk.len] };
+            },
+            .scroll => |wheel| {
+                const ratio = self.scale() orelse return null;
+                // Lines into a raster distance, which is the conversion the UI
+                // has no font to make. `pixel_delta` is deliberately not read:
+                // nothing fills it and nothing states its units, so translating
+                // it would be inventing a contract rather than following one.
+                return .{ .scroll = .{
+                    .x = -wheel.line_delta[0] * wheel_step * ratio.x,
+                    .y = -wheel.line_delta[1] * wheel_step * ratio.y,
+                } };
+            },
         }
+    }
+
+    fn scale(self: *const UiEvents) ?imui.ScaleFactor {
+        return uiScale(self.metrics orelse return null);
     }
 
     fn place(self: *const UiEvents, logical: [2]f32, generation: u32) ?imui.Point {

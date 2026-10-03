@@ -304,3 +304,45 @@ test "a closed window carries no phases into the next one" {
     try testing.expectEqual(@as(u64, 2), metrics.closed_windows);
     try testing.expectEqual(@as(u64, 55), metrics.last_phases.total());
 }
+
+test "the shader clock folds into its period and keeps its resolution" {
+    // Inside the period it is the elapsed time itself.
+    const early: lenore.FrameTime = .{
+        .elapsed_ns = 90 * std.time.ns_per_s,
+        .interval_ns = 0,
+        .delta = 0.0,
+        .index = 0,
+    };
+    try std.testing.expectApproxEqAbs(@as(f32, 90.0), early.shaderSeconds(), 1.0e-4);
+
+    // Past it, it starts again rather than growing without bound. Ten hours in,
+    // an unfolded f32 would space its values 3.9 ms apart and a surface
+    // animated on it would visibly step.
+    const late: lenore.FrameTime = .{
+        .elapsed_ns = 10 * 3600 * std.time.ns_per_s + 12 * std.time.ns_per_s,
+        .interval_ns = 0,
+        .delta = 0.0,
+        .index = 0,
+    };
+    try std.testing.expectApproxEqAbs(@as(f32, 12.0), late.shaderSeconds(), 1.0e-4);
+
+    // And what it hands a shader is always small enough for f32 to resolve
+    // finely. The worst case is the end of the period, and two things hold
+    // there: the value never leaves the period, and the spacing between
+    // representable values stays a fifth of a millisecond, which is under the
+    // shortest frame anything here will draw.
+    //
+    // The bound is inclusive because the last nanoseconds of the period round
+    // up to the period itself in f32. That is the same instant as zero for
+    // anything periodic in it, which is what everything reading this clock has
+    // to be anyway.
+    const worst: lenore.FrameTime = .{
+        .elapsed_ns = lenore.shaderClockPeriodNs - 1,
+        .interval_ns = 0,
+        .delta = 0.0,
+        .index = 0,
+    };
+    const value = worst.shaderSeconds();
+    try std.testing.expect(value <= 3600.0);
+    try std.testing.expect(std.math.floatEps(f32) * value < 1.0e-3);
+}

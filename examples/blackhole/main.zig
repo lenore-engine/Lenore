@@ -476,6 +476,7 @@ const Driver = struct {
     }
 
     pub fn onResize(_: *Driver, _: *lenore.Engine, _: platform.Extent2D) !void {}
+    pub fn onDepth(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onCompute(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
 
     // Nothing to draw over the picture. The hook is required of every

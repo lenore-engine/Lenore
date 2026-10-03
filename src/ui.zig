@@ -31,6 +31,21 @@ pub const Capacity = struct {
     regions: u32 = 128,
     // How deeply identity scopes and clips may nest. Nesting, not count.
     scope_depth: u32 = 16,
+
+    // Editing operations one frame may deliver to the focused widget, and the
+    // bytes the insertions among them hold.
+    //
+    // Sized for keystrokes rather than for a document: what reaches this is
+    // what the window said between two frames, and a paste arrives through the
+    // clipboard instead. A frame that overran either is one where the user
+    // typed faster than the loop ran, and the UI module says so rather than
+    // truncating the sentence.
+    //
+    // Two numbers because they measure different things. Six characters is six
+    // operations and six bytes in Latin, six operations and eighteen bytes in
+    // a script that spells a character in three.
+    edits: u32 = 32,
+    text_bytes: u32 = 256,
 };
 
 // What the engine's widget identities are derived against. One surface of UI,
@@ -43,6 +58,8 @@ pub const Host = struct {
     interactions: []imui.Interaction,
     lookup: []imui.LookupSlot,
     scopes: []imui.Id,
+    edits: []imui.Edit,
+    text: []u8,
 
     input: imui.InputContext,
     // Re-pointed at the slot being filled at the top of every frame, so it
@@ -77,14 +94,26 @@ pub const Host = struct {
         errdefer allocator.free(self.lookup);
         self.scopes = try allocator.alloc(imui.Id, capacity.scope_depth);
         errdefer allocator.free(self.scopes);
+        self.edits = try allocator.alloc(imui.Edit, capacity.edits);
+        errdefer allocator.free(self.edits);
+        self.text = try allocator.alloc(u8, capacity.text_bytes);
+        errdefer allocator.free(self.text);
 
-        self.input = try .initBuffers(self.regions, self.interactions, self.lookup);
+        self.input = try .initBuffers(
+            self.regions,
+            self.interactions,
+            self.lookup,
+            self.edits,
+            self.text,
+        );
         self.canvas = try .init(storage);
         self.widgets = try .init(&self.input, &self.canvas, self.scopes, root_seed, image);
         self.events = .init(metrics);
     }
 
     pub fn deinit(self: *Host, allocator: Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.edits);
         allocator.free(self.scopes);
         allocator.free(self.lookup);
         allocator.free(self.interactions);
@@ -110,7 +139,7 @@ pub const Host = struct {
     // False for everything the UI has no word for, which is most of what a
     // window says. A caller suppressing its own binding on this is suppressing
     // it on what a widget actually took.
-    pub fn route(self: *Host, event: platform.Event) !bool {
+    pub fn route(self: *Host, event: *const platform.Event) !bool {
         const ui_event = self.events.translate(event) orelse return false;
         return self.widgets.routeEvent(ui_event);
     }

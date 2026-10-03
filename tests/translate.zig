@@ -310,7 +310,7 @@ fn uiTranslator(generation: u32) lenore.UiEvents {
 test "a pointer position crosses in framebuffer pixels" {
     var events = uiTranslator(1);
 
-    const moved = events.translate(uiEvent(.{ .cursor = .{
+    const moved = events.translate(&uiEvent(.{ .cursor = .{
         .logical_position = .{ 500, 350 },
         .metrics_generation = 1,
     } }));
@@ -319,7 +319,7 @@ test "a pointer position crosses in framebuffer pixels" {
         moved.?,
     );
 
-    const pressed = events.translate(uiEvent(.{ .mouse_button = .{
+    const pressed = events.translate(&uiEvent(.{ .mouse_button = .{
         .button = .right,
         .action = .press,
         .modifiers = .{ .shift = true },
@@ -343,10 +343,10 @@ test "the surface configuration is folded where it arrives in the batch" {
 
     // The window has resized and the event says so, but the metrics that
     // describe the new surface are still ahead of it in the batch.
-    try testing.expectEqual(null, events.translate(moved));
+    try testing.expectEqual(null, events.translate(&moved));
 
-    try testing.expectEqual(null, events.translate(uiEvent(uiMetrics(2))));
-    try testing.expect(events.translate(moved) != null);
+    try testing.expectEqual(null, events.translate(&uiEvent(uiMetrics(2))));
+    try testing.expect(events.translate(&moved) != null);
 }
 
 test "a transition that cannot be placed cancels the gesture and a motion does not" {
@@ -356,11 +356,11 @@ test "a transition that cannot be placed cancels the gesture and a motion does n
     // dropped, because the pointer keeps the last position it was known at;
     // the transition becomes a cancel, because the release it might be is the
     // one thing that must not go missing.
-    try testing.expectEqual(null, events.translate(uiEvent(.{ .cursor = .{
+    try testing.expectEqual(null, events.translate(&uiEvent(.{ .cursor = .{
         .logical_position = .{ 500, 350 },
         .metrics_generation = 9,
     } })));
-    try testing.expectEqual(imui.Event.cancel, events.translate(uiEvent(.{ .mouse_button = .{
+    try testing.expectEqual(imui.Event.cancel, events.translate(&uiEvent(.{ .mouse_button = .{
         .button = .left,
         .action = .release,
         .logical_position = .{ 500, 350 },
@@ -372,7 +372,7 @@ test "what the UI has no word for does not cross" {
     var events = uiTranslator(1);
 
     for ([_]platform.MouseButton{ .back, .forward, .other }) |button| {
-        try testing.expectEqual(null, events.translate(uiEvent(.{ .mouse_button = .{
+        try testing.expectEqual(null, events.translate(&uiEvent(.{ .mouse_button = .{
             .button = button,
             .action = .press,
             .logical_position = .{ 500, 350 },
@@ -381,27 +381,70 @@ test "what the UI has no word for does not cross" {
     }
     // A held mouse button does not repeat: the action type is shared with the
     // keyboard, where it does.
-    try testing.expectEqual(null, events.translate(uiEvent(.{ .mouse_button = .{
+    try testing.expectEqual(null, events.translate(&uiEvent(.{ .mouse_button = .{
         .button = .left,
         .action = .repeat,
         .logical_position = .{ 500, 350 },
         .metrics_generation = 1,
     } })));
 
-    try testing.expectEqual(null, events.translate(uiEvent(.{ .key = .{
+    try testing.expectEqual(null, events.translate(&uiEvent(.{ .key = .{
         .physical = .q,
         .action = .press,
     } })));
-    try testing.expectEqual(null, events.translate(uiEvent(.{ .scroll = .{
-        .line_delta = .{ 0, 1 },
-    } })));
-    try testing.expectEqual(null, events.translate(uiEvent(.{ .text = .{
+    // A composition still being edited, which the UI has no word for. The
+    // commit beside it does cross, in the test below.
+    try testing.expectEqual(null, events.translate(&uiEvent(.{ .text = .{
         .transaction = 1,
-        .kind = .commit,
+        .kind = .preedit,
         .begin = true,
-        .end = true,
+        .end = false,
         .len = 1,
         .bytes = [_]u8{'a'} ++ [_]u8{0} ** 15,
+    } })));
+}
+
+test "a committed chunk crosses as the bytes it carries" {
+    var events = uiTranslator(1);
+
+    const chunk = uiEvent(.{
+        .text = .{
+            .transaction = 1,
+            .kind = .commit,
+            .begin = true,
+            .end = true,
+            // Two bytes of the sixteen the chunk carries, so the length and not
+            // the array is what says how much is text.
+            .len = 2,
+            .bytes = [_]u8{ 0xc3, 0xa9 } ++ [_]u8{0} ** 14,
+        },
+    });
+    const crossed = events.translate(&chunk).?;
+    try testing.expectEqualStrings("\xc3\xa9", crossed.text);
+}
+
+test "the wheel crosses in raster pixels, and the other way up" {
+    var events = uiTranslator(1);
+
+    // The ratio the translator is seeded with is 1051/700 down, so one line of
+    // 48 logical units lands on 72.0686 raster pixels.
+    const turned = events.translate(&uiEvent(.{ .scroll = .{
+        .line_delta = .{ 0, 1 },
+    } })).?;
+
+    // A wheel pushed away from the user moves the view up its content, so a
+    // positive line delta becomes a negative distance.
+    try testing.expect(turned.scroll.y < 0);
+    try testing.expectApproxEqAbs(-72.0686, turned.scroll.y, 1e-3);
+    try testing.expectApproxEqAbs(0, turned.scroll.x, 1e-3);
+}
+
+test "a wheel before the window has described itself crosses as nothing" {
+    // No metrics, so there is no ratio to turn a logical distance into a
+    // raster one, and inventing one would scroll by the wrong amount.
+    var events: lenore.UiEvents = .init(null);
+    try testing.expectEqual(null, events.translate(&uiEvent(.{ .scroll = .{
+        .line_delta = .{ 0, 1 },
     } })));
 }
 
@@ -412,7 +455,7 @@ test "the keys a widget acts on keep their action and their shift" {
         .key = .enter,
         .action = .repeat,
         .shift = false,
-    } }, events.translate(uiEvent(.{ .key = .{
+    } }, events.translate(&uiEvent(.{ .key = .{
         .physical = .numpad_enter,
         .action = .repeat,
     } })).?);
@@ -421,7 +464,7 @@ test "the keys a widget acts on keep their action and their shift" {
         .key = .tab,
         .action = .press,
         .shift = true,
-    } }, events.translate(uiEvent(.{ .key = .{
+    } }, events.translate(&uiEvent(.{ .key = .{
         .physical = .tab,
         .action = .press,
         .modifiers = .{ .shift = true },
@@ -429,6 +472,47 @@ test "the keys a widget acts on keep their action and their shift" {
 
     try testing.expectEqual(
         imui.Event{ .focus = false },
-        events.translate(uiEvent(.{ .focus = .{ .focused = false } })).?,
+        events.translate(&uiEvent(.{ .focus = .{ .focused = false } })).?,
     );
+}
+
+test "the keys a text field navigates by cross with their modifiers" {
+    var events = uiTranslator(1);
+
+    try testing.expectEqual(imui.Event{ .key = .{
+        .key = .backspace,
+        .action = .repeat,
+    } }, events.translate(&uiEvent(.{ .key = .{
+        .physical = .backspace,
+        .action = .repeat,
+    } })).?);
+
+    try testing.expectEqual(imui.Event{ .key = .{
+        .key = .delete,
+        .action = .press,
+    } }, events.translate(&uiEvent(.{ .key = .{
+        .physical = .delete,
+        .action = .press,
+    } })).?);
+
+    // Control and shift together, which is what extends a selection by a word
+    // and is the reason both cross rather than only shift.
+    try testing.expectEqual(imui.Event{ .key = .{
+        .key = .home,
+        .action = .press,
+        .shift = true,
+        .control = true,
+    } }, events.translate(&uiEvent(.{ .key = .{
+        .physical = .home,
+        .action = .press,
+        .modifiers = .{ .shift = true, .control = true },
+    } })).?);
+
+    try testing.expectEqual(imui.Event{ .key = .{
+        .key = .end,
+        .action = .press,
+    } }, events.translate(&uiEvent(.{ .key = .{
+        .physical = .end,
+        .action = .press,
+    } })).?);
 }

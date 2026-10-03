@@ -36,9 +36,9 @@ fn words(comptime bytes: anytype) []const u32 {
 // listed in the order `gpu.sceneVariantIndex` computes: skinning is the most
 // significant axis and the colour the least.
 //
-// Two fragment entry points, on the colour axis alone. A fragment stage's input
-// is the vertex stage's output, so the variants that carry COLOR_0 need the one
-// that declares it.
+// Four fragment entry points, on the colour axis and whether the pass shades or
+// only applies MASK coverage. A fragment stage's input is the vertex stage's
+// output, so the variants that carry COLOR_0 need the one that declares it.
 pub const scene: gpu.SceneShader = .{
     .spirv = words(@embedFile("scene").*),
     .vertex_entry = .{
@@ -53,6 +53,8 @@ pub const scene: gpu.SceneShader = .{
     },
     .fragment_entry = "fragmentMain",
     .colour_fragment_entry = "colourFragmentMain",
+    .mask_fragment_entry = "maskFragmentMain",
+    .colour_mask_fragment_entry = "colourMaskFragmentMain",
 };
 
 // The background: one screen-covering triangle sampling the environment cube
@@ -114,9 +116,22 @@ pub const morph: gpu.MorphShader = .{
     .compute_entry = "morphMain",
 };
 
+// The photocell: the frame's own light, reduced to a coarse grid an application
+// can set an exposure from. Compute only, and it shares no binding with any pass
+// above.
+pub const meter: gpu.MeterShader = .{
+    .spirv = words(@embedFile("meter").*),
+    .compute_entry = "meterMain",
+};
+
 // The five the renderer builds pipelines from, in the one value its `init`
 // takes. The prepass is not among them: the engine owns that pass directly and
 // hands it `morph` above.
+//
+// The meter is absent for a different reason. It is the renderer's pass and it
+// is optional there, so whether a run measures its own frames is a decision
+// taken where the engine is configured rather than by which words exist. The
+// engine adds `meter` above to its copy of this when it is asked for.
 pub const renderer: gpu.Shaders = .{
     .scene = scene,
     .sky = sky,
@@ -174,6 +189,8 @@ pub const all = [_]Module{
             .{ .name = scene.vertex_entry[7], .stage = .vertex },
             .{ .name = scene.fragment_entry, .stage = .fragment },
             .{ .name = scene.colour_fragment_entry, .stage = .fragment },
+            .{ .name = scene.mask_fragment_entry, .stage = .fragment },
+            .{ .name = scene.colour_mask_fragment_entry, .stage = .fragment },
         },
     },
     .{
@@ -230,6 +247,14 @@ pub const all = [_]Module{
         .reflection = @embedFile("morph_reflection"),
         .entry_points = &.{
             .{ .name = morph.compute_entry, .stage = .compute },
+        },
+    },
+    .{
+        .name = "meter",
+        .spirv = meter.spirv,
+        .reflection = @embedFile("meter_reflection"),
+        .entry_points = &.{
+            .{ .name = meter.compute_entry, .stage = .compute },
         },
     },
 };

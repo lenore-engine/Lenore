@@ -2,10 +2,10 @@ const lenore = @import("lenore");
 
 // What the compiler would otherwise never look at.
 //
-// A test reaches only what it calls, and the engine's surface begins at a window
-// and a device, which a test cannot open. Referencing a function compiles its
-// body, so this is what makes `zig build test` a check on the composition rather
-// than on the arithmetic that happens to be host-side.
+// A test reaches only what it calls. Most of the engine's surface needs a live
+// window, device and level rather than an arithmetic fixture; referencing those
+// functions compiles their bodies, so this makes `zig build test` a check on the
+// composition as well as on the host-side policy.
 //
 // `run` is the whole frame loop, so what it calls is compiled through it and
 // needs no line of its own. Anything here that gains a test which really calls
@@ -51,5 +51,6 @@ test "the device-facing surface is compiled" {
     _ = &lenore.Level.init;
     _ = &lenore.Level.deinit;
     _ = &lenore.Level.openEnvironment;
+    _ = &lenore.Level.uploadLightmap;
     _ = &lenore.Level.install;
 }

@@ -82,19 +82,43 @@ pub fn build(b: *std.Build) void {
     });
     addShaders(b, engine, "assets/shaders");
 
+    // The engine's public API is written in the siblings' types, so anything
+    // consuming `lenore` from outside this repository imports them too. They are
+    // re-exported here rather than declared again by the consumer, because two
+    // instances of one package compiled into a single binary is an error: the
+    // compiler reports the same file existing in `lenore-gpu` and `lenore-gpu0`.
+    //
+    // `addModule` is exactly this put, so nothing here is a private mechanism;
+    // what it adds is that the module already exists and must not be recreated.
+    for ([_]std.Build.Module.Import{
+        gltf_import,
+        gpu_import,
+        imui_import,
+        ktx_import,
+        platform_import,
+        resources_import,
+        scene_import,
+        text_import,
+        zignal_import,
+        zmath_import,
+    }) |shared| {
+        b.modules.put(b.graph.arena, b.dupe(shared.name), shared.module) catch @panic("OOM");
+    }
+
     const engine_import: std.Build.Module.Import = .{ .name = "lenore", .module = engine };
 
-    // There is no default executable. The engine is a module and every
-    // application over it is an example, which is where the umbrella already
-    // puts them; a second entry point here would be a second frame loop.
+    // There is no default executable. The engine is a module, and every
+    // application over it names its own entry point: the examples below, and
+    // the editor after them. Nothing is installed by a bare `zig build`,
+    // because what an umbrella builds by default should be the thing every
+    // consumer needs and no consumer needs somebody else's application.
 
     // Every example lives here rather than in the module it exercises. A module
     // example would still have to be built from the umbrella to reach a window
     // or a sibling's types, and what compiles a module from its own directory
     // is its `tests/reach.zig`, not an example.
-    const imports = [_]std.Build.Module.Import{
+    const imports_without_orbit = [_]std.Build.Module.Import{
         engine_import,
-        example_orbit_import,
         gltf_import,
         ktx_import,
         gpu_import,
@@ -106,6 +130,8 @@ pub fn build(b: *std.Build) void {
         zignal_import,
         zmath_import,
     };
+    const imports = imports_without_orbit ++ [_]std.Build.Module.Import{example_orbit_import};
+
     // One directory per example, `main.zig` at its root. A directory rather than
     // a bare file because an example may bring assets of its own, and the two
     // spellings would otherwise be one name meaning two things.
@@ -125,11 +151,10 @@ pub fn build(b: *std.Build) void {
         addShaders(b, module, b.fmt("examples/{s}/shaders", .{name}));
 
         const example = b.addExecutable(.{ .name = name, .root_module = module });
-        example.root_module.linkLibrary(platform.artifact("glfw"));
         const install = b.addInstallArtifact(example, .{});
         examples_step.dependOn(&install.step);
         // One example on its own, for when the change being looked at is in the
-        // engine and building the other four is the cost of looking at it.
+        // engine and building every other example is the cost of looking at it.
         b.step(name, b.fmt("Build the {s} example", .{name})).dependOn(&install.step);
 
         const run = b.addRunArtifact(example);
@@ -137,6 +162,36 @@ pub fn build(b: *std.Build) void {
         b.step(b.fmt("run-{s}", .{name}), b.fmt("Run the {s} example", .{name}))
             .dependOn(&run.step);
     }
+
+    // The editor is an application over the engine and not a demonstration of
+    // it, so it has a directory of its own rather than a place in `examples/`.
+    // Godot draws the same line: `editor/` sits beside `core/`, `scene/` and
+    // `servers/` in the engine's own repository rather than in a repository of
+    // its own or among the modules under `modules/`.
+    //
+    // What Godot needs and this does not is a switch. Its editor and its games
+    // are one binary, so `SConstruct` sets `env.editor_build` from
+    // `target=editor` and `editor/SCsub` contributes no source without it. Here
+    // the editor is an executable of its own, and a game linking the engine
+    // module never sees it, so a build option would gate something that is
+    // already separate.
+    //
+    // It takes the same imports an example does, less the orbit controller:
+    // that module is where the examples keep a camera policy they share, and
+    // the editor's camera is the editor's.
+    const editor_module = b.createModule(.{
+        .root_source_file = b.path("editor/main.zig"),
+        .imports = &imports_without_orbit,
+        .target = target,
+        .optimize = optimize,
+    });
+    const editor = b.addExecutable(.{ .name = "editor", .root_module = editor_module });
+    b.step("editor", "Build the editor")
+        .dependOn(&b.addInstallArtifact(editor, .{}).step);
+
+    const editor_run = b.addRunArtifact(editor);
+    if (b.args) |args| editor_run.addArgs(args);
+    b.step("run-editor", "Run the editor").dependOn(&editor_run.step);
 
     // The umbrella's suite covers what the umbrella owns. Every module carries
     // its own, run from its own directory with no umbrella, and this does not
@@ -161,10 +216,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    // The suite compiles the window-facing surface, which is the backend. A
-    // module's library links do not reach an artifact that imports it, so this
-    // is named here as well as on the engine below.
-    unit_tests.root_module.linkLibrary(platform.artifact("glfw"));
     // The font the suite opens. Ahem's metrics are defined rather than
     // designed, which is what makes an expected advance or coverage exact, and
     // it is already `lenore-text`'s test asset. Named where it lies instead of
@@ -175,16 +226,53 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
+    // The editor is built by a step of its own, so a bare `zig build test`
+    // would not compile a line of it. This is the module, which is what makes
+    // the layout arithmetic beside it run and what keeps the editor from
+    // drifting out of the surface it is written against.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = editor_module })).step);
+
+    // And a second root on the file that carries the arithmetic, because
+    // `addTest` collects test blocks from the root module of its compilation
+    // only: the module above compiles `shell.zig` and runs no line written
+    // beside it. A second editor file with tests takes a second entry here,
+    // which is visible where a forgotten registration would not be.
+    const editor_shell = b.createModule(.{
+        .root_source_file = b.path("editor/shell.zig"),
+        .imports = &imports_without_orbit,
+        .target = target,
+        .optimize = optimize,
+    });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = editor_shell })).step);
+
     // The shared example controller is not imported by the umbrella suite, and
     // addTest discovers blocks only in its root module. Give it that root so
     // frame-rate invariance and unconstrained orbit cannot stay uncompiled.
     const orbit_tests = b.addTest(.{ .root_module = example_orbit });
     test_step.dependOn(&b.addRunArtifact(orbit_tests).step);
+
+    // The same applies to any example file that carries its own arithmetic: an
+    // example is an executable and no suite imports it, so a `test` written in
+    // one is compiled by nothing and the step passes for want of anything to
+    // run. Each such file is named here, and a file left out of this list is a
+    // suite that passes for having nothing to run rather than for being right.
+    // They take an example's own imports, so a file that reaches the engine's
+    // ingest types can be tested like one that reaches only `std`.
+    for ([_][]const u8{
+        "examples/mandelbox/reference.zig",
+    }) |path| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(path),
+            .imports = &imports,
+            .target = target,
+            .optimize = optimize,
+        });
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+    }
     // addTest collects test blocks from the root module of its compilation only.
     // The suite above imports the engine rather than being it, so a `test`
     // written beside the code in src/ would never run and would stay green
     // forever. This second binary is that module.
-    engine.linkLibrary(platform.artifact("glfw"));
     const module_tests = b.addTest(.{ .root_module = engine });
     test_step.dependOn(&b.addRunArtifact(module_tests).step);
 }

@@ -45,11 +45,18 @@ pub fn main(process: std.process.Init.Minimal) !void {
     var host: platform.Platform = try .init();
     defer host.deinit();
 
-    var window = try host.createWindow(.{ .width = 1280, .height = 720 }, "lenore-gpu core");
+    var window = try host.createWindow(.{
+        .preferred = .{ .width = 1280, .height = 720 },
+        .title = "lenore-gpu core",
+        .app_id = "lenore",
+    });
     defer window.deinit();
 
-    var context: gpu.Context = try .init(gpa, "lenore-gpu core", window.nativeHandles());
+    var context: gpu.Context = try .init(gpa, "lenore-gpu core", host.nativeDisplay());
     defer context.deinit();
+
+    const surface: gpu.Surface = try .init(&context, window.nativeHandles());
+    defer surface.deinit(&context);
     // What the device selector actually chose. Compilation cannot show any of
     // it, and a run that only prints the device name leaves the families and the
     // optional capabilities unconfirmed.
@@ -233,7 +240,7 @@ pub fn main(process: std.process.Init.Minimal) !void {
     for (returned) |byte| intact = intact and byte == 0xA5;
     std.log.info("readback: {d} bytes, contents intact {}", .{ returned.len, intact });
 
-    var swapchain: gpu.Swapchain = try .init(&context, gpa, .{ .width = 1280, .height = 720 }, .fifo);
+    var swapchain: gpu.Swapchain = try .init(&context, surface, gpa, .{ .width = 1280, .height = 720 }, .fifo);
     defer swapchain.deinit();
 
     var frame: gpu.Frame = try .init(&context);

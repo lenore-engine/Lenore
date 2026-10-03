@@ -28,6 +28,7 @@ pub const NoDriver = engine.NoDriver;
 pub const Sun = engine.Sun;
 pub const FramePhases = time.FramePhases;
 pub const ShadowBakeRequest = engine.ShadowBakeRequest;
+pub const scaledExtent = engine.scaledExtent;
 
 pub const FrameClock = time.FrameClock;
 pub const FrameTime = time.FrameTime;
@@ -36,6 +37,7 @@ pub const PhaseTimer = time.PhaseTimer;
 pub const Phase = time.Phase;
 pub const FrameMetrics = time.FrameMetrics;
 pub const max_frame_delta_ns = time.max_frame_delta_ns;
+pub const shaderClockPeriodNs = time.shader_clock_period_ns;
 pub const seconds = time.seconds;
 
 pub const RecordPlan = translate.RecordPlan;

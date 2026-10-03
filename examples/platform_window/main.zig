@@ -20,7 +20,11 @@ pub fn main() !void {
     var host: platform.Platform = try .init();
     defer host.deinit();
 
-    var window = try host.createWindow(.{ .width = 1280, .height = 720 }, "lenore-platform");
+    var window = try host.createWindow(.{
+        .preferred = .{ .width = 1280, .height = 720 },
+        .title = "lenore-platform",
+        .app_id = "lenore",
+    });
     defer window.deinit();
 
     var input: platform.Input = try .init(

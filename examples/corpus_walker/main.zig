@@ -454,6 +454,7 @@ const Walker = struct {
     // away wherever the operator had flown to, which is the one thing this
     // application exists to let them do; `f` asks for the framing back.
     pub fn onResize(_: *Walker, _: *lenore.Engine, _: platform.Extent2D) !void {}
+    pub fn onDepth(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onCompute(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
 
     // Nothing to draw over the picture. The hook is required of every
@@ -549,10 +550,11 @@ const Walker = struct {
         // is a sample and the line above is an average.
         if (engine.last_gpu) |device_time| {
             log.info(
-                "  device {d:.3} ms: shadow {d:.3}, main {d:.3}, bloom {d:.3}, post {d:.3}",
+                "  device {d:.3} ms: shadow {d:.3}, depth {d:.3}, main {d:.3}, bloom {d:.3}, post {d:.3}",
                 .{
                     milliseconds(device_time.total()),
                     milliseconds(device_time.get(.shadow)),
+                    milliseconds(device_time.get(.depth)),
                     milliseconds(device_time.get(.main)),
                     milliseconds(device_time.get(.bloom)),
                     milliseconds(device_time.get(.post)),

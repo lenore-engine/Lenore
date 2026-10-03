@@ -351,6 +351,7 @@ const Harness = struct {
         reportNdcExtent(view_projection, self.bounds, ratio, extent);
         reportUpAxis(gpu.vulkanClip(view_projection), self.bounds, extent);
     }
+    pub fn onDepth(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onCompute(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     // Nothing to draw over the picture. The hook is required of every
     // driver, so declining it is a declaration rather than an omission.
@@ -1620,7 +1621,11 @@ fn reportLitFraction(meshes: []const gltf.importer.Mesh, lights: []const gpu.Lig
             for (lights) |light| {
                 const to_light: res.Vec3 = switch (light.kind) {
                     .directional => .{ -light.direction[0], -light.direction[1], -light.direction[2] },
-                    .point, .spot => .{
+                    // A rectangle's centre stands in for the whole of it. That
+                    // is wrong for a vertex beside a large panel and right for
+                    // the question this asks, which is whether any geometry
+                    // faces a light at all.
+                    .point, .spot, .rect => .{
                         light.position[0] - vertex.position[0],
                         light.position[1] - vertex.position[1],
                         light.position[2] - vertex.position[2],

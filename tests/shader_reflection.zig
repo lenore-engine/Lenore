@@ -171,25 +171,52 @@ fn mirroredScalarName(comptime T: type) !?[]const u8 {
 fn expectMirrors(comptime T: type, contents: *const Reflection.Type) !void {
     inline for (@typeInfo(T).@"struct".fields) |mirrored| {
         const field = find(contents.fields, mirrored.name) orelse return error.MissingField;
-        try testing.expectEqual(
-            @as(u32, @intCast(@offsetOf(T, mirrored.name))),
-            field.binding.offset,
-        );
-        try testing.expectEqual(
-            @as(u32, @intCast(@sizeOf(mirrored.type))),
-            field.binding.size,
-        );
-
-        // What it is made of, not only how much room it takes. A float where
-        // the mirror has an integer occupies the same four bytes at the same
-        // offset and reads the same word as a different number, which is how
-        // the reference's float type tag went unnoticed.
-        if (try mirroredScalarName(mirrored.type)) |named| {
-            try testing.expectEqualStrings(named, try scalarTypeOf(&field.type));
-        }
+        try expectField(T, mirrored.name, field);
     }
     try testing.expectEqual(@as(u32, @intCast(@sizeOf(T))), try uniformSize(contents));
     try testing.expectEqual(@typeInfo(T).@"struct".fields.len, contents.fields.len);
+}
+
+// A mirror the shader declares only part of, and the fields it may not omit.
+//
+// For a block whose range carries more than one shader reads. Vulkan
+// specification, Shader Resource Interface, Push Constant Interface: each
+// statically used member lies entirely within the range, which a block shorter
+// than the range satisfies. So the check runs from the shader's side: every
+// field it declares is a field of the mirror, at the mirror's offset and with
+// its length and scalar, and the block ends inside the mirror. The mirror's
+// remaining fields are bytes this shader never names.
+fn expectMirrorsPart(
+    comptime T: type,
+    contents: *const Reflection.Type,
+    comptime required: []const []const u8,
+) !void {
+    for (contents.fields) |field| {
+        const mirrored = inline for (@typeInfo(T).@"struct".fields) |candidate| {
+            if (std.mem.eql(u8, candidate.name, field.name)) {
+                try expectField(T, candidate.name, field);
+                break true;
+            }
+        } else false;
+        if (!mirrored) return error.UnmirroredField;
+    }
+    inline for (required) |name| {
+        if (find(contents.fields, name) == null) return error.MissingField;
+    }
+    try testing.expect(try uniformSize(contents) <= @sizeOf(T));
+}
+
+fn expectField(comptime T: type, comptime name: []const u8, field: Reflection.Parameter) !void {
+    try testing.expectEqual(@as(u32, @intCast(@offsetOf(T, name))), field.binding.offset);
+    try testing.expectEqual(@as(u32, @intCast(@sizeOf(@FieldType(T, name)))), field.binding.size);
+
+    // What it is made of, not only how much room it takes. A float where the
+    // mirror has an integer occupies the same four bytes at the same offset and
+    // reads the same word as a different number, which is how the reference's
+    // float type tag went unnoticed.
+    if (try mirroredScalarName(@FieldType(T, name))) |named| {
+        try testing.expectEqualStrings(named, try scalarTypeOf(&field.type));
+    }
 }
 
 // One block, three mirrors. The scene transforms vertices by the matrix and the
@@ -337,7 +364,9 @@ test "the post push constants are what the fullscreen shader reads" {
     const parsed = try parse(arena.allocator(), reflectionFor("fullscreen"));
     const post = find(parsed.parameters, "post") orelse return error.MissingPostPushConstants;
     try testing.expectEqualStrings("pushConstantBuffer", post.binding.kind);
-    try expectMirrors(gpu.PostPass.PushConstants, try block(post));
+    // The engine's own two floats, which the shader it ships reads. The rest of
+    // the range is a supplied shader's, and this one does not name it.
+    try expectMirrorsPart(gpu.PostPass.PushConstants, try block(post), &.{ "exposure", "bloom" });
 
     var push_count: usize = 0;
     for (parsed.parameters) |parameter| {
@@ -403,16 +432,6 @@ test "the post pass reads the chain out of its own set, beside the target" {
     const chain = find(parsed.parameters, "bloom_chain") orelse return error.MissingBloomChain;
     try testing.expectEqual(@as(u32, 0), chain.binding.space);
     try testing.expectEqual(@as(u32, gpu.PostBindings[1].slot), chain.binding.index);
-
-    // Two sampled bindings and no third. The set layout is built from the same
-    // table, so a binding the shader reads and the table does not declare is a
-    // descriptor nothing writes.
-    var sampled: usize = 0;
-    for (parsed.parameters) |parameter| {
-        if (std.mem.eql(u8, parameter.binding.kind, "pushConstantBuffer")) continue;
-        sampled += 1;
-    }
-    try testing.expectEqual(gpu.PostBindings.len, sampled);
 }
 
 test "the post pass has one composite that reads the chain and one that cannot" {
@@ -469,6 +488,9 @@ test "the descriptor sets are split by how often they are written" {
     const camera = find(parsed.parameters, "camera") orelse return error.MissingCameraBlock;
     const instances = find(parsed.parameters, "instances") orelse return error.MissingInstances;
     const materials = find(parsed.parameters, "materials") orelse return error.MissingMaterialBuffer;
+    const lightmap = find(parsed.parameters, "lightmap") orelse return error.MissingLightmap;
+    const lightmap_direction = find(parsed.parameters, "lightmap_direction") orelse
+        return error.MissingLightmapDirection;
     const base_colour = find(parsed.parameters, "base_colour") orelse return error.MissingBaseColourTexture;
     const metallic_roughness = find(parsed.parameters, "metallic_roughness") orelse
         return error.MissingMetallicRoughnessTexture;
@@ -485,6 +507,13 @@ test "the descriptor sets are split by how often they are written" {
     try testing.expectEqual(@as(u32, 1), instances.binding.index);
     try testing.expectEqual(@as(u32, gpu.scene_set_index), materials.binding.space);
     try testing.expectEqual(@as(u32, gpu.MaterialArrayBindings[0].slot), materials.binding.index);
+    try testing.expectEqual(@as(u32, gpu.scene_set_index), lightmap.binding.space);
+    try testing.expectEqual(@as(u32, gpu.lightmap_bindings[0].slot), lightmap.binding.index);
+    try testing.expectEqual(@as(u32, gpu.scene_set_index), lightmap_direction.binding.space);
+    try testing.expectEqual(
+        @as(u32, gpu.lightmap_bindings[1].slot),
+        lightmap_direction.binding.index,
+    );
     try testing.expectEqual(@as(u32, gpu.material_set_index), base_colour.binding.space);
     try testing.expectEqual(@as(u32, gpu.RendererMaterialBindings[0].slot), base_colour.binding.index);
     try testing.expectEqual(@as(u32, gpu.material_set_index), metallic_roughness.binding.space);
@@ -512,6 +541,11 @@ test "the descriptor sets are split by how often they are written" {
     // declares. A storage buffer bound as a uniform one is a validation error at
     // draw time and nothing sooner.
     try testing.expectEqual(gpu.MaterialArrayBindings[0].kind, try descriptorTypeOf(materials));
+    try testing.expectEqual(gpu.lightmap_bindings[0].kind, try descriptorTypeOf(lightmap));
+    try testing.expectEqual(
+        gpu.lightmap_bindings[1].kind,
+        try descriptorTypeOf(lightmap_direction),
+    );
     try testing.expectEqual(gpu.RendererMaterialBindings[0].kind, try descriptorTypeOf(base_colour));
     try testing.expectEqual(
         gpu.RendererMaterialBindings[1].kind,
@@ -555,7 +589,7 @@ test "the descriptor sets are split by how often they are written" {
     try testing.expectEqual(gpu.Shadow.bindings.len, shadow_binding_count);
 
     try testing.expectEqual(gpu.RendererMaterialBindings.len, material_binding_count);
-    // The scene set is assembled from two binding lists in two files. A slot
+    // The scene set is assembled from three binding lists. A slot
     // added to one of them and not declared in the shader leaves a descriptor
     // the layout reserves and nothing reads; the reverse is a read of a
     // descriptor that was never written.
@@ -617,9 +651,8 @@ test "the prefiltered level count is queried from the descriptor" {
         if (opcode == 106) queries += 1;
         index += length;
     }
-    // One per fragment entry point. Both shade through the same function, and
-    // the compiler emits the query into each of the two rather than sharing it,
-    // so the count follows the entry points and not the call sites.
+    // One per shaded fragment entry point. The two depth-only MASK entries do
+    // not reach image-based lighting and must not acquire this query.
     try testing.expectEqual(@as(usize, 2), queries);
 }
 
@@ -669,6 +702,23 @@ test "every entry point a module declares is in the module's words" {
     }
 }
 
+test "shaded scene fragments test depth before running lighting" {
+    const spirv = lenore.Shaders.scene.spirv;
+    for ([_][]const u8{ "fragmentMain", "colourFragmentMain" }) |name| {
+        const id = try entryPointId(spirv, name, testing.allocator) orelse
+            return error.EntryPointMissing;
+        try testing.expect(hasExecutionMode(spirv, id, execution_mode_early_fragment_tests));
+    }
+
+    // MASK coverage itself must run before depth is written, so its cutoff-only
+    // entries deliberately do not request early fragment tests.
+    for ([_][]const u8{ "maskFragmentMain", "colourMaskFragmentMain" }) |name| {
+        const id = try entryPointId(spirv, name, testing.allocator) orelse
+            return error.EntryPointMissing;
+        try testing.expect(!hasExecutionMode(spirv, id, execution_mode_early_fragment_tests));
+    }
+}
+
 test "every entry point the compiler reports is at the stage the host expects" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -688,6 +738,38 @@ test "every entry point the compiler reports is at the stage the host expects" {
 // the name as a literal string. A literal string is four characters per word
 // and NUL-terminated, so the name ends at the first zero byte.
 const op_entry_point: u32 = 15;
+const op_execution_mode: u32 = 16;
+const execution_mode_early_fragment_tests: u32 = 9;
+
+fn entryPointId(
+    spirv: []const u32,
+    wanted: []const u8,
+    allocator: std.mem.Allocator,
+) !?u32 {
+    var index: usize = 5;
+    while (index < spirv.len) : (index += spirv[index] >> 16) {
+        const length = spirv[index] >> 16;
+        if ((spirv[index] & 0xFFFF) != op_entry_point) continue;
+
+        const literal = spirv[index + 3 .. index + length];
+        const bytes = try allocator.alloc(u8, literal.len * @sizeOf(u32));
+        defer allocator.free(bytes);
+        for (literal, 0..) |word, position|
+            std.mem.writeInt(u32, bytes[position * 4 ..][0..4], word, .little);
+        const name = bytes[0 .. std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len];
+        if (std.mem.eql(u8, name, wanted)) return spirv[index + 2];
+    }
+    return null;
+}
+
+fn hasExecutionMode(spirv: []const u32, entry: u32, mode: u32) bool {
+    var index: usize = 5;
+    while (index < spirv.len) : (index += spirv[index] >> 16) {
+        if ((spirv[index] & 0xFFFF) != op_execution_mode) continue;
+        if (spirv[index + 1] == entry and spirv[index + 2] == mode) return true;
+    }
+    return false;
+}
 
 fn entryPointNames(
     spirv: []const u32,
@@ -832,22 +914,23 @@ test "both frame bindings carry a dynamic offset" {
     }
 }
 
-test "the post set declares exactly the fullscreen descriptors" {
+// From the shader's side only. A descriptor the shader declares and the table
+// does not is one nothing writes, since the set layout is built from the table.
+// The reverse is not checked: `depth` is in the table for a supplied shader, and
+// the one the engine ships does not declare it.
+test "every fullscreen descriptor is one the post set declares" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
     const parsed = try parse(arena.allocator(), reflectionFor("fullscreen"));
-    var descriptor_count: usize = 0;
     for (parsed.parameters) |parameter| {
         if (std.mem.eql(u8, parameter.binding.kind, "pushConstantBuffer")) continue;
-        descriptor_count += 1;
 
         const declared = for (gpu.PostBindings) |binding| {
             if (binding.slot == parameter.binding.index) break binding;
         } else return error.BindingNotDeclared;
         try testing.expectEqual(try descriptorTypeOf(parameter), declared.kind);
     }
-    try testing.expectEqual(gpu.PostBindings.len, descriptor_count);
 }
 
 test "an instance is what the shader steps through, field by field" {
@@ -1118,9 +1201,9 @@ test "every vertex variant is in the module the pipeline names" {
 
     const parsed = try parse(arena.allocator(), reflectionFor("scene"));
 
-    // One file, one module, five entry points. The four vertex variants share
-    // every binding in set zero, which is what keeps them a pipeline difference
-    // rather than a second descriptor layout.
+    // One file and one module. The vertex variants share every binding in set
+    // zero, which keeps them a pipeline difference rather than a second
+    // descriptor layout; the two MASK entries are the depth-prepass consumers.
     for ([_]res.VertexStreams{
         .{},
         .{ .skinned = true },
@@ -1128,6 +1211,9 @@ test "every vertex variant is in the module the pipeline names" {
         .{ .skinned = true, .uv1 = true },
     }) |streams| _ = try sceneVertexEntry(parsed, streams);
     try testing.expect(entryPoint(parsed, "fragmentMain") != null);
+    try testing.expect(entryPoint(parsed, "colourFragmentMain") != null);
+    try testing.expect(entryPoint(parsed, "maskFragmentMain") != null);
+    try testing.expect(entryPoint(parsed, "colourMaskFragmentMain") != null);
 }
 
 // SPIR-V specification, 3.20 Decoration, `Index`: what makes a second fragment

@@ -23,6 +23,27 @@ const FrameMetrics = time_module.FrameMetrics;
 const FrameTime = time_module.FrameTime;
 const Level = level_module.Level;
 
+const InitPhase = enum {
+    device,
+    renderer,
+};
+
+const RendererOptions = struct {
+    render_scale: f32,
+    frame_capacity: gpu.FrameCapacity,
+    material_capacity: u32,
+    shadow_map_size: u32,
+    ui_capacity: gpu.UiCapacity,
+    ui_widgets: ui_module.Capacity,
+    font_capacity: font_module.Capacity,
+    fps_window_ns: u64,
+    gpu_timing: bool,
+    metering: bool,
+    scene_shading: ?gpu.SceneShading,
+    background_shader: ?gpu.SkyShader,
+    post_shader: ?gpu.PostShader,
+};
+
 // The device, the window and the one frame loop.
 //
 // There is exactly one loop in this project and applications drive it rather
@@ -41,7 +62,7 @@ const Level = level_module.Level;
 // current one, without the latency a deeper queue adds.
 const frames_in_flight = 2;
 
-// What runs on top of the loop. Every driver declares all six, and they are
+// What runs on top of the loop. Every driver declares all eight, and they are
 // called at the one point in the frame where each is answerable:
 //
 //   onUiRegions(driver, engine, level, ui) !void
@@ -68,6 +89,11 @@ const frames_in_flight = 2;
 //   onRecord(driver, engine, level, commands) !void
 //       Inside the main pass, after the scene and before it closes. See the
 //       call site for what may be recorded there and what may not.
+//   onDepth(driver, engine, level, commands) !void
+//       After the main pass closes, with its depth stored and readable by
+//       compute in `gpu.MainPass.sampled_layout`. Dispatches only, and they
+//       may only read depth: the next frame's prepass writes it after them.
+//       What they write ends with its own dependency to whatever reads it.
 //   onUiDraw(driver, engine, level, ui) !void
 //       The overlay's geometry, built into the frame's own rings, and where a
 //       widget reads what the routing decided. It carries no command buffer
@@ -120,6 +146,7 @@ pub const NoDriver = struct {
     pub fn onUpdate(_: *NoDriver, _: *Engine, _: *Level, _: FrameTime) !void {}
     pub fn onCompute(_: *NoDriver, _: *Engine, _: *Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onRecord(_: *NoDriver, _: *Engine, _: *Level, _: gpu.vk.CommandBuffer) !void {}
+    pub fn onDepth(_: *NoDriver, _: *Engine, _: *Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onUiDraw(_: *NoDriver, _: *Engine, _: *Level, _: *imui.WidgetContext) !void {}
 };
 
@@ -187,8 +214,25 @@ pub const ShadowBakeRequest = struct {
 
 pub const Options = struct {
     title: [:0]const u8 = "Lenore",
+    // Which application the window belongs to; `platform.WindowOptions.app_id`
+    // says what a compositor does with it. An application that ships a desktop
+    // file names itself here with that file's basename.
+    app_id: [:0]const u8 = "lenore",
     extent: platform.Extent2D = .{ .width = 1280, .height = 720 },
     present: gpu.PresentModePreference = .fifo,
+
+    // The fraction of each side of the surface the scene is rasterized at. One
+    // is the surface itself. Below it the HDR and depth targets are smaller
+    // than the window and the pass that presents stretches its sample of the
+    // target over the whole image, so everything recorded before that pass
+    // costs the square of this number while the overlay, the pointer and the
+    // presented image stay at the surface's own extent.
+    //
+    // Bounded above at one. Past it the presenting pass would be reducing
+    // rather than enlarging, and a bilinear tap is the wrong filter for that:
+    // it reads four texels of however many the reduction covers and aliases
+    // the rest.
+    render_scale: f32 = 1.0,
 
     // The three capacities below take zero for "this application draws none of
     // these", which is what an application with no asset means. The engine
@@ -237,10 +281,51 @@ pub const Options = struct {
     // the numbers have one reader, and a frame that has none should record no
     // commands for it.
     gpu_timing: bool = false,
+
+    // Whether each frame is measured for the light it carries, which is what an
+    // application setting its own exposure from the picture needs.
+    //
+    // Off by default and for the same reason `gpu_timing` is: it is a dispatch,
+    // a pipeline and a buffer per frame in flight, and a run whose exposure is a
+    // constant should record none of it. What is measured is handed back through
+    // `meterCells` and nothing here acts on it: how a camera weights the frame,
+    // how fast it follows and what it may reach are the application's answers.
+    metering: bool = false,
+
+    // Optional game-authored surface shading. The renderer retains its vertex
+    // transforms, MASK depth prepass and descriptor layouts; only the two
+    // shaded fragment entry points are exchanged. Null is the engine's glTF PBR
+    // implementation.
+    scene_shading: ?gpu.SceneShading = null,
+
+    // The shader that fills every pixel no opaque surface covered. Null is the
+    // engine's own, which samples the environment cube along the view ray.
+    background_shader: ?gpu.SkyShader = null,
+
+    // The shader that presents: what turns the HDR target into the image the
+    // swapchain hands over. Null is the engine's own, which exposes the target,
+    // composites the bloom chain and applies the Khronos PBR Neutral operator.
+    //
+    // A supplied one is created against the pass's own descriptor set and push
+    // range, so it reads the target, the chain and the main pass's depth where
+    // they are and declares the same block. The block ends in bytes the engine
+    // passes without reading, `look.post.application`, which is where the
+    // shader's own parameters go. What it does with all of it is the
+    // application's: an upscaler, a different operator, fog, or a look that
+    // belongs to one game rather than to every application built on this
+    // engine.
+    post_shader: ?gpu.PostShader = null,
 };
 
 pub const Engine = struct {
     allocator: Allocator,
+    // Construction is ordered, so one phase names every field `deinit` may
+    // touch. A successful device phase is caller-visible: an application may
+    // hold it while it builds the layout and resources its renderer needs.
+    init_phase: InitPhase,
+    renderer_options: RendererOptions,
+    renderer_post_sampler: gpu.vk.Sampler,
+
     io_threaded: std.Io.Threaded,
     io: std.Io,
     clock: platform.Clock,
@@ -250,6 +335,7 @@ pub const Engine = struct {
     input: platform.Input,
 
     context: gpu.Context,
+    surface: gpu.Surface,
     swapchain: gpu.Swapchain,
     frames: [frames_in_flight]gpu.Frame,
     frame_index: usize,
@@ -335,7 +421,7 @@ pub const Engine = struct {
     // rate is a thing to look at when convenient and not an event.
     metrics: FrameMetrics,
     // Null where the device cannot carry a timestamp on the graphics queue, or
-    // where nothing asked for one. Absent rather than idle: eight timestamps a
+    // where nothing asked for one. Absent rather than idle: ten timestamps a
     // frame is device work, and a frame nobody is measuring should not pay it.
     //
     // Apart from `metrics`, which reads no clock and touches no device. Where
@@ -345,6 +431,12 @@ pub const Engine = struct {
     // The last frame slot's decomposition, read where its fence signalled.
     // Null until a frame has been submitted and come back.
     last_gpu: ?gpu.GpuTimings,
+    // What that same slot's frame carried, as the meter measured it. Read at the
+    // same point and for the same reason: both are values the device produced,
+    // and the fence is where a slot's results are known to exist. Null until a
+    // metered frame has come back, and null for good in a run that does not
+    // meter.
+    last_meter: ?gpu.MeterCells,
     // Frames that reached `record`. Not the presented count: a present that
     // fails leaves the frame recorded, and everything the recording counted
     // happened either way.
@@ -354,19 +446,20 @@ pub const Engine = struct {
     // Initialization is in place because native callbacks retain &self.input.
     // The engine must not move after the window captures that address.
     pub fn init(self: *Engine, allocator: Allocator, options: Options) !void {
-        // Zero means none, and none is served by the smallest ring the modules
-        // below will build. Done once here rather than at each of the four use
-        // sites, so an application that asks for nothing cannot get a ring of
-        // one in some places and a refusal in others.
-        const frame_capacity: gpu.FrameCapacity = .{
-            .instances = @max(options.frame_capacity.instances, 1),
-            .joints = @max(options.frame_capacity.joints, 1),
-        };
+        try self.initDevice(allocator, options);
+        errdefer self.deinit();
+        try self.initRenderer(null);
+    }
+
+    // Builds the window, device and the shared resources an application may use
+    // to construct a descriptor set layout and the storage behind its set. Any
+    // shader slices and entry names in `options` remain borrowed until
+    // `initRenderer` returns.
+    pub fn initDevice(self: *Engine, allocator: Allocator, options: Options) !void {
         const morph_capacity: gpu.MorphCapacity = .{
             .meshes = @max(options.morph_capacity.meshes, 1),
             .weights = @max(options.morph_capacity.weights, 1),
         };
-        const material_capacity = @max(options.material_capacity, 1);
 
         self.allocator = allocator;
         self.io_threaded = .init(allocator, .{});
@@ -376,7 +469,11 @@ pub const Engine = struct {
 
         self.platform_host = try .init();
         errdefer self.platform_host.deinit();
-        self.window = try self.platform_host.createWindow(options.extent, options.title);
+        self.window = try self.platform_host.createWindow(.{
+            .preferred = options.extent,
+            .title = options.title,
+            .app_id = options.app_id,
+        });
         errdefer self.window.deinit();
 
         // The compositor tells a client its size and nothing here can ask.
@@ -391,10 +488,19 @@ pub const Engine = struct {
         errdefer self.input.deinit();
         self.window.captureInput(&self.input);
 
-        self.context = try .init(allocator, options.title, self.window.nativeHandles());
+        self.context = try .init(allocator, options.title, self.platform_host.nativeDisplay());
         errdefer self.context.deinit();
 
-        self.swapchain = try .init(&self.context, allocator, options.extent, options.present);
+        self.surface = try .init(&self.context, self.window.nativeHandles());
+        errdefer self.surface.deinit(&self.context);
+
+        self.swapchain = try .init(
+            &self.context,
+            self.surface,
+            allocator,
+            options.extent,
+            options.present,
+        );
         errdefer self.swapchain.deinit();
 
         var created: usize = 0;
@@ -440,7 +546,7 @@ pub const Engine = struct {
 
         self.samplers = .init(&self.context);
         errdefer self.samplers.deinit(allocator);
-        const post_sampler = try self.samplers.get(allocator, .{
+        self.renderer_post_sampler = try self.samplers.get(allocator, .{
             .address_mode_u = .clamp_to_edge,
             .address_mode_v = .clamp_to_edge,
         });
@@ -460,23 +566,74 @@ pub const Engine = struct {
         );
         errdefer self.morph_pass.deinit();
 
-        const extent = self.swapchain.currentExtent();
+        // Zero means none, and none is served by the smallest ring the modules
+        // below will build. Normalized once before the phase boundary so the
+        // renderer and material storage cannot disagree about the capacity the
+        // application requested.
+        // Rejected rather than clamped. A scale is a decision about how the
+        // frame is spent, and an application that computed a nonsense one has a
+        // defect that silently drawing at some other resolution would hide.
+        // The first comparison is written against zero rather than as a range
+        // so that a NaN fails it.
+        if (!(options.render_scale > 0) or options.render_scale > 1)
+            return error.InvalidRenderScale;
+
+        self.renderer_options = .{
+            .render_scale = options.render_scale,
+            .frame_capacity = .{
+                .instances = @max(options.frame_capacity.instances, 1),
+                .joints = @max(options.frame_capacity.joints, 1),
+            },
+            .material_capacity = @max(options.material_capacity, 1),
+            .shadow_map_size = options.shadow_map_size,
+            .ui_capacity = options.ui_capacity,
+            .ui_widgets = options.ui_widgets,
+            .font_capacity = options.font_capacity,
+            .fps_window_ns = options.fps_window_ns,
+            .gpu_timing = options.gpu_timing,
+            .metering = options.metering,
+            .scene_shading = options.scene_shading,
+            .background_shader = options.background_shader,
+            .post_shader = options.post_shader,
+        };
+        self.init_phase = .device;
+    }
+
+    // Completes the engine with pipelines built against the application's set
+    // layout. A failed attempt leaves the device phase intact and may be retried.
+    pub fn initRenderer(self: *Engine, scene_extra_layout: ?gpu.vk.DescriptorSetLayout) !void {
+        if (self.init_phase != .device) return error.RendererAlreadyInitialized;
+        const allocator = self.allocator;
+        const options = self.renderer_options;
+
+        // The engine's table with the application-owned look substitutions.
+        // Geometry placement, depth coverage and pass layouts remain the
+        // renderer's; surface radiance and the background may be authored by
+        // the game.
+        var renderer_shaders = shaders.renderer;
+        renderer_shaders.scene_extra_layout = scene_extra_layout;
+        renderer_shaders.scene_shading = options.scene_shading;
+        if (options.metering) renderer_shaders.meter = shaders.meter;
+        if (options.background_shader) |background| renderer_shaders.sky = background;
+        if (options.post_shader) |present| renderer_shaders.post = present;
+
+        const extent = self.renderExtent();
         self.renderer = try .init(
             &self.context,
             &self.memory,
             allocator,
             .{ .width = extent.width, .height = extent.height },
             frames_in_flight,
-            frame_capacity,
-            material_capacity,
+            options.frame_capacity,
+            options.material_capacity,
             self.swapchain.surface_format.format,
-            post_sampler,
+            self.renderer_post_sampler,
             options.shadow_map_size,
-            shaders.renderer,
+            renderer_shaders,
         );
         errdefer self.renderer.deinit();
 
-        self.materials = try .init(&self.context, &self.memory, material_capacity);
+        self.materials = try .init(&self.context, &self.memory, options.material_capacity);
         errdefer self.materials.deinit();
 
         // After the renderer, because the pipeline is built against the format
@@ -585,6 +742,7 @@ pub const Engine = struct {
         // every pass as taking no time, which reads like an answer.
         self.gpu_timer = null;
         self.last_gpu = null;
+        self.last_meter = null;
         if (options.gpu_timing) {
             const support = self.context.timestampSupport();
             if (support.available()) {
@@ -616,6 +774,7 @@ pub const Engine = struct {
         self.metrics = .init(options.fps_window_ns);
         self.recorded_frames = 0;
         self.presented_frames = 0;
+        self.init_phase = .renderer;
     }
 
     // Vulkan specification, vkDestroyDevice: every use must have completed, and
@@ -627,17 +786,23 @@ pub const Engine = struct {
             log.err("device did not drain during teardown: {t}", .{err});
         };
 
-        if (self.gpu_timer) |*timer| timer.deinit(&self.context);
-        self.materials.deinit();
-        self.renderer.deinit();
-        self.ui_pass.deinit();
-        self.ui.deinit(self.allocator);
-        // After the pass, whose registry held the view and the sampler these
-        // two are, and after the drain at the top of this function, which is
-        // what makes destroying an image the last frame sampled correct.
-        self.glyph_staging.deinit();
-        self.glyph_image.deinit();
-        self.fonts.deinit(self.allocator);
+        switch (self.init_phase) {
+            .renderer => {
+                if (self.gpu_timer) |*timer| timer.deinit(&self.context);
+                self.materials.deinit();
+                self.renderer.deinit();
+                self.ui_pass.deinit();
+                self.ui.deinit(self.allocator);
+                // After the pass, whose registry held the view and the sampler
+                // these two are, and after the drain at the top of this
+                // function, which is what makes destroying an image the last
+                // frame sampled correct.
+                self.glyph_staging.deinit();
+                self.glyph_image.deinit();
+                self.fonts.deinit(self.allocator);
+            },
+            .device => {},
+        }
         self.morph_pass.deinit();
         self.samplers.deinit(self.allocator);
         // Both report whether anything was still held, and the answer is a
@@ -661,6 +826,7 @@ pub const Engine = struct {
 
         for (self.frames) |frame| frame.deinit(&self.context);
         self.swapchain.deinit();
+        self.surface.deinit(&self.context);
         self.context.deinit();
 
         self.window.deinit();
@@ -824,8 +990,19 @@ pub const Engine = struct {
         return translate.uiScale(metrics) orelse .identity;
     }
 
+    // What the scene is rasterized at: the surface at this application's render
+    // scale. The presented image, the overlay and every pointer position are in
+    // the surface's own extent and not this one.
+    pub fn renderExtent(self: *const Engine) platform.Extent2D {
+        return scaledExtent(self.swapchain.currentExtent(), self.renderer_options.render_scale);
+    }
+
+    // The ratio of the image the triangles land in, which is what a projection
+    // has to match. Below a render scale of one that is the scaled target: the
+    // two ratios agree to within a pixel of rounding, and the one the geometry
+    // is measured against is this.
     pub fn aspect(self: *const Engine) f32 {
-        const extent = self.swapchain.currentExtent();
+        const extent = self.renderExtent();
         return @as(f32, @floatFromInt(extent.width)) / @as(f32, @floatFromInt(extent.height));
     }
 
@@ -928,6 +1105,10 @@ pub const Engine = struct {
             // queries hold results and reading them waits for nothing. Taken
             // before anything overwrites the slot, which the reset below does.
             if (self.gpu_timer) |*timer| self.last_gpu = timer.read(&self.context, self.frame_index);
+            // The same window, and the same reason it is this one: the slot's
+            // dispatch has completed and nothing has overwritten its buffer yet.
+            // A slot no metered frame has reached answers null on its own.
+            self.last_meter = self.renderer.meterCells(self.frame_index);
             self.metrics.record(.wait, phase.split());
 
             // An acquire that fails this way has signalled nothing and consumed
@@ -1014,7 +1195,10 @@ pub const Engine = struct {
                 // which of the two it is.
                 .camera = gpu.vulkanClipCamera(.{
                     .view_projection = view_projection,
-                    .position = .{ eye[0], eye[1], eye[2], 1 },
+                    // The fourth lane is the frame's clock and not a
+                    // homogeneous one: nothing multiplies this by a matrix, and
+                    // a shader that animates has nowhere else to read a clock.
+                    .position = .{ eye[0], eye[1], eye[2], time.shaderSeconds() },
                     // The same pose and the same aspect the matrix above was
                     // built from, so the background's rays and the geometry's
                     // clip coordinates cannot describe two different cameras.
@@ -1057,8 +1241,10 @@ pub const Engine = struct {
             // hands its writes to the stages below. The morph pass is the
             // engine's; application compute follows it through the same command
             // buffer and cannot escape the frame's fence lifetime.
+            self.mark(commands, .compute, .begin);
             self.morph_pass.record(commands, self.frame_index);
             try driver.onCompute(self, level, commands);
+            self.mark(commands, .compute, .end);
 
             // Everything a frame can be refused for is refused here, before a
             // single command is recorded. What comes back is what every stage
@@ -1085,6 +1271,12 @@ pub const Engine = struct {
             self.renderer.recordShadowBake(commands, self.shadowBake(look, level), frame_plan);
             self.mark(commands, .shadow, .end);
 
+            self.mark(commands, .depth, .begin);
+            self.renderer.beginDepthPrepass(commands);
+            self.renderer.recordDepthPrepass(commands, frame_plan);
+            self.renderer.endDepthPrepass(commands);
+            self.mark(commands, .depth, .end);
+
             self.mark(commands, .main, .begin);
             self.renderer.beginMain(commands);
             self.renderer.recordScene(commands, frame_plan);
@@ -1102,6 +1294,19 @@ pub const Engine = struct {
             try driver.onRecord(self, level, commands);
             self.renderer.endMain(commands);
             self.mark(commands, .main, .end);
+
+            // What the frame drew, as depth, for compute that reads it.
+            self.mark(commands, .after_main, .begin);
+            try driver.onDepth(self, level, commands);
+            self.mark(commands, .after_main, .end);
+
+            // Before the chain rather than after it: both read the target the
+            // main pass filled, and neither changes it, so the order between
+            // them is free and this one keeps the frame's stages in the order
+            // they are reported in.
+            self.mark(commands, .meter, .begin);
+            self.renderer.recordMeter(commands, frame_plan);
+            self.mark(commands, .meter, .end);
 
             // Between the two passes: the chain reads what the main pass wrote
             // and the post pass reads what the chain leaves.
@@ -1414,8 +1619,11 @@ pub const Engine = struct {
         };
         defer self.input.releaseBatch();
 
-        for (batch) |event| {
-            try driver.onEvent(self, event, try self.ui.route(event));
+        // By pointer, because the UI's text event borrows the bytes a chunk
+        // carries inline. The ring holds them until `releaseBatch`, which is
+        // past the routing this loop does.
+        for (batch) |*event| {
+            try driver.onEvent(self, event.*, try self.ui.route(event));
         }
     }
 
@@ -1428,13 +1636,37 @@ pub const Engine = struct {
         try self.context.waitIdle();
         try self.swapchain.recreate(self.surface_extent);
 
-        const extent = self.swapchain.currentExtent();
-        try self.renderer.resize(.{ .width = extent.width, .height = extent.height });
+        const target = self.renderExtent();
+        try self.renderer.resize(.{ .width = target.width, .height = target.height });
         self.swapchain_stale = false;
 
-        try driver.onResize(self, extent);
+        // The surface extent and not the target's. A driver lays out an overlay
+        // and reads a pointer against the window, both of which the scale does
+        // not move.
+        try driver.onResize(self, self.swapchain.currentExtent());
     }
 };
+
+// The extent a render scale asks a surface to be rasterized at.
+//
+// Rounded to nearest, so the two axes hold the surface's ratio as closely as a
+// pair of integers can, and floored at one pixel: no image has a zero side, and
+// a window small enough to reach that is not one to take further down.
+//
+// Safe against a scale `Options` accepted: it is finite and at most one, so the
+// product is inside the side it came from and the conversion back cannot
+// overflow.
+pub fn scaledExtent(surface: platform.Extent2D, scale: f32) platform.Extent2D {
+    return .{
+        .width = scaledSide(surface.width, scale),
+        .height = scaledSide(surface.height, scale),
+    };
+}
+
+fn scaledSide(side: u32, scale: f32) u32 {
+    const scaled = @round(@as(f32, @floatFromInt(side)) * scale);
+    return @max(@as(u32, @intFromFloat(scaled)), 1);
+}
 
 // A direction in the four lanes a uniform block's vector field has. The last one
 // is the alignment's padding and is read by nothing.
