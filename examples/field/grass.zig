@@ -332,7 +332,7 @@ pub const Grass = struct {
         errdefer sets.deinit(context, allocator);
 
         var shaders = try Shaders.init(context, .{
-            .modules = .{ .grass = words(@embedFile("grass").*) },
+            .modules = .{ .grass = gpu.spirvWords(@embedFile("grass")) },
             .layouts = .{
                 .plant = LayoutConfig{
                     .descriptor_sets = &.{sets.layout},
@@ -564,14 +564,3 @@ pub const Grass = struct {
         self.planted = value.instance_count;
     }
 };
-
-// `@embedFile` yields bytes and SPIR-V is words. The array is copied into an
-// aligned constant so the reinterpretation is valid rather than merely likely.
-fn words(comptime bytes: anytype) []const u32 {
-    const aligned: [bytes.len]u8 align(@alignOf(u32)) = bytes;
-    const count = aligned.len / @sizeOf(u32);
-    // Vulkan specification, VkShaderModuleCreateInfo: codeSize is a multiple of
-    // four.
-    comptime std.debug.assert(count * @sizeOf(u32) == aligned.len);
-    return @as([*]const u32, @ptrCast(&aligned))[0..count];
-}

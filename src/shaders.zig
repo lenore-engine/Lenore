@@ -15,20 +15,6 @@ const gpu = @import("lenore-gpu");
 // application wanting its own shading fills the same structures and never
 // touches this file.
 
-// `@embedFile` yields bytes, and SPIR-V is words. The array is copied into an
-// aligned constant so the reinterpretation below is valid rather than merely
-// likely: an embedded file has no alignment of its own.
-fn words(comptime bytes: anytype) []const u32 {
-    const aligned: [bytes.len]u8 align(@alignOf(u32)) = bytes;
-    const count = aligned.len / @sizeOf(u32);
-    // Vulkan specification, VkShaderModuleCreateInfo: codeSize is a multiple of
-    // four. Dividing would otherwise drop a partial word and hand the driver a
-    // module shorter than the file, which reads as a corrupt shader rather than
-    // as a truncated build output.
-    comptime std.debug.assert(count * @sizeOf(u32) == aligned.len);
-    return @as([*]const u32, @ptrCast(&aligned))[0..count];
-}
-
 // The main pass: one instanced mesh, transformed, lit and textured.
 //
 // The eight vertex entry points are the product of the three optional streams a
@@ -40,7 +26,7 @@ fn words(comptime bytes: anytype) []const u32 {
 // only applies MASK coverage. A fragment stage's input is the vertex stage's
 // output, so the variants that carry COLOR_0 need the one that declares it.
 pub const scene: gpu.SceneShader = .{
-    .spirv = words(@embedFile("scene").*),
+    .spirv = gpu.spirvWords(@embedFile("scene")),
     .vertex_entry = .{
         "vertexMain",
         "colourVertexMain",
@@ -62,7 +48,7 @@ pub const scene: gpu.SceneShader = .{
 // else, which is what lets it be created against the pipeline layout the scene
 // draws through.
 pub const sky: gpu.SkyShader = .{
-    .spirv = words(@embedFile("sky").*),
+    .spirv = gpu.spirvWords(@embedFile("sky")),
     .vertex_entry = "vertexMain",
     .fragment_entry = "fragmentMain",
 };
@@ -72,7 +58,7 @@ pub const sky: gpu.SkyShader = .{
 // level before the operator; the first never names that binding, which is what
 // a recording with no chain behind it is drawn with.
 pub const post: gpu.PostShader = .{
-    .spirv = words(@embedFile("fullscreen").*),
+    .spirv = gpu.spirvWords(@embedFile("fullscreen")),
     .vertex_entry = "vertexMain",
     .fragment_entry = "fragmentMain",
     .bloom_fragment_entry = "bloomFragmentMain",
@@ -83,7 +69,7 @@ pub const post: gpu.PostShader = .{
 // through one binding and write one level, so the whole difference between them
 // is the fragment stage.
 pub const bloom: gpu.BloomShader = .{
-    .spirv = words(@embedFile("bloom").*),
+    .spirv = gpu.spirvWords(@embedFile("bloom")),
     .vertex_entry = "vertexMain",
     .downsample_entry = "downsampleMain",
     .upsample_entry = "upsampleMain",
@@ -93,7 +79,7 @@ pub const bloom: gpu.BloomShader = .{
 // fragment entry point is the masked variant's alone, and an opaque caster is
 // drawn with no fragment stage at all.
 pub const shadow: gpu.ShadowShader = .{
-    .spirv = words(@embedFile("shadow").*),
+    .spirv = gpu.spirvWords(@embedFile("shadow")),
     .vertex_entry = "vertexMain",
     .skinned_vertex_entry = "skinnedVertexMain",
     .masked_fragment_entry = "fragmentMain",
@@ -103,7 +89,7 @@ pub const shadow: gpu.ShadowShader = .{
 // image after the tone operator. One pipeline, because the fragment stage
 // multiplies the vertex colour by the sampled texel whatever the image holds.
 pub const ui: gpu.UiShader = .{
-    .spirv = words(@embedFile("ui").*),
+    .spirv = gpu.spirvWords(@embedFile("ui")),
     .vertex_entry = "vertexMain",
     .fragment_entry = "fragmentMain",
 };
@@ -112,7 +98,7 @@ pub const ui: gpu.UiShader = .{
 // draws in place of the mesh's own. Compute only, and it shares no binding with
 // any pass above.
 pub const morph: gpu.MorphShader = .{
-    .spirv = words(@embedFile("morph").*),
+    .spirv = gpu.spirvWords(@embedFile("morph")),
     .compute_entry = "morphMain",
 };
 
@@ -120,7 +106,7 @@ pub const morph: gpu.MorphShader = .{
 // can set an exposure from. Compute only, and it shares no binding with any pass
 // above.
 pub const meter: gpu.MeterShader = .{
-    .spirv = words(@embedFile("meter").*),
+    .spirv = gpu.spirvWords(@embedFile("meter")),
     .compute_entry = "meterMain",
 };
 

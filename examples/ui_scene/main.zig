@@ -7,8 +7,6 @@ const platform = @import("lenore-platform");
 const res = @import("lenore-resources");
 const scene = @import("lenore-scene");
 
-const OrbitControl = @import("example-orbit").OrbitControl;
-
 const log = std.log.scoped(.ui_scene);
 
 // A panel over a scene: the exit criterion of the UI stage, and the first thing
@@ -204,11 +202,12 @@ const Driver = struct {
     pub const hooks: lenore.Hooks(Driver) = .{
         .ui_regions = onUiRegions,
         .event = onEvent,
-        .update = onUpdate,
         .ui_draw = onUiDraw,
     };
 
-    orbit: OrbitControl = .{},
+    // The pointer stays visible while the scene turns, so a drag can end over
+    // the panel and be seen to.
+    orbit: lenore.OrbitCamera = .{ .capture = false },
 
     // What the panel holds, and the only state a frame carries: every widget is
     // a call, so what a UI remembers is exactly the values its controls stand
@@ -296,41 +295,14 @@ const Driver = struct {
     }
 
     pub fn onEvent(
-        self: *Driver,
+        _: *Driver,
         engine: *lenore.Engine,
         event: platform.Event,
         ui_consumed: bool,
     ) !void {
-        // What the UI took, it took. This is this frame's answer and not the
-        // previous frame's, so a press that lands on a panel which appeared
-        // this frame does not also start an orbit that lasts until the button
-        // comes back up.
-        //
-        // A drag that began on the scene keeps going: once the orbit holds the
-        // pointer the UI has no region under it, and the motion arrives here
-        // unconsumed.
-        if (ui_consumed) {
-            if (event.payload == .mouse_button and event.payload.mouse_button.action == .press)
-                self.orbit.cancel();
-            return;
-        }
-
+        // What the UI took, it took.
+        if (ui_consumed) return;
         switch (event.payload) {
-            .cursor => |cursor| self.orbit.dragTo(
-                &engine.camera,
-                cursor.logical_position,
-                event.timestamp_ns,
-            ),
-            .mouse_button => |button| if (button.button == .left) switch (button.action) {
-                .press => self.orbit.begin(button.logical_position, event.timestamp_ns),
-                .release => self.orbit.end(
-                    &engine.camera,
-                    button.logical_position,
-                    event.timestamp_ns,
-                ),
-                .repeat => {},
-            },
-            .focus => |focus| if (!focus.focused) self.orbit.cancel(),
             .key => |key| if (key.action == .press and key.physical == .escape)
                 engine.requestExit(),
             else => {},
@@ -451,10 +423,6 @@ const Driver = struct {
         style.horizontal = horizontal;
         try ui.label(try row.toFramebufferFilled(self.scale), style, line, true);
     }
-
-    pub fn onUpdate(self: *Driver, engine: *lenore.Engine, _: *lenore.Level, time: lenore.FrameTime) !void {
-        self.orbit.advance(&engine.camera, time.delta);
-    }
 };
 
 // The font this host prefers for an interface, or nothing.
@@ -536,5 +504,5 @@ pub fn main(process: std.process.Init.Minimal) !void {
     try engine.install(&level, &model);
 
     var driver: Driver = .{ .framing = level.world.sphere, .font = loadFont(&engine, io) };
-    try engine.run(&level, .{&driver});
+    try engine.run(&level, .{ &driver.orbit, &driver });
 }

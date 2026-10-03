@@ -3,7 +3,6 @@ const gpu = @import("lenore-gpu");
 const imui = @import("lenore-imui");
 const lenore = @import("lenore");
 const platform = @import("lenore-platform");
-const OrbitControl = @import("example-orbit").OrbitControl;
 const zm = @import("zmath");
 
 const log = std.log.scoped(.blackhole);
@@ -162,16 +161,6 @@ const push_range: gpu.vk.PushConstantRange = .{
 // the pipeline declares no vertex input.
 const vertex_count: u32 = 3;
 
-// `@embedFile` yields bytes and SPIR-V is words. Copied into an aligned
-// constant so the reinterpretation is valid rather than merely likely: an
-// embedded file has no alignment of its own.
-fn words(comptime bytes: anytype) []const u32 {
-    const aligned: [bytes.len]u8 align(@alignOf(u32)) = bytes;
-    const count = aligned.len / @sizeOf(u32);
-    comptime std.debug.assert(count * @sizeOf(u32) == aligned.len);
-    return @as([*]const u32, @ptrCast(&aligned))[0..count];
-}
-
 // The one pipeline this application owns.
 //
 // Built against the main pass's formats, which are read from the renderer
@@ -208,7 +197,7 @@ const Effect = struct {
         return .{
             .context = context,
             .shaders = try .init(context, .{
-                .modules = .{ .blackhole = words(@embedFile("blackhole").*) },
+                .modules = .{ .blackhole = gpu.spirvWords(@embedFile("blackhole")) },
                 .layouts = .{ .blackhole = LayoutConfig{ .push_constants = &.{push_range} } },
                 .formats = formats,
             }),
@@ -314,7 +303,7 @@ const Driver = struct {
     effect: *const Effect,
     tier: usize = default_tier,
     spin: f32 = 1,
-    orbit: OrbitControl = .{},
+    orbit: lenore.OrbitCamera = .{},
 
     // Half-height of the requested projection at unit depth. Null means the
     // camera has reached it and no zoom work remains.
@@ -363,33 +352,6 @@ const Driver = struct {
 
     pub fn onEvent(self: *Driver, engine: *lenore.Engine, event: platform.Event, _: bool) !void {
         switch (event.payload) {
-            .cursor => |cursor| self.orbit.dragTo(
-                &engine.camera,
-                cursor.logical_position,
-                event.timestamp_ns,
-            ),
-            .mouse_button => |button| if (button.button == .left) switch (button.action) {
-                .press => {
-                    self.orbit.begin(button.logical_position, event.timestamp_ns);
-                    engine.window.setCursorMode(.disabled) catch |err|
-                        log.warn("cursor capture unavailable: {t}", .{err});
-                },
-                .release => {
-                    self.orbit.end(
-                        &engine.camera,
-                        button.logical_position,
-                        event.timestamp_ns,
-                    );
-                    engine.window.setCursorMode(.normal) catch |err|
-                        log.warn("cursor release unavailable: {t}", .{err});
-                },
-                .repeat => {},
-            },
-            .focus => |focus| if (!focus.focused) {
-                self.orbit.cancel();
-                engine.window.setCursorMode(.normal) catch |err|
-                    log.warn("cursor release unavailable: {t}", .{err});
-            },
             .scroll => |scroll| if (scroll.line_delta[1] != 0)
                 self.queueZoom(engine, scroll.line_delta[1]),
             .key => |key| switch (key.action) {
@@ -538,10 +500,9 @@ const Driver = struct {
         _: *lenore.Level,
         time: lenore.FrameTime,
     ) !void {
-        // The clamped delta and not the wall interval: neither the disk nor a
-        // camera throw may teleport after a stall.
+        // The clamped delta and not the wall interval: the disk may not teleport
+        // after a stall.
         self.elapsed += time.delta;
-        self.orbit.advance(&engine.camera, time.delta);
         self.advanceZoom(engine, time.delta);
 
         // Reported per closed window rather than per frame, and only when the
@@ -652,5 +613,7 @@ pub fn main(process: std.process.Init.Minimal) !void {
         tiers[tier].windings(),
     });
 
-    try engine.run(&level, .{&driver});
+    // The orbit first, so a throw has moved the camera before the driver's own
+    // update reads it.
+    try engine.run(&level, .{ &driver.orbit, &driver });
 }

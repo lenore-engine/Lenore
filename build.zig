@@ -46,18 +46,6 @@ pub fn build(b: *std.Build) void {
         .module = b.dependency("zmath", .{}).module("root"),
     };
 
-    // Controllers are application policy, so examples share this module rather
-    // than putting one in the engine or copying it into every demonstration.
-    const example_orbit = b.createModule(.{
-        .root_source_file = b.path("examples/common_orbit.zig"),
-        .imports = &.{scene_import},
-        .target = target,
-        .optimize = optimize,
-    });
-    const example_orbit_import: std.Build.Module.Import = .{
-        .name = "example-orbit",
-        .module = example_orbit,
-    };
     // The engine is a module and not only an executable root. Two things follow
     // from that and neither is available without it: an example can consume the
     // composition instead of reassembling it, and a test binary can be built
@@ -117,7 +105,7 @@ pub fn build(b: *std.Build) void {
     // example would still have to be built from the umbrella to reach a window
     // or a sibling's types, and what compiles a module from its own directory
     // is its `tests/reach.zig`, not an example.
-    const imports_without_orbit = [_]std.Build.Module.Import{
+    const imports = [_]std.Build.Module.Import{
         engine_import,
         gltf_import,
         ktx_import,
@@ -130,7 +118,6 @@ pub fn build(b: *std.Build) void {
         zignal_import,
         zmath_import,
     };
-    const imports = imports_without_orbit ++ [_]std.Build.Module.Import{example_orbit_import};
 
     // One directory per example, `main.zig` at its root. A directory rather than
     // a bare file because an example may bring assets of its own, and the two
@@ -175,13 +162,9 @@ pub fn build(b: *std.Build) void {
     // the editor is an executable of its own, and a game linking the engine
     // module never sees it, so a build option would gate something that is
     // already separate.
-    //
-    // It takes the same imports an example does, less the orbit controller:
-    // that module is where the examples keep a camera policy they share, and
-    // the editor's camera is the editor's.
     const editor_module = b.createModule(.{
         .root_source_file = b.path("editor/main.zig"),
-        .imports = &imports_without_orbit,
+        .imports = &imports,
         .target = target,
         .optimize = optimize,
     });
@@ -239,17 +222,11 @@ pub fn build(b: *std.Build) void {
     // which is visible where a forgotten registration would not be.
     const editor_shell = b.createModule(.{
         .root_source_file = b.path("editor/shell.zig"),
-        .imports = &imports_without_orbit,
+        .imports = &imports,
         .target = target,
         .optimize = optimize,
     });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = editor_shell })).step);
-
-    // The shared example controller is not imported by the umbrella suite, and
-    // addTest discovers blocks only in its root module. Give it that root so
-    // frame-rate invariance and unconstrained orbit cannot stay uncompiled.
-    const orbit_tests = b.addTest(.{ .root_module = example_orbit });
-    test_step.dependOn(&b.addRunArtifact(orbit_tests).step);
 
     // The same applies to any example file that carries its own arithmetic: an
     // example is an executable and no suite imports it, so a `test` written in

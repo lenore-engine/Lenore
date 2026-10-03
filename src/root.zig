@@ -19,12 +19,20 @@ const level = @import("level.zig");
 const shaders = @import("shaders.zig");
 const translate = @import("translate.zig");
 const ui = @import("ui.zig");
+const camera_control = @import("camera_control.zig");
 const world = @import("world.zig");
 
 pub const Engine = engine.Engine;
 pub const EngineOptions = engine.Options;
 pub const Look = engine.Look;
 pub const Hooks = engine.Hooks;
+
+// The two common cameras as components, and the blocks a custom controller
+// builds on.
+pub const FlyCamera = camera_control.FlyCamera;
+pub const OrbitCamera = camera_control.OrbitCamera;
+pub const MouseLook = camera_control.MouseLook;
+pub const MoveKeys = camera_control.MoveKeys;
 pub const Sun = engine.Sun;
 pub const FramePhases = time.FramePhases;
 pub const ShadowBakeRequest = engine.ShadowBakeRequest;

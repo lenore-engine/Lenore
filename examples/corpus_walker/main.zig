@@ -213,123 +213,11 @@ const Open = struct {
     }
 };
 
-// A camera that goes where it is pushed.
-//
-// The engine's camera carries the pose and the projection; what a controller
-// adds is the part that reads input, which is why this lives here. Framing a
-// model puts it back on an orbit, and the first movement key drops the pivot:
-// an orbit derives the eye from the pivot, so moving the eye directly is not
-// expressible until it is detached.
-const Freecam = struct {
-    // World units a second at rest, set from the model's own radius when one is
-    // opened. A corpus asset may be a metre across or a hundred, and a constant
-    // that suits either crawls or overshoots on the other; a radius a second
-    // crosses any of them in the same time.
-    base_speed: f32 = 1.0,
-    // The wheel's multiplier on it, kept across models so a chosen pace
-    // survives a step. Geometric per notch: the useful range spans decades, and
-    // a linear step is either imperceptible at the bottom of one or unusable at
-    // the top.
-    scale: f32 = 1.0,
-
-    // One flag per direction rather than one signed value per axis. Two keys
-    // name the vertical axis, and with a signed value releasing either would
-    // stop the axis while the other was still held.
-    held: struct {
-        forward: bool = false,
-        back: bool = false,
-        left: bool = false,
-        right: bool = false,
-        up: bool = false,
-        down: bool = false,
-    } = .{},
-
-    looking: bool = false,
-    last_cursor: ?[2]f32 = null,
-
-    const sensitivity: f32 = 0.0025;
-    const scale_step: f32 = 1.25;
-    const min_scale: f32 = 1.0 / 64.0;
-    const max_scale: f32 = 64.0;
-
-    fn axis(positive: bool, negative: bool) f32 {
-        return @as(f32, if (positive) 1 else 0) - @as(f32, if (negative) 1 else 0);
-    }
-
-    fn advance(self: *const Freecam, camera: *scene.Camera, delta: f32) void {
-        const forward = axis(self.held.forward, self.held.back);
-        const strafe = axis(self.held.right, self.held.left);
-        const rise = axis(self.held.up, self.held.down);
-        // Opposed keys cancel, and a cancelled input must not reach the camera:
-        // the write below detaches the orbit, which is not undone by moving by
-        // nothing.
-        if (forward == 0 and strafe == 0 and rise == 0) return;
-
-        const placement = camera.placement();
-        const speed = self.base_speed * self.scale * delta;
-        // Up is the world's, not the camera's: a freecam that rises along its
-        // own up drifts sideways whenever it is looking anywhere but level.
-        const step = placement.front * @as(res.Vec3, @splat(forward * speed)) +
-            placement.right * @as(res.Vec3, @splat(strafe * speed)) +
-            res.Vec3{ 0, rise * speed, 0 };
-
-        // Detached first. An orbit places the eye from the pivot, so writing an
-        // eye into one changes nothing.
-        camera.detach();
-        camera.anchor = .{ .eye = camera.placement().position + step };
-    }
-
-    fn look(self: *Freecam, camera: *scene.Camera, position: [2]f32) void {
-        defer self.last_cursor = position;
-        if (!self.looking) return;
-        const previous = self.last_cursor orelse return;
-
-        camera.detach();
-        camera.yaw += (position[0] - previous[0]) * sensitivity;
-        camera.pitch = std.math.clamp(
-            camera.pitch - (position[1] - previous[1]) * sensitivity,
-            -std.math.pi / 2.0 + 0.01,
-            std.math.pi / 2.0 - 0.01,
-        );
-    }
-
-    // The wheel sets the pace. `lines` arrives already summed when the queue
-    // coalesces a burst, so raising the step to it makes one flick worth the
-    // notches it contained.
-    fn wheel(self: *Freecam, lines: f32) void {
-        if (lines == 0) return;
-        self.scale = std.math.clamp(
-            self.scale * std.math.pow(f32, scale_step, lines),
-            min_scale,
-            max_scale,
-        );
-    }
-
-    fn key(self: *Freecam, physical: platform.PhysicalKey, pressed: bool) bool {
-        switch (physical) {
-            .w => self.held.forward = pressed,
-            .s => self.held.back = pressed,
-            .d => self.held.right = pressed,
-            .a => self.held.left = pressed,
-            // Both pairs move along world Y, so neither depends on where the
-            // camera is looking.
-            .space, .e => self.held.up = pressed,
-            .shift_left, .shift_right, .q => self.held.down = pressed,
-            else => return false,
-        }
-        return true;
-    }
-};
-
 // The camera keeps whatever pose it was left in across a resize and across a
 // model. Reframing on either would throw away wherever the operator had flown
 // to, which is the one thing this application exists to let them do; `f` is what
 // asks for the framing back.
 const Walker = struct {
-    // No `resize`: the camera keeps whatever pose it was left in. Reframing on a
-    // resize would throw away wherever the operator had flown to, which is the
-    // one thing this application exists to let them do; `f` asks for the framing
-    // back.
     pub const hooks: lenore.Hooks(Walker) = .{
         .event = onEvent,
         .update = onUpdate,
@@ -345,7 +233,9 @@ const Walker = struct {
 
     open: *Open,
 
-    camera: Freecam = .{},
+    // Framing a model puts the camera back on an orbit, and the first movement
+    // key or drag detaches it: an orbit derives the eye from its pivot.
+    fly: lenore.FlyCamera = .{},
     sun: Sun = .{},
     lights: [gpu.max_lights]gpu.LightUniform = undefined,
     sun_moved: bool = false,
@@ -368,21 +258,7 @@ const Walker = struct {
 
     pub fn onEvent(self: *Walker, engine: *lenore.Engine, event: platform.Event, _: bool) !void {
         switch (event.payload) {
-            .cursor => |cursor| self.camera.look(&engine.camera, cursor.logical_position),
-            .scroll => |wheel| self.camera.wheel(wheel.line_delta[1]),
-            .mouse_button => |button| if (button.button == .left) {
-                self.camera.looking = button.action == .press;
-                if (!self.camera.looking) self.camera.last_cursor = null;
-                // Pointer capture, which hides the cursor and unbounds its
-                // position, so looking is not stopped by the window edge. A
-                // compositor may refuse it; the drag still works from the
-                // deltas either way, which is why this is not fatal.
-                engine.window.setCursorMode(
-                    if (self.camera.looking) .disabled else .normal,
-                ) catch |err| log.warn("cursor capture unavailable: {t}", .{err});
-            },
             .key => |key| {
-                if (self.camera.key(key.physical, key.action != .release)) return;
                 switch (key.action) {
                     .press => try self.command(engine, key.physical),
                     // Held keys repeat only where holding one means something.
@@ -449,7 +325,9 @@ const Walker = struct {
     // other flies at the previous model's scale.
     fn adopt(self: *Walker, open: *Open) void {
         self.open = open;
-        self.camera.base_speed = @max(open.level.world.sphere.radius, 0.01);
+        // A radius a second. A corpus asset may be a metre across or a hundred,
+        // and a constant that suits either crawls or overshoots on the other.
+        self.fly.speed = @max(open.level.world.sphere.radius, 0.01);
         self.sun_moved = true;
     }
 
@@ -462,10 +340,8 @@ const Walker = struct {
         self: *Walker,
         engine: *lenore.Engine,
         level: *lenore.Level,
-        time: lenore.FrameTime,
+        _: lenore.FrameTime,
     ) !void {
-        self.camera.advance(&engine.camera, time.delta);
-
         // Every read of the look is below this hook, so a key pressed this
         // frame is answered by the picture this frame draws.
         engine.look.sun_shadow.enabled = self.shadows;
@@ -738,7 +614,7 @@ pub fn main(process: std.process.Init.Minimal) !void {
 
     logControls();
     while (true) {
-        engine.run(&open.level, .{&walker}) catch |err| {
+        engine.run(&open.level, .{ &walker.fly, &walker }) catch |err| {
             log.err("{s}: {t}", .{ entries[walker.index].name, err });
             return err;
         };

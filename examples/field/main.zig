@@ -258,38 +258,16 @@ fn captionOf(row: imui.LogicalRect) imui.LogicalRect {
     };
 }
 
-// Which movement keys are down. Held state and not per-event motion: a key
-// repeat arrives at the system's repeat rate, so walking driven by events would
-// travel at whatever that is set to.
-const Held = struct {
-    forward: bool = false,
-    back: bool = false,
-    left: bool = false,
-    right: bool = false,
-    fast: bool = false,
-    jump: bool = false,
-
-    fn set(self: *Held, key: platform.PhysicalKey, down: bool) bool {
-        switch (key) {
-            .w => self.forward = down,
-            .s => self.back = down,
-            .a => self.left = down,
-            .d => self.right = down,
-            .shift_left, .shift_right => self.fast = down,
-            .space => self.jump = down,
-            else => return false,
-        }
-        return true;
-    }
-};
-
-// Mouse look and walking. This owns the interpretation of input; where the
-// camera is stays in `scene.Camera`, the way the shared orbit controller keeps
-// its angles there.
+// Walking on the field: the engine's mouse look and movement keys, and the
+// body's own fall and footing. Where the camera is stays in `scene.Camera`.
 const Walk = struct {
-    looking: bool = false,
-    last_cursor: [2]f32 = .{ 0, 0 },
-    held: Held = .{},
+    look: lenore.MouseLook = .{ .settings = .{ .sensitivity = 0.0022, .max_pitch = max_pitch } },
+    // Space jumps rather than rising, and nothing goes down.
+    keys: lenore.MoveKeys = .{ .bindings = .{
+        .up = &.{.space},
+        .down = &.{},
+        .fast = &.{ .shift_left, .shift_right },
+    } },
 
     // Metres per second, upward. Carried between frames because it is the whole
     // of what makes a fall a fall: a camera placed on the ground every frame
@@ -300,30 +278,12 @@ const Walk = struct {
     // which the ground rose to meet a rising camera is not a landing.
     grounded: bool = false,
 
-    const sensitivity: f32 = 0.0022;
-
-    fn beginLook(self: *Walk, position: [2]f32) void {
-        self.looking = true;
-        self.last_cursor = position;
-    }
-
-    fn lookTo(self: *Walk, camera: *scene.Camera, position: [2]f32) void {
-        if (!self.looking) return;
-        camera.yaw += (position[0] - self.last_cursor[0]) * sensitivity;
-        camera.pitch = std.math.clamp(
-            camera.pitch - (position[1] - self.last_cursor[1]) * sensitivity,
-            -max_pitch,
-            max_pitch,
-        );
-        self.last_cursor = position;
-    }
-
     // Focus loss can arrive without a release, and a key that went down before
     // it would otherwise stay down forever. The fall is not cleared: losing the
     // window does not catch a body in mid air.
     fn cancel(self: *Walk) void {
-        self.looking = false;
-        self.held = .{};
+        self.look.end();
+        self.keys.cancel();
     }
 
     // Puts the feet on the ground and stops any fall. Used once before the first
@@ -348,17 +308,17 @@ const Walk = struct {
         const right = res.Vec3{ -@sin(camera.yaw), 0.0, @cos(camera.yaw) };
 
         var direction = res.Vec3{ 0.0, 0.0, 0.0 };
-        if (self.held.forward) direction += forward;
-        if (self.held.back) direction -= forward;
-        if (self.held.right) direction += right;
-        if (self.held.left) direction -= right;
+        if (self.keys.held(.forward)) direction += forward;
+        if (self.keys.held(.back)) direction -= forward;
+        if (self.keys.held(.right)) direction += right;
+        if (self.keys.held(.left)) direction -= right;
 
         const length = @sqrt(direction[0] * direction[0] + direction[2] * direction[2]);
         var eye = eyeOf(camera.*);
         if (length > 0.0) {
             // Normalised, so that two keys together do not travel by the
             // diagonal's extra factor.
-            const speed = walk_speed * (if (self.held.fast) run_multiplier else 1.0) * delta;
+            const speed = walk_speed * (if (self.keys.held(.fast)) run_multiplier else 1.0) * delta;
             const scale: res.Vec3 = @splat(speed / length);
             eye += direction * scale;
         }
@@ -370,7 +330,7 @@ const Walk = struct {
         // A jump is taken only from the ground. Tested against the flag rather
         // than against the height, so that holding the key while falling does
         // not launch again the instant the feet touch.
-        if (self.grounded and self.held.jump) {
+        if (self.grounded and self.keys.held(.up)) {
             self.vertical_velocity = jump_speed;
             self.grounded = false;
         }
@@ -525,17 +485,17 @@ const Driver = struct {
         // arrives here unconsumed.
         if (ui_consumed) {
             if (event.payload == .mouse_button and event.payload.mouse_button.action == .press)
-                self.walk.looking = false;
+                self.walk.look.end();
             return;
         }
 
         switch (event.payload) {
-            .cursor => |cursor| self.walk.lookTo(&engine.camera, cursor.logical_position),
+            .cursor => |cursor| self.walk.look.turnCamera(cursor.logical_position, &engine.camera),
             .mouse_button => |button| if (button.button == .left) switch (button.action) {
-                .press => self.walk.beginLook(button.logical_position),
+                .press => self.walk.look.begin(button.logical_position),
                 .release => {
-                    self.walk.lookTo(&engine.camera, button.logical_position);
-                    self.walk.looking = false;
+                    self.walk.look.turnCamera(button.logical_position, &engine.camera);
+                    self.walk.look.end();
                 },
                 .repeat => {},
             },
@@ -543,9 +503,9 @@ const Driver = struct {
             .key => |key| switch (key.action) {
                 .press => {
                     if (key.physical == .escape) return engine.requestExit();
-                    _ = self.walk.held.set(key.physical, true);
+                    _ = self.walk.keys.key(key.physical, .press);
                 },
-                .release => _ = self.walk.held.set(key.physical, false),
+                .release => _ = self.walk.keys.key(key.physical, .release),
                 // A repeat says the key is still down, which it already is.
                 .repeat => {},
             },
