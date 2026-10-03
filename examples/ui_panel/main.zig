@@ -112,6 +112,12 @@ fn rect(x: f32, y: f32, width: f32, height: f32) res.Rect {
 }
 
 const Driver = struct {
+    pub const hooks: lenore.Hooks(Driver) = .{
+        .event = onEvent,
+        .update = onUpdate,
+        .ui_draw = onUiDraw,
+    };
+
     white: res.ImageHandle,
     // Null when the host had no font to open. Every other figure is unaffected,
     // which is why a missing font is a line in the log and not a refusal.
@@ -133,13 +139,6 @@ const Driver = struct {
             else => {},
         }
     }
-
-    pub fn onResize(_: *Driver, _: *lenore.Engine, _: platform.Extent2D) !void {}
-    pub fn onDepth(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onCompute(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onRecord(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-
-    pub fn onUiRegions(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
 
     pub fn onUiDraw(
         self: *Driver,
@@ -355,5 +354,5 @@ pub fn main() !void {
     var driver: Driver = .{ .white = engine.ui_white, .font = loadFont(&engine, io) };
     log.info("{s}", .{usage});
 
-    try engine.run(&level, &driver);
+    try engine.run(&level, .{&driver});
 }

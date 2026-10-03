@@ -266,6 +266,12 @@ fn applyView(engine: *lenore.Engine, view: View, sphere: res.Sphere) void {
 // What drives the loop: key handling, reframing, and every probe that can only
 // be answered from inside a running frame.
 const Harness = struct {
+    pub const hooks: lenore.Hooks(Harness) = .{
+        .event = onEvent,
+        .resize = onResize,
+        .update = onUpdate,
+    };
+
     model: *const gltf.importer.Model,
     sphere: res.Sphere,
     bounds: res.Aabb,
@@ -351,14 +357,6 @@ const Harness = struct {
         reportNdcExtent(view_projection, self.bounds, ratio, extent);
         reportUpAxis(gpu.vulkanClip(view_projection), self.bounds, extent);
     }
-    pub fn onDepth(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onCompute(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    // Nothing to draw over the picture. The hook is required of every
-    // driver, so declining it is a declaration rather than an omission.
-    pub fn onUiRegions(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
-    pub fn onUiDraw(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
-
-    pub fn onRecord(_: *Harness, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
 
     pub fn onUpdate(
         self: *Harness,
@@ -693,7 +691,7 @@ pub fn main(process: std.process.Init.Minimal) !void {
         .weight_probe = playingMorph(&level),
         .weight_span = morphSpan(&level),
     };
-    try engine.run(&level, &harness);
+    try engine.run(&level, .{&harness});
 
     log.info("presented {d} frames", .{engine.presented_frames});
     log.info("checks failed: {d}", .{failures});

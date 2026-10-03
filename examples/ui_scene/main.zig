@@ -201,6 +201,13 @@ fn captionOf(row: imui.LogicalRect) imui.LogicalRect {
 }
 
 const Driver = struct {
+    pub const hooks: lenore.Hooks(Driver) = .{
+        .ui_regions = onUiRegions,
+        .event = onEvent,
+        .update = onUpdate,
+        .ui_draw = onUiDraw,
+    };
+
     orbit: OrbitControl = .{},
 
     // What the panel holds, and the only state a frame carries: every widget is
@@ -329,11 +336,6 @@ const Driver = struct {
             else => {},
         }
     }
-
-    pub fn onResize(_: *Driver, _: *lenore.Engine, _: platform.Extent2D) !void {}
-    pub fn onDepth(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onCompute(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onRecord(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
 
     pub fn onUiDraw(
         self: *Driver,
@@ -534,5 +536,5 @@ pub fn main(process: std.process.Init.Minimal) !void {
     try engine.install(&level, &model);
 
     var driver: Driver = .{ .framing = level.world.sphere, .font = loadFont(&engine, io) };
-    try engine.run(&level, &driver);
+    try engine.run(&level, .{&driver});
 }

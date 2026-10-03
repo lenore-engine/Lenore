@@ -6,42 +6,60 @@ const platform = @import("lenore-platform");
 
 const testing = std.testing;
 
-// The loop is generic over its driver, so nothing compiles its body until a
-// driver is named. `_ = &Engine.run` does not: a reference to a generic function
-// is not an instantiation, and a body only a reach line names would stay
-// unanalysed however green the build.
+// The loop is generic over its components, so nothing compiles its body until
+// a tuple of them is named. `_ = &Engine.run` does not: a reference to a generic
+// function is not an instantiation, and a body only a reach line names would
+// stay unanalysed however green the build.
 //
 // `@TypeOf` on a call is what instantiates without running. The return type is
 // an inferred error set, so the compiler has to walk the body to know it, and a
-// mistake anywhere inside stops the build here. Proven by breaking a statement
-// in the loop and watching this fail.
+// mistake anywhere inside stops the build here.
 
-// `pub` is the whole point of this fixture. Written without it, these are
-// invisible to the engine's file, and before the hooks were made required that
-// compiled into a loop that called nothing.
+// Every hook, and none of the functions `pub`: the table names them from inside
+// the component's own type, so visibility is not what decides whether they run.
 const Full = struct {
-    pub fn onEvent(_: *Full, _: *lenore.Engine, _: platform.Event, _: bool) !void {}
-    pub fn onResize(_: *Full, _: *lenore.Engine, _: platform.Extent2D) !void {}
-    pub fn onUpdate(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: lenore.FrameTime) !void {}
-    pub fn onDepth(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onCompute(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onRecord(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onUiRegions(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
-    pub fn onUiDraw(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
+    pub const hooks: lenore.Hooks(Full) = .{
+        .ui_regions = uiRegions,
+        .event = event,
+        .resize = resize,
+        .update = update,
+        .compute = compute,
+        .record = record,
+        .depth = depth,
+        .ui_draw = uiDraw,
+    };
+
+    fn uiRegions(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
+    fn event(_: *Full, _: *lenore.Engine, _: platform.Event, _: bool) !void {}
+    fn resize(_: *Full, _: *lenore.Engine, _: platform.Extent2D) !void {}
+    fn update(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: lenore.FrameTime) !void {}
+    fn compute(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
+    fn record(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
+    fn depth(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
+    fn uiDraw(_: *Full, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
 };
 
-test "the loop compiles for a driver that declares every hook" {
-    var driver: Full = .{};
+// One hook, which is the common shape of a component.
+const Partial = struct {
+    pub const hooks: lenore.Hooks(Partial) = .{ .update = update };
+
+    fn update(_: *Partial, _: *lenore.Engine, _: *lenore.Level, _: lenore.FrameTime) !void {}
+};
+
+test "the loop compiles for a component that names every hook" {
+    var full: Full = .{};
     const engine: *lenore.Engine = undefined;
     const level: *lenore.Level = undefined;
-    _ = @TypeOf(engine.run(level, &driver));
+    _ = @TypeOf(engine.run(level, .{&full}));
 }
 
-test "the loop compiles for the driver that does nothing" {
-    var driver: lenore.NoDriver = .{};
+test "the loop compiles for several components and for none" {
+    var full: Full = .{};
+    var partial: Partial = .{};
     const engine: *lenore.Engine = undefined;
     const level: *lenore.Level = undefined;
-    _ = @TypeOf(engine.run(level, &driver));
+    _ = @TypeOf(engine.run(level, .{ &partial, &full }));
+    _ = @TypeOf(engine.run(level, .{}));
 }
 
 test "the device phase is independently destructible" {

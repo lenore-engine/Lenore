@@ -409,6 +409,15 @@ fn eyeOf(camera: scene.Camera) res.Vec3 {
 }
 
 const Driver = struct {
+    pub const hooks: lenore.Hooks(Driver) = .{
+        .ui_regions = onUiRegions,
+        .event = onEvent,
+        .update = onUpdate,
+        .compute = onCompute,
+        .record = onRecord,
+        .ui_draw = onUiDraw,
+    };
+
     field: terrain.Terrain,
     walk: Walk = .{},
     // Borrowed. It owns device resources and is torn down by `main` after the
@@ -544,9 +553,6 @@ const Driver = struct {
         }
     }
 
-    pub fn onResize(_: *Driver, _: *lenore.Engine, _: platform.Extent2D) !void {}
-
-    pub fn onDepth(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onCompute(
         self: *Driver,
         engine: *lenore.Engine,
@@ -976,5 +982,5 @@ pub fn main(process: std.process.Init.Minimal) !void {
     driver.walk.stand(&engine.camera, field);
     try driver.applyLook(&engine);
 
-    try engine.run(&level, &driver);
+    try engine.run(&level, .{&driver});
 }

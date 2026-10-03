@@ -326,6 +326,15 @@ const Freecam = struct {
 // to, which is the one thing this application exists to let them do; `f` is what
 // asks for the framing back.
 const Walker = struct {
+    // No `resize`: the camera keeps whatever pose it was left in. Reframing on a
+    // resize would throw away wherever the operator had flown to, which is the
+    // one thing this application exists to let them do; `f` asks for the framing
+    // back.
+    pub const hooks: lenore.Hooks(Walker) = .{
+        .event = onEvent,
+        .update = onUpdate,
+    };
+
     entries: []Entry,
     index: usize,
     // Why the frame loop is to end, set in the event drain and read once it has
@@ -449,20 +458,6 @@ const Walker = struct {
         self.sun_moved = true;
     }
 
-    // The camera keeps whatever pose it was left in. Reframing here would throw
-    // away wherever the operator had flown to, which is the one thing this
-    // application exists to let them do; `f` asks for the framing back.
-    pub fn onResize(_: *Walker, _: *lenore.Engine, _: platform.Extent2D) !void {}
-    pub fn onDepth(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onCompute(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-
-    // Nothing to draw over the picture. The hook is required of every
-
-    // driver, so declining it is a declaration rather than an omission.
-    pub fn onUiRegions(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
-    pub fn onUiDraw(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
-
-    pub fn onRecord(_: *Walker, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
     pub fn onUpdate(
         self: *Walker,
         engine: *lenore.Engine,
@@ -743,7 +738,7 @@ pub fn main(process: std.process.Init.Minimal) !void {
 
     logControls();
     while (true) {
-        engine.run(&open.level, &walker) catch |err| {
+        engine.run(&open.level, .{&walker}) catch |err| {
             log.err("{s}: {t}", .{ entries[walker.index].name, err });
             return err;
         };

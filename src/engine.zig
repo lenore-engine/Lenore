@@ -53,102 +53,124 @@ const RendererOptions = struct {
 // the copies were where they drifted.
 //
 // What varies between applications reaches the loop two ways. `Look` is what
-// the frame is drawn with, taken once below the last hook that can write it. A
-// driver is a value with the hooks below, called at the one point in the frame
-// where each is answerable.
+// the frame is drawn with, taken once below the last hook that can write it.
+// Components are values whose hooks, declared through `Hooks`, are called at
+// the one point in the frame where each is answerable.
 
 // How many frames the host may be preparing while the device works on earlier
 // ones. Two lets the host record the next frame while the device finishes the
 // current one, without the latency a deeper queue adds.
 const frames_in_flight = 2;
 
-// What runs on top of the loop. Every driver declares all eight, and they are
-// called at the one point in the frame where each is answerable:
+// What a component asks the loop to call. `run` takes a tuple of pointers to
+// components, and a component's type declares
 //
-//   onUiRegions(driver, engine, level, ui) !void
-//       Every interactive area the frame has, in painter's order. Called
-//       before the frame's events are routed, which is what lets them be
-//       routed against geometry that is this frame's rather than last one's.
-//       Nothing may be drawn here and nothing read: what a widget got out of
-//       the frame is not knowable until every region exists.
-//   onEvent(driver, engine, event, ui_consumed) !void
-//       Every input event, with what the UI did about it. `ui_consumed` is
-//       this frame's answer and not the previous frame's, so an application
-//       that suppresses its own binding on it does so on the frame the click
-//       lands.
-//   onResize(driver, engine, extent) !void
-//       After the swapchain and the render targets have followed the surface.
-//   onUpdate(driver, engine, level, time) !void
-//       The frame's simulation, between the clock's one reading and the camera
-//       the frame is built from. Everything a driver advances with the delta
-//       goes here, and everything it wants this frame drawn with: the look,
-//       the lights and the camera are all read below it.
-//   onCompute(driver, engine, level, commands) !void
-//       Before any rendering opens. Compute work ends with its own dependency
-//       from storage writes to the stage that consumes them.
-//   onRecord(driver, engine, level, commands) !void
-//       Inside the main pass, after the scene and before it closes. See the
-//       call site for what may be recorded there and what may not.
-//   onDepth(driver, engine, level, commands) !void
-//       After the main pass closes, with its depth stored and readable by
-//       compute in `gpu.MainPass.sampled_layout`. Dispatches only, and they
-//       may only read depth: the next frame's prepass writes it after them.
-//       What they write ends with its own dependency to whatever reads it.
-//   onUiDraw(driver, engine, level, ui) !void
-//       The overlay's geometry, built into the frame's own rings, and where a
-//       widget reads what the routing decided. It carries no command buffer
-//       and records nothing: what is appended here is drawn later, over the
-//       finished picture, in display colour.
+//     pub const hooks: lenore.Hooks(@This()) = .{ .update = update, ... };
 //
+// At each point below the loop calls every component that named the hook, in
+// the order the tuple gives. A hook nobody names is not called. The table is a
+// comptime value whose fields are functions rather than pointers, so every call
+// is direct and an absent hook is a branch the compiler removes.
+//
+// The table is typed so that a mistake is reported at the component's own
+// line: a misspelt hook is a field this struct does not have, and a wrong
+// signature is a function that does not coerce to the field's type. The
+// functions it names need not be `pub`. Finding hooks by declaration instead
+// would miss any declared without `pub`, since `@hasDecl` answers only for
+// public declarations, and such a hook would compile and never be called.
+//
+// Every hook returns `anyerror!void`, and `run` returns the first error a hook
+// returns.
+pub fn Hooks(comptime Component: type) type {
+    return struct {
+        // Every interactive area the frame has, in painter's order. Called
+        // before the frame's events are routed, which is what lets them be
+        // routed against geometry that is this frame's rather than last one's.
+        // Nothing may be drawn here and nothing read: what a widget got out of
+        // the frame is not knowable until every region exists.
+        ui_regions: ?fn (*Component, *Engine, *Level, *imui.WidgetContext) anyerror!void = null,
+        // Every input event, with what the UI did about it. The flag is this
+        // frame's answer and not the previous frame's, so a component that
+        // suppresses its own binding on it does so on the frame the click lands.
+        event: ?fn (*Component, *Engine, platform.Event, bool) anyerror!void = null,
+        // After the swapchain and the render targets have followed the surface.
+        resize: ?fn (*Component, *Engine, platform.Extent2D) anyerror!void = null,
+        // The frame's simulation, between the clock's one reading and the
+        // camera the frame is built from. Everything a component advances with
+        // the delta goes here, and everything it wants this frame drawn with:
+        // the look, the lights and the camera are all read below it.
+        update: ?fn (*Component, *Engine, *Level, FrameTime) anyerror!void = null,
+        // Before any rendering opens. Compute work ends with its own dependency
+        // from storage writes to the stage that consumes them.
+        compute: ?fn (*Component, *Engine, *Level, gpu.vk.CommandBuffer) anyerror!void = null,
+        // Inside the main pass, after the scene and before it closes. See the
+        // call site for what may be recorded there and what may not.
+        record: ?fn (*Component, *Engine, *Level, gpu.vk.CommandBuffer) anyerror!void = null,
+        // After the main pass closes, with its depth stored and readable by
+        // compute in `gpu.MainPass.sampled_layout`. Dispatches only, and they
+        // may only read depth: the next frame's prepass writes it after them.
+        // What they write ends with its own dependency to whatever reads it.
+        depth: ?fn (*Component, *Engine, *Level, gpu.vk.CommandBuffer) anyerror!void = null,
+        // The overlay's geometry, built into the frame's own rings, and where a
+        // widget reads what the routing decided. It carries no command buffer
+        // and records nothing: what is appended here is drawn later, over the
+        // finished picture, in display colour.
+        ui_draw: ?fn (*Component, *Engine, *Level, *imui.WidgetContext) anyerror!void = null,
+    };
+}
+
 // Nothing is called between the recording and the submission, because there is
-// nothing a driver could only answer there. The device has produced nothing at
-// that point: the command buffer is still open, `Frame.submit` is what ends it,
-// and what the recording cost the device is read a ring apart, where this
+// nothing a component could only answer there. The device has produced nothing
+// at that point: the command buffer is still open, `Frame.submit` is what ends
+// it, and what the recording cost the device is read a ring apart, where this
 // slot's fence next signals. What the recording moves on the host is counters
-// that outlive the frame, so a driver reading one at the top of the next frame
-// reads the same number.
+// that outlive the frame, so a component reading one at the top of the next
+// frame reads the same number.
 //
 // What a hook writes reaches the frame through two readings and no others. The
-// camera is read below `onUpdate`, into the matrices the scene is culled and
-// transformed by; the look is read below `onUiDraw`, once, for every stage that
+// camera is read below `update`, into the matrices the scene is culled and
+// transformed by; the look is read below `ui_draw`, once, for every stage that
 // draws. A write above its reading is in this frame and a write below it is in
 // the next.
 //
 // Stated and not enforced, which is a decision. A write on the wrong side of a
 // reading costs a frame of latency and never a broken frame, and nothing can
-// tell the two cases apart: a driver deliberately setting up the next frame
-// writes exactly what a driver that missed the deadline writes. The overlay's
-// own phases are refused at runtime because a registration in the wrong pass
-// corrupts the widget tree, which is a different kind of mistake and gets a
-// different answer.
+// tell the two cases apart: a component deliberately setting up the next frame
+// writes exactly what a component that missed the deadline writes. The
+// overlay's own phases are refused at runtime because a registration in the
+// wrong pass corrupts the widget tree, which is a different kind of mistake and
+// gets a different answer.
 //
 // The UI is two hooks rather than one because the loop does its own work
 // between them. Registration, routing and drawing are three passes over the
 // same widget tree in a fixed order, and the middle one is the engine's: it
 // drains the platform's queue, translates it and routes it. A single hook
-// would have to be handed the batch and trusted to route it, and a driver that
-// simply did not would draw a UI that never responds, with nothing to report.
-//
-// Required rather than optional, and the reason is a trap that was sprung twice
-// in one day. Optional hooks were selected with `@hasDecl`, which does not see a
-// declaration that is not `pub` from another file, so a driver whose methods
-// were declared without it compiled, ran, and was never called: no keys, no
-// resize, no probes, and a background left at whatever the look defaulted to.
-// Nothing reported anything, because nothing was wrong as far as the compiler
-// could tell. Requiring all of them turns that into a missing declaration,
-// which is an error at the call below.
-//
-// A driver that wants none of them uses `NoDriver`, which says so.
-pub const NoDriver = struct {
-    pub fn onUiRegions(_: *NoDriver, _: *Engine, _: *Level, _: *imui.WidgetContext) !void {}
-    pub fn onEvent(_: *NoDriver, _: *Engine, _: platform.Event, _: bool) !void {}
-    pub fn onResize(_: *NoDriver, _: *Engine, _: platform.Extent2D) !void {}
-    pub fn onUpdate(_: *NoDriver, _: *Engine, _: *Level, _: FrameTime) !void {}
-    pub fn onCompute(_: *NoDriver, _: *Engine, _: *Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onRecord(_: *NoDriver, _: *Engine, _: *Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onDepth(_: *NoDriver, _: *Engine, _: *Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onUiDraw(_: *NoDriver, _: *Engine, _: *Level, _: *imui.WidgetContext) !void {}
-};
+// would have to be handed the batch and trusted to route it, and a component
+// that simply did not would draw a UI that never responds, with nothing to
+// report.
+
+// Refuses at compile time what `run` cannot call, naming the component.
+fn checkComponents(comptime Components: type) void {
+    inline for (@typeInfo(Components).@"struct".field_types) |Pointer| {
+        if (@typeInfo(Pointer) != .pointer)
+            @compileError("run takes pointers to components, and " ++ @typeName(Pointer) ++ " is not one");
+        const Component = @typeInfo(Pointer).pointer.child;
+        if (!@hasDecl(Component, "hooks"))
+            @compileError(@typeName(Component) ++ " declares no `pub const hooks: lenore.Hooks(" ++
+                @typeName(Component) ++ ")`");
+        if (@TypeOf(Component.hooks) != Hooks(Component))
+            @compileError("declare " ++ @typeName(Component) ++ ".hooks with the type `lenore.Hooks(" ++
+                @typeName(Component) ++ ")`, so that a misspelt hook is an error at its line");
+    }
+}
+
+// One point of the frame: every component that named the hook, in tuple order.
+inline fn callHooks(components: anytype, comptime hook_name: []const u8, args: anytype) anyerror!void {
+    inline for (components) |component| {
+        const Component = @typeInfo(@TypeOf(component)).pointer.child;
+        if (@field(Component.hooks, hook_name)) |hook| try @call(.auto, hook, .{component} ++ args);
+    }
+}
 
 // What every frame is drawn with.
 //
@@ -417,7 +439,7 @@ pub const Engine = struct {
 
     frame_clock: FrameClock,
     // Where the host time of a frame went and how fast the frames came. A
-    // driver reads its last window rather than being called back, because a
+    // component reads its last window rather than being called back, because a
     // rate is a thing to look at when convenient and not an event.
     metrics: FrameMetrics,
     // Null where the device cannot carry a timestamp on the graphics queue, or
@@ -906,7 +928,7 @@ pub const Engine = struct {
     //
     // This is how an application frees a buffer or an image it made itself, and
     // it is correct from any hook. Destroying one directly is correct only where
-    // the device happens to be idle, which is true inside `onResize` because
+    // the device happens to be idle, which is true inside a `resize` hook because
     // `recreate` drains first and is true nowhere else the application can see.
     // Nothing in a signature says which is which, so this exists to make the
     // question not arise.
@@ -979,11 +1001,11 @@ pub const Engine = struct {
         return distance;
     }
 
-    // What a driver lays its UI out against: logical units multiplied by this
+    // What a component lays its UI out against: logical units multiplied by this
     // are framebuffer pixels, which is the space a region is tested in.
     //
     // Identity until the window has described itself. That is the same picture
-    // an unscaled display gives, so a driver that ignores the distinction is
+    // an unscaled display gives, so a component that ignores the distinction is
     // wrong only on a scaled output and not before the first frame.
     pub fn uiScale(self: *const Engine) imui.ScaleFactor {
         const metrics = self.input.inputState().metrics orelse return .identity;
@@ -1014,7 +1036,8 @@ pub const Engine = struct {
         self.exit_requested = true;
     }
 
-    pub fn run(self: *Engine, level: *Level, driver: anytype) !void {
+    pub fn run(self: *Engine, level: *Level, components: anytype) !void {
+        comptime checkComponents(@TypeOf(components));
         self.exit_requested = false;
 
         // One timer for the whole run rather than one per frame. A timer built
@@ -1046,7 +1069,7 @@ pub const Engine = struct {
                 continue;
             }
             if (self.swapchain_stale or !self.swapchain.matchesExtent(self.surface_extent))
-                try self.recreate(driver);
+                try self.recreate(components);
 
             self.metrics.beginFrame();
             self.metrics.record(.events, phase.split());
@@ -1062,7 +1085,7 @@ pub const Engine = struct {
             // fence has signalled is writing that slot.
             //
             // What the placement buys is that every event is routed against
-            // this frame's regions before the driver hears about it. A driver
+            // this frame's regions before a component hears about it. A component
             // reading the previous frame's answer instead is wrong in exactly
             // the case that matters: a panel that has just appeared or moved
             // under the pointer takes the click and starts a camera drag with
@@ -1080,9 +1103,9 @@ pub const Engine = struct {
                 // scope left open, is the one nobody sees. Leaving the loop and
                 // re-entering it is ordinary: it is how a level is replaced.
                 errdefer self.ui.abandonFrame();
-                try driver.onUiRegions(self, level, &self.ui.widgets);
+                try callHooks(components, "ui_regions", .{ self, level, &self.ui.widgets });
                 try self.ui.beginRouting();
-                try self.drainInput(driver);
+                try self.drainInput(components);
                 try self.ui.finishRouting();
             }
             self.metrics.record(.ui, phase.split());
@@ -1137,7 +1160,7 @@ pub const Engine = struct {
             // The frame's simulation, and the reason it is here rather than
             // after the recording. Everything below reads what it writes: the
             // camera the frame is built from, the lights, and the look every
-            // pass is planned against. A driver advancing them after the
+            // pass is planned against. A component advancing them after the
             // recording instead would have each frame drawn from the state
             // before the input that produced it, at every rate.
             //
@@ -1145,7 +1168,7 @@ pub const Engine = struct {
             // FIFO most of a frame is spent in `wait_ns`, so simulating above
             // it would hand the recording a state that much older, which is
             // the latency this placement exists to remove.
-            try driver.onUpdate(self, level, time);
+            try callHooks(components, "update", .{ self, level, time });
             self.metrics.record(.update, phase.split());
 
             const ratio = self.aspect();
@@ -1175,7 +1198,7 @@ pub const Engine = struct {
             // registered before the fence and the frame's events have already
             // been routed against them, so a click and what it does appear in
             // the same picture rather than one apart.
-            try driver.onUiDraw(self, level, &self.ui.widgets);
+            try callHooks(components, "ui_draw", .{ self, level, &self.ui.widgets });
 
             // One reading of the look per frame, below the last hook that can
             // write one. Every stage below takes this copy and none of them
@@ -1183,7 +1206,7 @@ pub const Engine = struct {
             // single deadline: the lights and the shadow settings are wanted
             // here, the background, the bloom and the post operator when the
             // frame is planned, and the shadow decision later still. Read
-            // separately they would land a driver's two writes in two
+            // separately they would land a component's two writes in two
             // different frames, and which field went into which is not
             // something a picture shows.
             const look = self.look;
@@ -1243,7 +1266,7 @@ pub const Engine = struct {
             // buffer and cannot escape the frame's fence lifetime.
             self.mark(commands, .compute, .begin);
             self.morph_pass.record(commands, self.frame_index);
-            try driver.onCompute(self, level, commands);
+            try callHooks(components, "compute", .{ self, level, commands });
             self.mark(commands, .compute, .end);
 
             // Everything a frame can be refused for is refused here, before a
@@ -1286,18 +1309,18 @@ pub const Engine = struct {
             // what is already bound, and the scene's sets have to be the last
             // word for the draws that read them.
             //
-            // What a driver records here writes the HDR target and is tone
+            // What a component records here writes the HDR target and is tone
             // mapped with everything else, so it is in scene radiance and not
             // in display colour. The chain and the operator run after it.
             //
-            // A driver that records nothing costs the call and no commands.
-            try driver.onRecord(self, level, commands);
+            // A component that names no `record` hook costs nothing here.
+            try callHooks(components, "record", .{ self, level, commands });
             self.renderer.endMain(commands);
             self.mark(commands, .main, .end);
 
             // What the frame drew, as depth, for compute that reads it.
             self.mark(commands, .after_main, .begin);
-            try driver.onDepth(self, level, commands);
+            try callHooks(components, "depth", .{ self, level, commands });
             self.mark(commands, .after_main, .end);
 
             // Before the chain rather than after it: both read the target the
@@ -1388,12 +1411,13 @@ pub const Engine = struct {
     // into whole pixels: on the reference host they read 1.50000 across against
     // 1.49952 down.
     //
-    // **A face is a face at one size**, so this is answered once, when a font is
-    // loaded, and the face does not follow the window afterwards. A driver that
-    // wants text to track a scale change hears the change through `onResize` and
-    // reopens the face itself. The engine does not do it for it: `Fonts` appends
-    // faces and never reclaims the atlas room a dropped one held, so reopening
-    // on every change would spend both the face budget and the atlas.
+    // **A face is a face at one size**, so this is answered once, when a font
+    // is loaded, and the face does not follow the window afterwards. A
+    // component that wants text to track a scale change hears the change
+    // through `resize` and reopens the face itself. The engine does not do it
+    // for it: `Fonts` appends faces and never reclaims the atlas room a dropped
+    // one held, so reopening on every change would spend both the face budget
+    // and the atlas.
     //
     // What a size out of range becomes, and what every `load` below then answers
     // with, is `pixelsFor`'s to say.
@@ -1598,10 +1622,10 @@ pub const Engine = struct {
         return request.decide();
     }
 
-    // The frame's events, to the UI first and to the driver with what the UI
+    // The frame's events, to the UI first and to the components with what the UI
     // did about it. Called inside the routing pass, which is what makes the
     // second half of that sentence true.
-    fn drainInput(self: *Engine, driver: anytype) !void {
+    fn drainInput(self: *Engine, components: anytype) !void {
         const batch = self.input.takeBatch() catch |err| switch (err) {
             error.InputEventOverflow => {
                 log.warn(
@@ -1623,7 +1647,7 @@ pub const Engine = struct {
         // carries inline. The ring holds them until `releaseBatch`, which is
         // past the routing this loop does.
         for (batch) |*event| {
-            try driver.onEvent(self, event.*, try self.ui.route(event));
+            try callHooks(components, "event", .{ self, event.*, try self.ui.route(event) });
         }
     }
 
@@ -1632,7 +1656,7 @@ pub const Engine = struct {
     // the last submission. A fence covers the submission and not the
     // presentation, so this drains the device instead. Resizing is cold enough
     // to pay for it.
-    fn recreate(self: *Engine, driver: anytype) !void {
+    fn recreate(self: *Engine, components: anytype) !void {
         try self.context.waitIdle();
         try self.swapchain.recreate(self.surface_extent);
 
@@ -1640,10 +1664,10 @@ pub const Engine = struct {
         try self.renderer.resize(.{ .width = target.width, .height = target.height });
         self.swapchain_stale = false;
 
-        // The surface extent and not the target's. A driver lays out an overlay
+        // The surface extent and not the target's. A component lays out an overlay
         // and reads a pointer against the window, both of which the scale does
         // not move.
-        try driver.onResize(self, self.swapchain.currentExtent());
+        try callHooks(components, "resize", .{ self, self.swapchain.currentExtent() });
     }
 };
 

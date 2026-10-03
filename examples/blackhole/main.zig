@@ -305,6 +305,12 @@ const zoom_response: f32 = 12;
 const zoom_snap: f32 = 1e-4;
 
 const Driver = struct {
+    pub const hooks: lenore.Hooks(Driver) = .{
+        .event = onEvent,
+        .update = onUpdate,
+        .record = onRecord,
+    };
+
     effect: *const Effect,
     tier: usize = default_tier,
     spin: f32 = 1,
@@ -474,16 +480,6 @@ const Driver = struct {
             },
         }
     }
-
-    pub fn onResize(_: *Driver, _: *lenore.Engine, _: platform.Extent2D) !void {}
-    pub fn onDepth(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-    pub fn onCompute(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: gpu.vk.CommandBuffer) !void {}
-
-    // Nothing to draw over the picture. The hook is required of every
-
-    // driver, so declining it is a declaration rather than an omission.
-    pub fn onUiRegions(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
-    pub fn onUiDraw(_: *Driver, _: *lenore.Engine, _: *lenore.Level, _: *imui.WidgetContext) !void {}
 
     pub fn onRecord(
         self: *Driver,
@@ -656,5 +652,5 @@ pub fn main(process: std.process.Init.Minimal) !void {
         tiers[tier].windings(),
     });
 
-    try engine.run(&level, &driver);
+    try engine.run(&level, .{&driver});
 }
