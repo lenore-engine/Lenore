@@ -48,7 +48,6 @@ documentation, build tooling.
   `cd lenore-<module> && zig build test`. A module that only builds from the
   umbrella has lost its boundary, and that is a defect on its own.
 - `zig fmt` is the formatter. No other style discussion is needed.
-- Source files start with `// SPDX-License-Identifier: BSD-3-Clause`.
 - Vulkan work is developed with validation layers enabled. A validation error is
   a bug, not a warning.
 - Behaviour that only a GPU can demonstrate is not asserted from a build. Say

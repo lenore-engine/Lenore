@@ -39,23 +39,33 @@ that point remain available under BSD-3-Clause; nothing is withdrawn.
 
 ## Third-party dependencies
 
-Dependencies are consumed unmodified and keep their own licences. Their terms
-are not affected by this file:
+Dependencies keep their own licences. Their terms are not affected by this file.
 
 | Dependency | Licence | Used for |
 |---|---|---|
-| vulkan-zig (Snektron) | MIT, © Robin Voetter | Vulkan bindings generated from `vk.xml` |
+| vulkan-zig | MIT, © Robin Voetter | Vulkan bindings generated from `vk.xml` |
 | zmath (zig-gamedev) | MIT, © 2021 Michal Ziulek, © 2024 zig-gamedev contributors | SIMD math |
-| zglfw (zig-gamedev) | MIT, © 2022 Michal Ziulek | the current platform backend, to be replaced |
-| system_sdk (zig-gamedev) | MIT, © 2021 Michal Ziulek | system libraries zglfw links against |
-| zignal | MIT, © 2024–2026 B Factory Inc, © Zignal Contributors | source PNG decoding in composition tools |
+| zignal | MIT, © 2024–2026 B Factory Inc, © Zignal Contributors | PNG and JPEG decoding of source images |
+| FreeType 2.14.3 | FreeType Licence, chosen over GPLv2 | glyph rasterisation, in `lenore-text` |
+| HarfBuzz 14.3.0 | "Old MIT", as its `COPYING` calls it | text shaping, in `lenore-text` |
+| bc7enc, Richard Geldreich, Jr. | MIT or public domain | BC7 encoding, vendored in `lenore-ktx` |
 
-All five are MIT, whose only condition is that the copyright notice and the
-permission notice travel with copies and substantial portions. Nothing here
-vendors their source, so the obligation is discharged by this table and by the
-`LICENSE` file each package carries in the fetched package directory. MIT
-imposes no term that BSD-3-Clause does not already accept, and none of it
-constrains the intended move to Apache-2.0.
+vulkan-zig and zmath are fetched from forks under `lenore-engine`, each one
+commit over the upstream revision it pins, which builds it on Zig 0.17.0;
+licence and copyright are upstream's. The rest are fetched as released, except bc7enc,
+which `lenore-ktx` vendors unmodified. `lenore-text/NOTICE.md` and
+`lenore-ktx/NOTICE.md` carry the detail for the code those modules compile.
 
-The Vulkan registry (`vk/vk.xml`) is published by The Khronos Group under its
-own terms.
+The MIT-style licences ask that the copyright and permission notices travel with
+copies and substantial portions; each fetched package carries its `LICENSE` and
+this table names them. None of them imposes a term BSD-3-Clause does not already
+accept, and none constrains the intended move to Apache-2.0.
+
+The FreeType Licence asks a program that uses FreeType to say so in its
+documentation, and a build of this engine compiles it:
+
+> Portions of this software are copyright © 2026 The FreeType Project
+> (https://freetype.org). All rights reserved.
+
+The Vulkan registry (`lenore-gpu/vk/vk.xml`) is published by The Khronos Group
+under Apache-2.0 OR MIT, as its own header states.
