@@ -13,7 +13,7 @@ from `lenore-platform`'s native handles.
 | Module | Owns |
 |---|---|
 | `lenore-gpu` | everything that talks to Vulkan: device, swapchain, GPU resources, descriptor layouts, the renderer and its passes |
-| `lenore-scene` | CPU-side scene state and the per-frame math over it: camera, transforms, culling, picking, shadow fit, light and fog descriptions |
+| `lenore-scene` | CPU-side scene state and the per-frame math over it: camera, transforms, culling, picking, shadow fit, light descriptions, exposure |
 | `lenore-resources` | the neutral vocabulary two modules share without naming each other: interchange vertex, bounds, material description, sampler configuration, skeletons, clips, the 2D draw list |
 | `lenore-platform` | window, input, clock and system font lookup, on native Wayland; no graphics API |
 | `lenore-imui` | immediate-mode UI: regions, event routing, drawing into the `lenore-resources` draw list |

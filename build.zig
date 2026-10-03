@@ -123,7 +123,8 @@ pub fn build(b: *std.Build) void {
     // a bare file because an example may bring assets of its own, and the two
     // spellings would otherwise be one name meaning two things.
     const examples_step = b.step("examples", "Build every example");
-    for (directoriesIn(b, "examples")) |name| {
+    const example_names = directoriesIn(b, "examples");
+    for (example_names) |name| {
         const module = b.createModule(.{
             .root_source_file = b.path(b.fmt("examples/{s}/main.zig", .{name})),
             .imports = &imports,
@@ -235,11 +236,17 @@ pub fn build(b: *std.Build) void {
     // suite that passes for having nothing to run rather than for being right.
     // They take an example's own imports, so a file that reaches the engine's
     // ingest types can be tested like one that reaches only `std`.
-    for ([_][]const u8{
-        "examples/mandelbox/reference.zig",
-    }) |path| {
+    //
+    // Named by example, because some examples are kept out of the repository
+    // and a checkout without one has no file to test. Its entry is skipped
+    // with it, which is the same set `examples` builds.
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "mandelbox", "reference.zig" },
+    }) |entry| {
+        const example, const file = entry;
+        if (!isAmong(example_names, example)) continue;
         const module = b.createModule(.{
-            .root_source_file = b.path(path),
+            .root_source_file = b.path(b.fmt("examples/{s}/{s}", .{ example, file })),
             .imports = &imports,
             .target = target,
             .optimize = optimize,
@@ -326,6 +333,13 @@ fn addShaders(b: *std.Build, module: *std.Build.Module, dir_path: []const u8) vo
 
 fn zigFilesIn(b: *std.Build, dir_path: []const u8) [][]const u8 {
     return filesIn(b, dir_path, ".zig");
+}
+
+fn isAmong(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
 }
 
 fn directoriesIn(b: *std.Build, dir_path: []const u8) [][]const u8 {
