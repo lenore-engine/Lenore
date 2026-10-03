@@ -597,13 +597,9 @@ pub fn main(process: std.process.Init.Minimal) !void {
     defer level.deinit(&engine.textures);
 
     var effect = try Effect.init(&engine.context, engine.renderer.mainPassFormats());
-    // Before the engine's own teardown, and after the drain inside it would be
-    // too late: these are destroyed while the device may still be running the
-    // last frame that named them.
-    defer {
-        engine.context.waitIdle() catch {};
-        effect.deinit();
-    }
+    // Before the engine's own teardown, which destroys the device under it.
+    // `run` has drained by the time this runs, however it returned.
+    defer effect.deinit();
 
     var driver: Driver = .{ .effect = &effect, .tier = tier, .spin = spin };
     log.info("{s}", .{usage});

@@ -1058,10 +1058,26 @@ pub const Engine = struct {
         self.exit_requested = true;
     }
 
+    // Runs frames until the window closes or `requestExit`, then drains the
+    // device, and drains it on an error as well. An application's own device
+    // resources may therefore be destroyed as soon as this returns, whichever
+    // way it returned. On an error a failed drain is logged rather than
+    // returned, because the error that ended the loop is the one the caller
+    // has to see.
     pub fn run(self: *Engine, level: *Level, components: anytype) !void {
         comptime checkComponents(@TypeOf(components));
         self.exit_requested = false;
 
+        self.loop(level, components) catch |err| {
+            self.context.waitIdle() catch |drain| {
+                log.err("device did not drain after the loop failed: {t}", .{drain});
+            };
+            return err;
+        };
+        try self.context.waitIdle();
+    }
+
+    fn loop(self: *Engine, level: *Level, components: anytype) !void {
         // One timer for the whole run rather than one per frame. A timer built
         // at the top of a frame cannot measure what happened before it was
         // built, and what happened there is every wait the loop does outside a
@@ -1417,8 +1433,6 @@ pub const Engine = struct {
             self.frame_index = (self.frame_index + 1) % frames_in_flight;
             self.presented_frames += 1;
         }
-
-        try self.context.waitIdle();
     }
 
     // The raster size a face of `logical` units is opened at.
