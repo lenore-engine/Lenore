@@ -97,15 +97,29 @@ p(t) = P · (1 − t/T₊) · exp(−b·t/T₊)        t ≥ 0
 - Charge and barrel: `P, T₊ ∝ (charge)^{1/3} · (L_ref/L)^{0.3}`. A shorter
   barrel leaves more pressure at the muzzle.
 
-The Friedlander front alone is a click: at 1 m its positive phase is under a
-millisecond and almost nothing of it lies below 500 Hz. The body of the blast
-is the barrel emptying. The propellant gas, ~1.5 L at ambient pressure for
-0.35 g of powder at ~1300 K, leaves as a volume flow
-`Q(t) = (V/τ)·(1 − e^{−t/τ_r})·e^{−t/τ}` with `τ ≈ 1.2 ms`, `τ_r ≈ 0.4 ms`,
-and radiates as a monopole, `p = ρ/(4πr) · dQ/dt`: a positive lobe and a
-longer negative one, several hundred pascals at 0.5 m, centred near 150 Hz.
-Front and blowdown together put about a quarter of the blast's energy below
-500 Hz and stretch it to ~2.5 ms, inside the 3–5 ms Maher reports.
+`T₊` defaults to 0.15 ms at 1 m, 90°: Kinney–Graham gives 0.13 ms for the
+pistol's prompt energy (`blast.md`), and a fit to a CZ 75 recording (below)
+prefers 0.07–0.2 ms. With 0.45 ms the blast peaked near 1 kHz and sounded
+dull.
+
+The Friedlander front with `b ≈ 1.8` has almost no negative phase. That
+comes from the barrel emptying. The propellant gas leaves as a volume flow
+`Q(t) = (V/τ)·(1 − e^{−t/τ_r})·e^{−t/τ}` and radiates as a monopole,
+`p = ρ/(4πr) · dQ/dt`: a positive lobe, then a longer negative one.
+
+- `τ ≈ 0.2 ms`, `τ_r ≈ 0.07 ms`. Choked flow through the 9 mm bore at
+  ~400 bar and ~1300 K moves ~3 kg/s, so 0.35 g leaves in a few tenths of a
+  millisecond; the recording fit has its minimum at 0.2 ms. An earlier 1.2 ms
+  put the energy near 150 Hz and made the shot a thud on a table.
+- `V ≈ 0.5 L`: the gas at ambient pressure after expanding adiabatically from
+  the muzzle, ~450 K, not at the 1300 K it leaves at.
+- The free-field monopole overstates a directed, nonlinear jet this close to
+  the muzzle; `blowdown.gain = 0.15` keeps the total peak at ~157 dB at the
+  shooter's ear, against Ylikoski's 154 dB.
+
+At the ear the result is a ~0.1 ms spike to ~1.5 kPa and a ~0.5 ms
+negative lobe of ~−0.3 kPa, its energy peaking near 3 kHz and falling
+~6 dB per octave below 1 kHz, as the first 3 ms of the recording do.
 
 The dry blast near the gun is still a sharp crack with little low end; most of the
 "boom" a listener hears is the ground reflection and the space. Judge the
@@ -268,11 +282,16 @@ shots share a waveform and their differences stay physically consistent.
 A CZ 75 shot outdoors (44.1 kHz stereo, through MP3), measured with
 `python3 -m gunshot.analyze`:
 
-- the recording chain hides the blast: nothing below ~250 Hz (−45 dB), and
-  automatic gain holds the first 110 ms at one level, so the direct front is
-  no louder than the reflections after it (crest factor 9.8 dB over the first
-  50 ms). Neither the front's shape nor the blowdown's low end can be checked
-  against it;
+- the recording chain hides much of the blast: nothing below ~250 Hz
+  (−45 dB), and automatic gain holds the first 110 ms at one level, so the
+  direct front is no louder than the reflections after it (crest factor
+  9.8 dB over the first 50 ms). Its waveform and its low end cannot be
+  checked against it, but its spectral shape above 400 Hz can, window by
+  window, since gain control does not change shape;
+- fitting that shape over 400 Hz–12.5 kHz in four windows (0–3, 0–20,
+  20–100, 100–250 ms) through the same chain: `T₊ = 0.45 ms` and a 1.2 ms
+  blowdown miss by 6.1 dB RMS; `T₊ = 0.07–0.2 ms` and a 0.2 ms blowdown by
+  2.9–3.1 dB. The gas-jet noise's level and centre barely move the fit;
 - what is heard is the space: a dense field from 300 Hz to 5 kHz for
   ~250 ms with the highs dying first, and an echo at 280 ms (a surface
   ~48 m away). The first 3 ms are flat from 1 to 13 kHz: the front;

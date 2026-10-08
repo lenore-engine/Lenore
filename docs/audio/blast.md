@@ -50,10 +50,8 @@ prompt enough to drive the blast:
 - At 1 m, `Z ≈ 31`: Kinney–Graham gives `P ≈ 2.8 kPa`. The model's on-axis
   value at 1 m is 2.5 kPa (1.1 kPa at 90° plus 7 dB). That agrees.
 - The same formula gives `T₊ ≈ 0.13 ms`, against 0.3 ms measured near a 9 mm
-  pistol (Ylikoski) and the model's 0.45 ms. A spherical charge is not a
-  barrel: the jet stretches the blast along the bore and nonlinear
-  propagation lengthens it. The duration is the parameter to fit to
-  recordings.
+  pistol (Ylikoski). A spectral fit to a CZ 75 recording prefers
+  0.07–0.2 ms; the model now uses 0.15 ms, after 0.45 ms proved too dull.
 
 Brode (1955) gives the same peak scaling for `Z = 0.2–2`; Reed's equations
 and ANSI S2.20 extend blast estimation to long range and weather, which
