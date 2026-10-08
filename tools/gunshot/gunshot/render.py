@@ -162,6 +162,8 @@ def main(argv=None):
                     help="fire the shots into one file this far apart, emptying the magazine")
     ap.add_argument("--room", choices=["dry", "ground", "room"], default="dry",
                     help="audition space (not part of the source model)")
+    ap.add_argument("--drive", type=float, default=0.0, metavar="DB",
+                    help="audition: saturate this many dB into tanh, as an overloaded ear or recorder does at 155 dB")
     ap.add_argument("--rate", type=int, default=48000)
     ap.add_argument("--stems", action="store_true", help="also write each layer")
     ap.add_argument("--normalize", action="store_true", help="peak-normalise each file to -1 dBFS")
@@ -196,6 +198,9 @@ def main(argv=None):
     fs = a.rate
 
     def finish(x):
+        if a.drive > 0:
+            g = 10 ** (a.drive / 20)
+            x = np.tanh(g * x) / g
         if a.normalize:
             x = x / (np.max(np.abs(x)) + 1e-20) * 10 ** (-1 / 20)
         return x

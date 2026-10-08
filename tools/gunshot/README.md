@@ -26,10 +26,12 @@ to the bullet leaving the muzzle.
 
 `--room` is for listening only and is not part of the source model:
 `ground` adds the ground reflection, `room` a small reverberant space.
+`--drive DB` saturates the result as an ear or a recorder overloaded by a
+155 dB peak does; most recorded gunshots carry that overload.
 
 | Preset | |
 |---|---|
-| `game` | mechanism +20 dB, brass +34 dB, so they read under the blast |
+| `game` | mechanism +8 dB, brass +26 dB, so they read under the blast |
 | `downrange` | 15 m downrange, 124 gr +P: the crack before the blast |
 | `bystander` | 8 m to the side |
 | `subsonic` | 147 gr subsonic |

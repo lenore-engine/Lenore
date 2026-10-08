@@ -13,15 +13,17 @@ REF_CHARGE, REF_BARREL = 0.35e-3, 0.117
 # from beam and shell formulas for the CZ 75's steel parts; tune by ear and
 # against recordings. "damped" bodies are held and follow mech.grip_damping.
 BODIES = {
-    "slide":     (True,  [(1150, .035, .5), (2150, .05, 1.), (3400, .04, .6), (5900, .03, .7),
-                          (7900, .02, .4), (11000, .015, .35), (15500, .01, .2)]),
-    "frame":     (True,  [(620, .02, .3), (1350, .025, .8), (2600, .02, .7), (4100, .015, .6),
-                          (6800, .01, .4), (9500, .008, .25)]),
-    "barrel":    (False, [(5200, .06, 1.), (9800, .04, .4), (14300, .03, .5)]),
-    "hammer":    (False, [(4400, .012, 1.), (8800, .008, .6), (13200, .006, .4)]),
-    "trigger":   (True,  [(2900, .01, .6), (6100, .008, .8), (11800, .005, .4)]),
-    "magazine":  (True,  [(240, .03, .4), (1800, .02, .7), (3300, .02, .6), (5200, .012, .4)]),
-    "cartridge": (False, [(7200, .01, .6), (11800, .008, .4)]),
+    # Parts pressed against each other and held in a hand ring briefly: a
+    # struck slide reads as a clack, not as a free bar.
+    "slide":     (True,  [(1150, .010, .5), (2150, .014, 1.), (3400, .012, .6), (5900, .009, .7),
+                          (7900, .007, .4), (11000, .005, .35), (15500, .004, .2)]),
+    "frame":     (True,  [(620, .008, .3), (1350, .009, .8), (2600, .008, .7), (4100, .006, .6),
+                          (6800, .005, .4), (9500, .004, .25)]),
+    "barrel":    (False, [(5200, .018, 1.), (9800, .012, .4), (14300, .009, .5)]),
+    "hammer":    (False, [(4400, .008, 1.), (8800, .006, .6), (13200, .005, .4)]),
+    "trigger":   (True,  [(2900, .006, .6), (6100, .005, .8), (11800, .004, .4)]),
+    "magazine":  (True,  [(240, .02, .4), (1800, .012, .7), (3300, .010, .6), (5200, .008, .4)]),
+    "cartridge": (False, [(7200, .008, .6), (11800, .006, .4)]),
 }
 
 # Which bodies an event rings, with what weight, and the contact time at 5 m/s.
@@ -145,6 +147,8 @@ def muzzle(k, rng, fs, t_arrive, cos_theta, distance, t0) -> list[tuple[int, np.
         fl = dsp.friedlander(peak * 10 ** (k["flash.level_db"] / 20), 2.5 * positive, 1.2, 4 * rise)
         out.append(dsp.render_analytic(fl, t_arrive + k["flash.delay_ms"] * 1e-3 - t0, 20 * positive, fs))
 
+    out.append(dsp.render_analytic(blowdown(k, distance), t_arrive - t0, 12 * k["blowdown.time_ms"] * 1e-3, fs))
+
     dur = k["gas.duration_ms"] * 1e-3
     n = int(6 * dur * fs)
     tt = np.arange(n) / fs
@@ -153,6 +157,24 @@ def muzzle(k, rng, fs, t_arrive, cos_theta, distance, t0) -> list[tuple[int, np.
     jet = peak * 10 ** (jet_db / 20) * env * dsp.shaped_noise(rng, n, fs, k["gas.center_hz"], 1.3)
     out.append((int((t_arrive - t0) * fs), jet))
     return out
+
+
+def blowdown(k, distance):
+    """The barrel emptying: the propellant gas leaves as a volume flow
+    Q(t) = V/τ (1 - e^{-t/τr}) e^{-t/τ}, a monopole p = ρ/(4πr) dQ/dt. Its
+    long positive and negative lobes are the blast's body below ~1 kHz; the
+    shock front alone is only a click."""
+    rho, r_gas, molar = 1.2, 8.314, 0.025
+    volume = k["ammo.charge_mass"] * r_gas * k["blowdown.gas_temperature"] / (P_ATM * molar)
+    tau = k["blowdown.time_ms"] * 1e-3
+    tr = k["blowdown.rise_ms"] * 1e-3
+    q0 = volume / tau
+    scale = k["blowdown.gain"] * rho / (4 * math.pi * max(distance, 0.3))
+
+    def fn(t):
+        # d/dt [(1 - e^{-t/tr}) e^{-t/tau}]
+        return scale * q0 * (np.exp(-t / tr) / tr - (1 - np.exp(-t / tr)) / tau) * np.exp(-t / tau)
+    return fn
 
 
 def bullet_path(k, c):

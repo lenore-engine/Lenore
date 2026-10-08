@@ -97,7 +97,17 @@ p(t) = P · (1 − t/T₊) · exp(−b·t/T₊)        t ≥ 0
 - Charge and barrel: `P, T₊ ∝ (charge)^{1/3} · (L_ref/L)^{0.3}`. A shorter
   barrel leaves more pressure at the muzzle.
 
-The dry blast near the gun is a sharp crack with little low end; most of the
+The Friedlander front alone is a click: at 1 m its positive phase is under a
+millisecond and almost nothing of it lies below 500 Hz. The body of the blast
+is the barrel emptying. The propellant gas, ~1.5 L at ambient pressure for
+0.35 g of powder at ~1300 K, leaves as a volume flow
+`Q(t) = (V/τ)·(1 − e^{−t/τ_r})·e^{−t/τ}` with `τ ≈ 1.2 ms`, `τ_r ≈ 0.4 ms`,
+and radiates as a monopole, `p = ρ/(4πr) · dQ/dt`: a positive lobe and a
+longer negative one, several hundred pascals at 0.5 m, centred near 150 Hz.
+Front and blowdown together put about a quarter of the blast's energy below
+500 Hz and stretch it to ~2.5 ms, inside the 3–5 ms Maher reports.
+
+The dry blast near the gun is still a sharp crack with little low end; most of the
 "boom" a listener hears is the ground reflection and the space. Judge the
 model with `--room ground` or `--room room`, which stand in for propagation.
 
@@ -134,6 +144,10 @@ speed `v` scales the bank by `v`, and its contact time
 half-sine force pulse; a broadband click of one contact length carries the
 attack. Every event names the parts it rings and their weights
 (`sources.EVENTS`).
+
+Decay times are 5–20 ms. The parts press against each other and against a
+hand, so a struck slide is a clack; free-bar decays of 30–60 ms made the
+mechanism sound like two pipes struck together.
 
 | Part | First modes (Hz) | Basis |
 |---|---|---|
