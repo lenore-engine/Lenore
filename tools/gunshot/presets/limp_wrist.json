@@ -1,0 +1,5 @@
+{
+  "_": "A loose grip: the frame recoils with the slide, the cycle slows and the frame rings longer.",
+  "slide.frame_mass": [0.7, 0.1],
+  "mech.grip_damping": [0.5, 0.05]
+}
