@@ -1,0 +1,9 @@
+{
+  "_": "Standing 15 m downrange, 3 degrees off the line of fire, with 124 gr +P: the crack arrives before the blast.",
+  "listener.distance": 15,
+  "listener.azimuth": 3,
+  "ammo.velocity": [375, 8],
+  "ammo.bullet_mass": 0.0080,
+  "ammo.bullet_length": 0.0162,
+  "ammo.charge_mass": [0.40e-3, 0.01e-3]
+}

@@ -1,0 +1,8 @@
+{
+  "_": "147 gr subsonic: no crack at any angle, softer blast, slower slide.",
+  "ammo.velocity": [295, 6],
+  "ammo.bullet_mass": 0.0095,
+  "ammo.bullet_length": 0.0175,
+  "ammo.charge_mass": [0.28e-3, 0.01e-3],
+  "ammo.flash_chance": 0.1
+}
