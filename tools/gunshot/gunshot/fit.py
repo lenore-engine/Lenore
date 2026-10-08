@@ -33,10 +33,12 @@ FIT = {
     "env.far_rt": (0.3, 6, True),
     "rec.clip_db": (115, 145, False),
     "rec.highpass_hz": (20, 400, True),
+    "rec.highpass_order": (1, 4, False),
     "rec.agc_threshold_db": (60, 130, False),
     "rec.agc_ratio": (1.5, 50, True),
     "rec.agc_window_ms": (0.5, 50, True),
     "rec.agc_release": (20, 3000, True),
+    "rec.agc_lookahead_ms": (0, 5, False),
 }
 
 

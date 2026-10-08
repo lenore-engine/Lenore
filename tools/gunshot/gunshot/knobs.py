@@ -106,12 +106,14 @@ KNOBS: dict[str, Knob] = {
     "env.far_rt": K(2.0, 0.0, 0.1, 10, "s", "its RT60"),
     # --- receiver: what records the shot (fitted to a phone) ----------------
     "rec.clip_db": K(118.0, 0.0, 90, 200, "dB SPL", "microphone overload: the pressure is soft-clipped about here"),
-    "rec.highpass_hz": K(150.0, 0.0, 0, 1000, "Hz", "2nd-order high-pass of the microphone and its pipeline"),
-    "rec.lowpass_hz": K(16000.0, 0.0, 1000, 24000, "Hz", "8th-order low-pass: the codec's band limit"),
+    "rec.highpass_hz": K(150.0, 0.0, 0, 1000, "Hz", "Butterworth high-pass of the microphone and its pipeline"),
+    "rec.highpass_order": K(1.0, 0.0, 1, 4, "×2", "its order in 2nd-order sections"),
+    "rec.lowpass_hz": K(16000.0, 0.0, 1000, 24000, "Hz", "the codec's band limit (a brick wall)"),
     "rec.agc_threshold_db": K(100.0, 0.0, 40, 160, "dB SPL", "level the gain control holds the signal to"),
     "rec.agc_ratio": K(10.0, 0.0, 1, 100, ":1", "compression above the threshold; 1 = no gain control"),
     "rec.agc_window_ms": K(3.0, 0.0, 0.1, 100, "ms", "RMS window of its level detector"),
     "rec.agc_release": K(500.0, 0.0, 1, 1e4, "dB/s", "how fast its gain climbs back after the blast"),
+    "rec.agc_lookahead_ms": K(1.0, 0.0, 0, 10, "ms", "how early it sees what is coming: with none, the blast's first spike gets through"),
     # --- mix ----------------------------------------------------------------
     "mix.blast_db": K(0.0, 0.0, -80, 40, "dB", "artistic gain on blast + gas + flash"),
     "mix.nwave_db": K(0.0, 0.0, -80, 40, "dB", "artistic gain on the ballistic crack"),

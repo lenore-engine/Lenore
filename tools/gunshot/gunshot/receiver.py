@@ -39,21 +39,25 @@ def butterworth(F, fs, kind, f0, order):
     return H
 
 
-def band_limit(x, fs, hp, hp_order, lp, lp_order):
+def band_limit(x, fs, hp, hp_order, lp):
+    """Causal Butterworth high-pass; the codec's cut is a brick wall, as an
+    MP3 or AAC encoder's filter bank is: a 0.5 kHz transition, zero phase."""
     n = 1 << int(math.ceil(math.log2(len(x) + fs * 0.1)))
     F = np.fft.rfftfreq(n, 1 / fs)
     H = np.ones(len(F), complex)
     if hp > 0:
         H *= butterworth(F, fs, "high", hp, hp_order)
     if 0 < lp < 0.5 * fs:
-        H *= butterworth(F, fs, "low", lp, lp_order)
+        H *= np.clip((lp + 250 - F) / 500, 0, 1)
     return np.fft.irfft(np.fft.rfft(x, n) * H, n)[:len(x)]
 
 
-def agc_gain(x, fs, threshold_db, ratio, window_ms, release_db_s):
+def agc_gain(x, fs, threshold_db, ratio, window_ms, release_db_s, lookahead_ms):
     """Gain of an automatic gain control: RMS level over ``window_ms``,
-    instant attack, a release that climbs ``release_db_s`` dB per second,
-    and ``ratio``:1 compression of whatever lies above the threshold."""
+    instant attack ``lookahead_ms`` early (a recorder's limiter delays the
+    signal to catch its own transients), a release that climbs
+    ``release_db_s`` dB per second, and ``ratio``:1 compression of whatever
+    lies above the threshold."""
     n = max(1, int(window_ms * 1e-3 * fs))
     c = np.concatenate([[0.0], np.cumsum(x * x)])
     ms = (c[n:] - c[:-n]) / n
@@ -63,6 +67,9 @@ def agc_gain(x, fs, threshold_db, ratio, window_ms, release_db_s):
     # Peak hold falling at release_db_s: max over s <= t of level(s) - R (t - s).
     held = np.maximum.accumulate(level + release_db_s * t) - release_db_s * t
     over = np.maximum(held - threshold_db, 0.0)
+    ahead = int(lookahead_ms * 1e-3 * fs)
+    if ahead:
+        over = np.concatenate([over[ahead:], np.full(ahead, over[-1])])
     return 10 ** (-over * (1 - 1 / ratio) / 20)
 
 
@@ -72,10 +79,10 @@ def process(x_pa: np.ndarray, fs, k, gain=None):
     ride the mix's gain); returns the output and the gain curve."""
     clip = P0 * 10 ** (k["rec.clip_db"] / 20)
     y = clip * np.tanh(x_pa / clip)
-    y = band_limit(y, fs, k["rec.highpass_hz"], 2, k["rec.lowpass_hz"], 8)
+    y = band_limit(y, fs, k["rec.highpass_hz"], 2 * int(round(k["rec.highpass_order"])), k["rec.lowpass_hz"])
     if gain is None:
         gain = agc_gain(y, fs, k["rec.agc_threshold_db"], k["rec.agc_ratio"],
-                        k["rec.agc_window_ms"], k["rec.agc_release"])
+                        k["rec.agc_window_ms"], k["rec.agc_release"], k["rec.agc_lookahead_ms"])
     return y * gain, gain
 
 

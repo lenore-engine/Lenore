@@ -63,30 +63,36 @@ def band_split(n: int, fs: float, centres: np.ndarray):
 CENTRES = 1000 * 2.0 ** np.arange(-4, 5)  # 62.5 Hz .. 16 kHz octaves
 
 
-def diffuse(rng, n, fs, c, level_db, rt, rt_hf, build, lo_hz, tilt, air_db_m, start=0.0):
+def diffuse(rng, n, fs, c, level_db, rt, rt_hf, build, lo_hz, tilt, air, start=0.0):
     """A diffuse field: noise whose every octave builds up over ``build`` s,
     decays with its own RT60 and loses what the air takes over the path c*t.
-    Scaled so that its energy gain at 1 kHz is ``level_db`` (times the
-    spectral weight: 12 dB/oct below ``lo_hz``, ``tilt`` dB/oct above 1 kHz)."""
+
+    ``level_db`` is the energy gain at 1 kHz, before the air. The other
+    octaves start at the same density times the spectral weight (12 dB/oct
+    below ``lo_hz``, ``tilt`` dB/oct above 1 kHz); a shorter decay or the air
+    leaves them less energy, as it does in the field."""
     F, W = band_split(n, fs, CENTRES)
     t = np.maximum(np.arange(n) / fs - start, 0.0)
     on = np.arange(n) / fs >= start
+    build_up = on * (1 - np.exp(-t / max(build, 1e-4)))
+    # Unit noise times the 1 kHz envelope carries this much energy (s).
+    ref_energy = np.sum((build_up * np.exp(-6.9 * t / rt)) ** 2) / fs
     white = np.fft.rfft(rng.standard_normal(n))
-    absorb = air_absorption(CENTRES, *air_db_m)
+    absorb = air_absorption(CENTRES, *air)
     h = np.zeros(n)
     for i, fc in enumerate(CENTRES):
         if fc > 0.45 * fs:
             break
         band_rt = rt * (1000 / fc) ** rt_hf if fc > 1000 else rt
-        env = on * (1 - np.exp(-t / max(build, 1e-4))) * np.exp(-6.9 * t / band_rt)
-        env *= 10 ** (-absorb[i] * c * (t + start) / 20)
+        env = build_up * np.exp(-6.9 * t / band_rt) * 10 ** (-absorb[i] * c * (t + start) / 20)
         band = np.fft.irfft(white * W[i], n)
         band /= np.sqrt(np.mean(band ** 2)) + 1e-30
         weight = 10 ** (tilt * math.log2(max(fc, 1000) / 1000) / 10) / (1 + (lo_hz / fc) ** 4)
-        # Energy gain of band-limited unit noise times env, per Hz of band.
+        # Energy gain of band-limited unit noise times an envelope, per Hz
+        # of band: scaled on the 1 kHz envelope so the decay and the air
+        # are not normalised away.
         bw = fc * (2 ** 0.5 - 2 ** -0.5)
-        energy = np.sum(env ** 2) / fs
-        h += band * env * math.sqrt(10 ** (level_db / 10) * weight * 2 * bw / (energy * fs * fs + 1e-30))
+        h += band * env * math.sqrt(10 ** (level_db / 10) * weight * 2 * bw / (ref_energy * fs * fs + 1e-30))
     return h
 
 
