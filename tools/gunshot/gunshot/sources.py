@@ -26,23 +26,29 @@ BODIES = {
     "cartridge": (False, [(7200, .008, .6), (11800, .006, .4)]),
 }
 
-# Which bodies an event rings, with what weight, and the contact time at 5 m/s.
+# Which bodies an event rings, with what weight, the contact time at 5 m/s,
+# and the mass whose momentum the impact stops (kg, estimates). The sound of
+# an impact scales with that momentum: a 4 g trigger bar letting go is not a
+# 300 g slide hitting the frame at the same speed.
 EVENTS = {
-    "sear_release":   ([("hammer", .15), ("trigger", .3)], 30e-6),
-    "hammer_strike":  ([("hammer", 1.), ("slide", .4), ("frame", .3)], 40e-6),
-    "fire_jolt":      ([("barrel", 1.), ("slide", .6), ("frame", .5)], 150e-6),
-    "barrel_unlock":  ([("barrel", .8), ("frame", .5)], 60e-6),
-    "hammer_cock":    ([("hammer", .6), ("frame", .4)], 40e-6),
-    "eject":          ([("frame", .4), ("slide", .3)], 40e-6),
-    "rear_stop":      ([("slide", 1.), ("frame", .9)], 70e-6),
-    "mag_bump":       ([("magazine", 1.)], 80e-6),
-    "feed_ramp":      ([("barrel", .5), ("cartridge", .6)], 50e-6),
-    "barrel_pickup":  ([("barrel", .5), ("slide", .3)], 60e-6),
-    "extractor_snap": ([("slide", .3), ("cartridge", .2)], 30e-6),
-    "battery":        ([("slide", 1.), ("barrel", .7), ("frame", .8)], 60e-6),
-    "slide_lock":     ([("slide", 1.), ("frame", .9)], 60e-6),
-    "trigger_reset":  ([("trigger", 1.), ("frame", .2)], 30e-6),
+    "sear_release":   ([("hammer", .15), ("trigger", .3)], 30e-6, 0.005),
+    "hammer_strike":  ([("hammer", 1.), ("slide", .4), ("frame", .3)], 40e-6, 0.025),
+    # The powder pushes for the bullet's whole barrel time, ~0.5 ms: a slow
+    # force that rings the low modes, not a contact.
+    "fire_jolt":      ([("barrel", 1.), ("slide", .6), ("frame", .5)], 400e-6, 0.375),
+    "barrel_unlock":  ([("barrel", .8), ("frame", .5)], 60e-6, 0.075),
+    "hammer_cock":    ([("hammer", .6), ("frame", .4)], 40e-6, 0.025),
+    "eject":          ([("frame", .4), ("slide", .3)], 40e-6, 0.012),
+    "rear_stop":      ([("slide", 1.), ("frame", .9)], 70e-6, 0.30),
+    "mag_bump":       ([("magazine", 1.)], 80e-6, 0.03),
+    "feed_ramp":      ([("barrel", .5), ("cartridge", .6)], 50e-6, 0.012),
+    "barrel_pickup":  ([("barrel", .5), ("slide", .3)], 60e-6, 0.075),
+    "extractor_snap": ([("slide", .3), ("cartridge", .2)], 30e-6, 0.004),
+    "battery":        ([("slide", 1.), ("barrel", .7), ("frame", .8)], 60e-6, 0.375),
+    "slide_lock":     ([("slide", 1.), ("frame", .9)], 60e-6, 0.30),
+    "trigger_reset":  ([("trigger", 1.), ("frame", .2)], 30e-6, 0.004),
 }
+REF_MOMENTUM = 0.30 * 5.0  # the slide at 5 m/s: what mech.ref_pa describes
 
 SURFACE_MODES = {
     "concrete": [],
@@ -53,6 +59,13 @@ SURFACE_MODES = {
 }
 
 
+# Modes per kHz beyond the tabulated ones. A 4 mm steel plate the size of the
+# slide has one bending mode every ~600 Hz; the table holds the strongest few,
+# and with only those a struck part rings like a tuned bar instead of a clack.
+DENSITY = {"slide": 1.6, "frame": 1.8, "barrel": 0.5, "hammer": 0.4, "trigger": 0.5,
+           "magazine": 1.2, "cartridge": 0.3}
+
+
 class Gun:
     """One physical pistol: its parts' modes, detuned once by the gun seed so
     that two pistols of the same model do not ring identically."""
@@ -61,6 +74,15 @@ class Gun:
         self.bodies = {}
         for name, (damped, modes) in BODIES.items():
             m = np.array(modes, dtype=float)
+            # Fill in the dense modes: uniform in frequency (constant modal
+            # density), weaker than the tabulated ones, with the part's
+            # median loss factor so they die at the same rate per cycle.
+            eta = np.median(1 / (np.pi * m[:, 0] * m[:, 1]))
+            count = int(DENSITY[name] * (17000 - m[0, 0]) / 1000)
+            f = gun_rng.uniform(m[0, 0], 17000, count)
+            g = 0.4 * np.interp(f, m[:, 0], m[:, 2]) * np.exp(0.5 * gun_rng.standard_normal(count))
+            tau = 1 / (np.pi * f * eta) * np.exp(0.3 * gun_rng.standard_normal(count))
+            m = np.vstack([m, np.column_stack([f, tau, g])])
             m[:, 0] *= 1.0 + 0.03 * gun_rng.standard_normal(len(m))
             m[:, 1] *= np.exp(0.2 * gun_rng.standard_normal(len(m)))
             m[:, 2] *= np.exp(0.15 * gun_rng.standard_normal(len(m)))
@@ -77,10 +99,10 @@ class Gun:
 
 def mech_event(name: str, v: float, gun: Gun, k, rng, fs) -> np.ndarray:
     """Pressure at 1 m of one mechanical impact."""
-    parts, contact5 = EVENTS[name]
+    parts, contact5, mass = EVENTS[name]
     v = max(abs(v), 0.05)
     contact = contact5 * (v / 5.0) ** -0.2  # Hertz: faster impacts are shorter
-    amp = k["mech.ref_pa"] * v / 5.0
+    amp = k["mech.ref_pa"] * mass * v / REF_MOMENTUM
     longest = max(gun.bodies[p][1][:, 1].max() for p, _ in parts)
     length = min(0.5, 6.0 * longest + 0.005)
     out = np.zeros(int(length * fs))
@@ -100,7 +122,7 @@ def da_pull(k, gun, rng, fs) -> np.ndarray:
     T = k["trigger.da_pull_time"]
     n = int(T * fs)
     env = np.linspace(0.3, 1.0, n) * np.sin(np.pi * np.linspace(0, 1, n)) ** 0.3
-    out = 0.04 * k["mech.ref_pa"] * env * dsp.shaped_noise(rng, n, fs, 3500, 1.0)
+    out = 0.003 * k["mech.ref_pa"] * env * dsp.shaped_noise(rng, n, fs, 3500, 1.0)
     for frac in (rng.uniform(.15, .3), rng.uniform(.6, .8)):
         s = mech_event("trigger_reset", .4, gun, k, rng, fs)
         dsp.add(out, int(frac * n), s)

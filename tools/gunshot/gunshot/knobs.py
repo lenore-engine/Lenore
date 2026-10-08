@@ -25,6 +25,7 @@ K = Knob
 KNOBS: dict[str, Knob] = {
     # --- environment and listener -------------------------------------------
     "air.temperature": K(20.0, 0.0, -40, 50, "°C", "air temperature; sets the speed of sound and so whether the bullet is supersonic"),
+    "air.humidity": K(50.0, 0.0, 1, 100, "%", "relative humidity; with temperature, how fast the air takes the highs off every reflection"),
     "listener.distance": K(0.45, 0.0, 0.1, 500, "m", "muzzle to listener"),
     "listener.azimuth": K(140.0, 0.0, 0, 180, "deg", "0 = straight downrange, 90 = beside the line of fire, 180 = behind the muzzle"),
     "listener.height": K(1.6, 0.0, 0.1, 10, "m", "listener above the ground (casing and ground reflection)"),
@@ -77,7 +78,7 @@ KNOBS: dict[str, Knob] = {
     "impact.battery_restitution": K(0.12, 0.03, 0, 0.9, "", "slide into battery restitution"),
     "magazine.rounds": K(15.0, 0.0, 0, 16, "", "rounds left in the magazine after this shot is chambered; 0 locks the slide back"),
     # --- mechanical sound ---------------------------------------------------
-    "mech.ref_pa": K(8.0, 0.0, 0.01, 1000, "Pa", "peak pressure at 1 m of a 5 m/s steel impact"),
+    "mech.ref_pa": K(8.0, 0.0, 0.01, 1000, "Pa", "peak pressure at 1 m of the slide (0.3 kg) hitting steel at 5 m/s; other impacts scale with their momentum"),
     "mech.grip_damping": K(1.0, 0.1, 0.2, 5, "×", "multiplies the decay rate of frame and slide modes (a firm grip damps them)"),
     "mech.detune": K(0.012, 0.0, 0, 0.1, "", "per-shot random detune of each mode (relative)"),
     "mech.rail_noise_db": K(-30.0, 2.0, -80, 0, "dB", "rail sliding noise relative to the impacts"),
@@ -90,6 +91,27 @@ KNOBS: dict[str, Knob] = {
     "case.ref_pa": K(0.6, 0.0, 0.001, 100, "Pa", "peak at 1 m of a 3 m/s casing impact on a hard floor"),
     "case.roll_time": K(0.6, 0.25, 0, 3, "s", "how long the casing rolls after it stops bouncing (hard surfaces)"),
     "surface.kind": K(0.0, 0.0, 0, 4, "enum", "0 concrete, 1 tile, 2 wood, 3 dirt, 4 steel plate"),
+    # --- environment (fitted to a CZ 75 recorded outdoors at ~0.5 m) --------
+    "env.ground_kpa": K(300.0, 0.0, 0, 1e5, "kPa·s/m²", "ground flow resistivity: ~200 grass, ~2000 packed dirt, 2e4+ asphalt or concrete; 0 = no ground"),
+    "env.near_db": K(-6.0, 0.0, -99, 20, "dB", "scattered field near the shooter (trees, berms, walls): energy at 1 kHz re the free-field source at 1 m"),
+    "env.near_rt": K(0.6, 0.0, 0.05, 6, "s", "its RT60 at 1 kHz before the air takes its share"),
+    "env.near_rt_hf": K(0.3, 0.0, 0, 2, "", "RT60 shortens as (1 kHz / f) to this power above 1 kHz (foliage, soft ground)"),
+    "env.near_build_ms": K(5.0, 0.0, 0.1, 300, "ms", "how long the scattered field takes to build up"),
+    "env.near_lo_hz": K(250.0, 0.0, 10, 2000, "Hz", "below this the scatterers are small against the wavelength: the field falls 12 dB/oct"),
+    "env.near_tilt": K(-3.0, 0.0, -12, 6, "dB/oct", "spectral tilt of the scattered field above 1 kHz"),
+    "env.echo_delay": K(0.625, 0.0, 0, 3, "s", "delay of the strongest distant return (a treeline or hill at c·t/2); 0 = none"),
+    "env.echo_db": K(-30.0, 0.0, -99, 10, "dB", "its energy re the free-field source at 1 m"),
+    "env.echo_width_ms": K(35.0, 0.0, 1, 300, "ms", "its spread: a face of scattered trees returns a burst, a wall a click"),
+    "env.far_db": K(-26.0, 0.0, -99, 10, "dB", "terrain rolling the shot on after the echo, energy re the source at 1 m"),
+    "env.far_rt": K(2.0, 0.0, 0.1, 10, "s", "its RT60"),
+    # --- receiver: what records the shot (fitted to a phone) ----------------
+    "rec.clip_db": K(118.0, 0.0, 90, 200, "dB SPL", "microphone overload: the pressure is soft-clipped about here"),
+    "rec.highpass_hz": K(150.0, 0.0, 0, 1000, "Hz", "2nd-order high-pass of the microphone and its pipeline"),
+    "rec.lowpass_hz": K(16000.0, 0.0, 1000, 24000, "Hz", "8th-order low-pass: the codec's band limit"),
+    "rec.agc_threshold_db": K(100.0, 0.0, 40, 160, "dB SPL", "level the gain control holds the signal to"),
+    "rec.agc_ratio": K(10.0, 0.0, 1, 100, ":1", "compression above the threshold; 1 = no gain control"),
+    "rec.agc_window_ms": K(3.0, 0.0, 0.1, 100, "ms", "RMS window of its level detector"),
+    "rec.agc_release": K(500.0, 0.0, 1, 1e4, "dB/s", "how fast its gain climbs back after the blast"),
     # --- mix ----------------------------------------------------------------
     "mix.blast_db": K(0.0, 0.0, -80, 40, "dB", "artistic gain on blast + gas + flash"),
     "mix.nwave_db": K(0.0, 0.0, -80, 40, "dB", "artistic gain on the ballistic crack"),

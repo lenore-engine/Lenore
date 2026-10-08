@@ -5,7 +5,10 @@
 For each shot: peak, clipping, rise time, positive-phase duration, the
 envelope peaks after the blast (the mechanism's events), high-band ticks
 later on (the brass), the decay of the space, and the 1/3-octave spectrum of
-the first 5 ms and of the whole shot.
+the first 5 ms and of the whole shot. With --synth, also how far the render
+is from the recording: the mean dB difference of their 1/3-octave levels in
+10 ms frames over the first 1.4 s, levels matched, which is what
+gunshot.fit minimises.
 """
 
 import argparse
@@ -152,6 +155,56 @@ def measure(x, fs, i0, length):
     }
 
 
+BAND_CENTRES = 1000 * 2.0 ** (np.arange(-10, 13) / 3)  # 100 Hz .. 16 kHz
+
+
+def bandgram(x, fs, start, hop=0.01, length=1.4, pre=0.005):
+    """1/3-octave levels (dB) in ``hop`` frames from ``pre`` before ``start``."""
+    a = start - int(pre * fs)
+    x = np.concatenate([np.zeros(max(-a, 0)), x[max(a, 0):]])
+    n_total = int((length + pre) * fs)
+    x = np.pad(x[:n_total], (0, max(0, n_total - len(x))))
+    n = int(hop * fs)
+    win = 2 * n
+    frames = np.lib.stride_tricks.sliding_window_view(np.pad(x, (n // 2, win)), win)[::n][:n_total // n]
+    power = np.abs(np.fft.rfft(frames * np.hanning(win), axis=1)) ** 2
+    f = np.fft.rfftfreq(win, 1 / fs)
+    centres = BAND_CENTRES[BAND_CENTRES < 0.45 * fs]
+    m = np.array([(f >= c / 2 ** (1 / 6)) & (f < c * 2 ** (1 / 6)) for c in centres], float)
+    return 10 * np.log10(m @ power.T + 1e-30)
+
+
+def distance(ref, synth, floor=45.0):
+    """Mean |dB| between two bandgrams after matching their total levels.
+    Both are floored ``floor`` dB under the recording's loudest cell, so its
+    noise floor does not count."""
+    bands = min(len(ref), len(synth))
+    ref, synth = ref[:bands], synth[:bands]
+    ref = ref - 10 * np.log10(np.sum(10 ** (ref / 10)))
+    synth = synth - 10 * np.log10(np.sum(10 ** (synth / 10)))
+    low = ref.max() - floor
+    return np.abs(np.maximum(ref, low) - np.maximum(synth, low))
+
+
+WINDOWS_MS = [(0, 3), (3, 20), (20, 100), (100, 250), (250, 700), (700, 1400)]
+
+
+def score(d, hop_ms=10):
+    """The windows' mean differences, and their mean: each window counts the
+    same, so the first 20 ms weigh as much as the last 700."""
+    per = [d[:, lo // hop_ms:max(hi // hop_ms, lo // hop_ms + 1)].mean() for lo, hi in WINDOWS_MS]
+    return float(np.mean(per)), per
+
+
+def crest_kurtosis(x, fs, start):
+    """Crest factor (dB) of the first 50 ms and kurtosis of the first 250 ms:
+    how much the blast stands out of its tail, and how clipped the tail is."""
+    a = x[start:start + int(0.05 * fs)]
+    b = x[start:start + int(0.25 * fs)]
+    crest = 20 * np.log10(np.abs(a).max() / (np.sqrt(np.mean(a * a)) + 1e-30))
+    return crest, float(np.mean(b ** 4) / (np.mean(b * b) ** 2 + 1e-30))
+
+
 def report(name, fs, shots):
     print(f"== {name}: {fs} Hz, {len(shots)} shot(s)")
     for k, m in enumerate(shots):
@@ -184,6 +237,15 @@ def main(argv=None):
         shots = [measure(x, fs, i, a.length) for i in onsets(x, fs)]
         report(path, fs, shots)
         sets.append((path, x, fs, onsets(x, fs), shots))
+
+    if a.synth and all(s[3] for s in sets):
+        (_, x0, fs0, on0, _), (_, x1, fs1, on1, _) = sets
+        total, per = score(distance(bandgram(x0, fs0, on0[0]), bandgram(x1, fs1, on1[0])))
+        per = " ".join(f"{lo}-{hi} ms {v:.1f}" for (lo, hi), v in zip(WINDOWS_MS, per))
+        c0, k0 = crest_kurtosis(x0, fs0, on0[0])
+        c1, k1 = crest_kurtosis(x1, fs1, on1[0])
+        print(f"== distance: {total:.2f} dB, mean |dB| of 1/3 octaves x 10 ms by window ({per})")
+        print(f"   crest 50 ms {c0:.1f} / {c1:.1f} dB, kurtosis 250 ms {k0:.2f} / {k1:.2f} (recording / render)")
 
     if a.plot:
         import matplotlib

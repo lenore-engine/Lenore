@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import dsp, knobs, mechanism, sources
+from . import dsp, environment, knobs, mechanism, receiver, sources
 
 STEMS = ("blast", "nwave", "mech", "case")
 
@@ -73,9 +73,16 @@ def shot(k: dict, gun: sources.Gun, rng, fs: float) -> tuple[dict, dict]:
 
     gains = {"blast": k["mix.blast_db"], "nwave": k["mix.nwave_db"],
              "mech": k["mix.mech_db"], "case": k["mix.case_db"]}
-    fsc = k["mix.full_scale_pa"]
     for s in STEMS:
-        stems[s] *= 10 ** (gains[s] / 20) / fsc
+        stems[s] *= 10 ** (gains[s] / 20)
+    # Each stem's distance back to 1 m, for feeding the space; the blast's
+    # also undoes its directivity toward the listener, since the space hears
+    # the gun from every side.
+    d = k["blast.directivity_db"] * math.log(10) / 10
+    mean_dir_db = 10 * math.log10(math.sinh(d) / d) if d > 0 else 0.0
+    d_case = math.dist(bounces[0].pos, listener) if bounces else d_mech
+    feed = {"blast": d_muzzle * 10 ** ((mean_dir_db - k["blast.directivity_db"] * cos_theta) / 20),
+            "nwave": d_muzzle, "mech": d_mech, "case": d_case}
 
     log = {
         "t0": t0,
@@ -83,6 +90,8 @@ def shot(k: dict, gun: sources.Gun, rng, fs: float) -> tuple[dict, dict]:
         "mach": cy.bullet_velocity / c,
         "muzzle_exit": cy.t_exit,
         "listener": listener,
+        "muzzle": muzzle,
+        "feed": feed,
         "blast_peak_pa": sources.blast_level(k, cos_theta, d_muzzle)[0],
         "nwave": nw is not None,
         "events": [{"t": e.t, "name": e.name, "v": e.v} for e in cy.events],
@@ -93,69 +102,33 @@ def shot(k: dict, gun: sources.Gun, rng, fs: float) -> tuple[dict, dict]:
     return stems, log
 
 
-def room(x: np.ndarray, kind: str, k, fs, rng) -> np.ndarray:
-    """Audition only: a stand-in for the propagation engine, so a dry source
-    can be judged in a plausible space. Not part of the source model."""
-    if kind == "dry":
-        return x
-    if kind == "ground":
-        muzzle, listener = geometry(k)
-        image = (muzzle[0], muzzle[1], -muzzle[2])
-        d1, d2 = math.dist(muzzle, listener), math.dist(image, listener)
-        lag = int((d2 - d1) / 343.0 * fs)
-        y = x.copy()
-        y[lag:] += 0.8 * (d1 / d2) * x[:len(x) - lag]
-        return y
-    if kind == "room":
-        # Octave bands of noise, each decaying at its own rate: air and
-        # surfaces take the highs first. Shaped on a covered CZ 75 recording
-        # whose reverberant field carried 300 Hz-5 kHz for ~250 ms.
-        rt60, n = 0.45, int(1.2 * fs)
-        t = np.arange(n) / fs
-        ir = np.zeros(n)
-        for fc in (125, 250, 500, 1000, 2000, 4000, 8000, 16000):
-            if fc > 0.45 * fs:
-                break
-            rt = rt60 * min(1.0, (4000 / fc) ** 0.3)
-            ir += dsp.shaped_noise(rng, n, fs, fc, 0.5) * np.exp(-6.9 * t / rt)
-        ir *= 0.012 * (1 - np.exp(-t / 0.004))  # the field builds up over a few ms
-        ir[0] = 1.0
-        for lag, g in ((0.004, 0.5), (0.009, 0.35), (0.017, 0.3), (0.28, 0.08)):
-            ir[int(lag * fs)] += g
-        size = len(x) + n
-        return np.fft.irfft(np.fft.rfft(x, size) * np.fft.rfft(ir, size), size)
-    raise ValueError(kind)
+def place(stems: dict, k, log, fs, rng) -> dict:
+    """Put each stem in the space: the direct sound, its ground image, and
+    the scattered field fed by the stem at 1 m. Pascals at the listener."""
+    c = log["speed_of_sound"]
+    h = environment.impulse_response(k, fs, rng, c)
+    out = {}
+    for name, x in stems.items():
+        if not np.any(x):
+            out[name] = np.zeros(len(x) + len(h) - 1)
+            continue
+        y = environment.convolve(x * log["feed"][name], h)
+        if name != "case":  # the casing lies on the ground already
+            y[:len(x)] += environment.ground(x, fs, k, c, log["muzzle"], log["listener"])
+        y[:len(x)] += x
+        out[name] = y
+    return out
 
 
-def recorder(x: np.ndarray, fs: float, squash_db: float) -> np.ndarray:
-    """Audition only: a phone or camera. High-pass at 150 Hz, MP3-like
-    cut at 16 kHz, and an automatic gain control that holds the blast
-    ``squash_db`` under its natural peak and lets the tail come up behind it."""
-    n = len(x)
-    # Causal 2nd-order Butterworth high-pass at 150 Hz: a zero-phase one
-    # would smear the low end ahead of the front.
-    k = np.tan(np.pi * 150.0 / fs)
-    q = 1 / np.sqrt(2)
-    norm = 1 / (1 + k / q + k * k)
-    b0, b1, b2 = norm, -2 * norm, norm
-    a1, a2 = 2 * (k * k - 1) * norm, (1 - k / q + k * k) * norm
-    y = np.empty(n)
-    x1 = x2 = y1 = y2 = 0.0
-    for i, v in enumerate(x):
-        out = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
-        x2, x1, y2, y1 = x1, v, y1, out
-        y[i] = out
-    spec = np.fft.rfft(y)
-    f = np.fft.rfftfreq(n, 1 / fs)
-    spec *= 1 / np.sqrt(1 + (f / 16000.0) ** 24)
-    x = np.fft.irfft(spec, n)
-    thr = np.max(np.abs(x)) * 10 ** (-squash_db / 20)
-    rel = np.exp(-1 / (0.12 * fs))
-    env, gain = 0.0, np.empty(n)
-    for i, v in enumerate(np.abs(x)):
-        env = v if v > env else env * rel  # instant attack, slow release
-        gain[i] = min(1.0, thr / (env + 1e-20))
-    return x * gain
+def trim(x: np.ndarray, fs, floor_db=-90.0) -> np.ndarray:
+    """Cut the silent end, with a short fade."""
+    a = np.abs(x)
+    loud = np.flatnonzero(a > a.max() * 10 ** (floor_db / 20))
+    end = min(len(x), (loud[-1] if len(loud) else 0) + int(0.05 * fs))
+    y = x[:end].copy()
+    fade = min(end, int(0.02 * fs))
+    y[end - fade:] *= np.linspace(1, 0, fade)
+    return y
 
 
 def write_wav(path: Path, x: np.ndarray, fs: int, pcm16: bool) -> None:
@@ -198,12 +171,12 @@ def main(argv=None):
     ap.add_argument("--fixed", action="store_true", help="zero every spread: the knobs exactly as set")
     ap.add_argument("--sequence", type=float, metavar="SECONDS",
                     help="fire the shots into one file this far apart, emptying the magazine")
-    ap.add_argument("--room", choices=["dry", "ground", "room"], default="dry",
-                    help="audition space (not part of the source model)")
+    ap.add_argument("--env", choices=list(environment.ENVIRONMENTS), default="range",
+                    help="the space around the shot (default: the outdoor range of the reference recording)")
+    ap.add_argument("--receiver", choices=list(receiver.RECEIVERS) + ["none"], default="phone",
+                    help="what hears it: a phone (fitted), an ear for a game mix, or none (pressure, 1.0 = mix.full_scale_pa)")
     ap.add_argument("--drive", type=float, default=0.0, metavar="DB",
-                    help="audition: saturate this many dB into tanh, as an overloaded ear or recorder does at 155 dB")
-    ap.add_argument("--recorder", type=float, metavar="DB",
-                    help="audition: a phone's high-pass, MP3 band limit and AGC squashing the blast by DB")
+                    help="saturate this many dB into tanh after the receiver")
     ap.add_argument("--rate", type=int, default=48000)
     ap.add_argument("--stems", action="store_true", help="also write each layer")
     ap.add_argument("--normalize", action="store_true", help="peak-normalise each file to -1 dBFS")
@@ -214,7 +187,9 @@ def main(argv=None):
     if a.list:
         print(knobs.describe())
         return
-    values, spreads = {}, {}
+    values, spreads = dict(environment.ENVIRONMENTS[a.env]), {}
+    if a.receiver != "none":
+        values.update(receiver.RECEIVERS[a.receiver])
     for p in a.preset or []:
         data = json.loads(Path(p).read_text())
         for key, val in data.items():
@@ -237,15 +212,32 @@ def main(argv=None):
     gun = sources.Gun(np.random.default_rng(a.gun_seed))
     fs = a.rate
 
-    def finish(x):
-        if a.recorder:
-            x = recorder(x, fs, a.recorder)
-        if a.drive > 0:
-            g = 10 ** (a.drive / 20)
-            x = np.tanh(g * x) / g
+    def hear(mix, stems, k):
+        """Receiver, drive and normalisation; stems ride the mix's gain."""
+        if a.receiver == "none":
+            scale, gain = 1 / k["mix.full_scale_pa"], None
+            mix = mix * scale
+            stems = {name: x * scale for name, x in stems.items()}
+        else:
+            # The threshold's RMS level is written at -14 dBFS.
+            scale = 10 ** (-14 / 20) / (receiver.P0 * 10 ** (k["rec.agc_threshold_db"] / 20))
+            mix, gain = receiver.process(mix, fs, k)
+            mix = mix * scale
+            stems = {name: receiver.process(x, fs, k, gain)[0] * scale for name, x in stems.items()}
+        n = len(trim(mix, fs))
+        result = [mix] + list(stems.values())
+        for i, x in enumerate(result):
+            x = x[:n].copy()
+            fade = min(n, int(0.02 * fs))
+            x[n - fade:] *= np.linspace(1, 0, fade)
+            if a.drive > 0:
+                g = 10 ** (a.drive / 20)
+                x = np.tanh(g * x) / g
+            result[i] = x
         if a.normalize:
-            x = x / (np.max(np.abs(x)) + 1e-20) * 10 ** (-1 / 20)
-        return x
+            peak = np.max(np.abs(result[0])) + 1e-20
+            result = [x / peak * 10 ** (-1 / 20) for x in result]
+        return result[0], dict(zip(stems, result[1:]))
 
     if a.sequence:
         rounds = values.get("magazine.rounds", knobs.KNOBS["magazine.rounds"].default)
@@ -259,7 +251,8 @@ def main(argv=None):
                 vi["trigger.double_action"] = 0.0
             k = knobs.draw(rng, vi, spreads)
             stems, log = shot(k, gun, rng, fs)
-            parts.append((i * hop, sum(stems.values()), log["t0"]))
+            placed = place(stems, k, log, fs, rng)
+            parts.append((i * hop, sum(placed.values()), log["t0"]))
             logs.append(log)
             if vi["magazine.rounds"] == 0:
                 break
@@ -268,9 +261,8 @@ def main(argv=None):
         mix = np.zeros(n)
         for p, x, t0 in parts:
             dsp.add(mix, p + int((lead + t0) * fs), x)
-        mix = room(mix, a.room, knobs.draw(np.random.default_rng(0), values, {}), fs,
-                   np.random.default_rng(a.seed))
-        write_wav(out / "sequence.wav", finish(mix), fs, a.pcm16)
+        mix, _ = hear(mix, {}, knobs.draw(np.random.default_rng(0), values, {}))
+        write_wav(out / "sequence.wav", mix, fs, a.pcm16)
         (out / "sequence.json").write_text(json.dumps(logs, indent=1))
         report(logs)
         return
@@ -279,11 +271,11 @@ def main(argv=None):
         rng = np.random.default_rng([a.seed, i])
         k = knobs.draw(rng, values, spreads)
         stems, log = shot(k, gun, rng, fs)
-        mix = room(sum(stems.values()), a.room, k, fs, rng)
-        write_wav(out / f"shot_{i:03}.wav", finish(mix), fs, a.pcm16)
-        if a.stems:
-            for name, x in stems.items():
-                write_wav(out / f"shot_{i:03}_{name}.wav", finish(room(x, a.room, k, fs, rng)), fs, a.pcm16)
+        placed = place(stems, k, log, fs, rng)
+        mix, placed = hear(sum(placed.values()), placed if a.stems else {}, k)
+        write_wav(out / f"shot_{i:03}.wav", mix, fs, a.pcm16)
+        for name, x in placed.items():
+            write_wav(out / f"shot_{i:03}_{name}.wav", x, fs, a.pcm16)
         (out / f"shot_{i:03}.json").write_text(json.dumps(log, indent=1))
         report([log])
 
