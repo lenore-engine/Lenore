@@ -177,7 +177,11 @@ f_n = (1/2π) · (h/R²) · √(E / 12ρ(1−ν²)) · n(n²−1)/√(n²+1)
 ```
 
 give ≈ 8.5 kHz for `n = 2` and 2.83× that for `n = 3`; the model adds an
-axial mode at 1.58×. `Q ≈ 900` in free air gives a ~30 ms ring. Mouth hits
+axial mode at 1.58×. A recording of a CZ 75 outdoors measures the first mode
+at 10.84–10.87 kHz across three cases (the short case is stiffer than a long
+shell) and its decay at ~220 dB/s, `τ ≈ 40 ms`, `Q ≈ 1300`; the model uses
+those. The higher modes lie above that recording's 16 kHz MP3 limit and are
+still the formula's. Mouth hits
 ring fully; base hits are duller.
 
 Flight is ballistic from the ejection port (3.6 m/s, 40° up, 100° right of the
@@ -258,6 +262,31 @@ shots share a waveform and their differences stay physically consistent.
   <https://www.gun-tests.com/handguns/cz-75-b-sa-9mm/>.
 - Cyclic rate of the Glock 18, ~1200 rounds per minute (≈50 ms per shot), as an
   upper bound on a pistol's slide cycle.
+
+## Against a recording
+
+A CZ 75 shot outdoors (44.1 kHz stereo, through MP3), measured with
+`python3 -m gunshot.analyze`:
+
+- the recording chain hides the blast: nothing below ~250 Hz (−45 dB), and
+  automatic gain holds the first 110 ms at one level, so the direct front is
+  no louder than the reflections after it (crest factor 9.8 dB over the first
+  50 ms). Neither the front's shape nor the blowdown's low end can be checked
+  against it;
+- what is heard is the space: a dense field from 300 Hz to 5 kHz for
+  ~250 ms with the highs dying first, and an echo at 280 ms (a surface
+  ~48 m away). The first 3 ms are flat from 1 to 13 kHz: the front;
+- the brass lands 0.86 s after the shot and again 0.40 s later; the model's
+  flight gives 0.8–0.9 s for the first landing. Its ring is the one
+  measurement taken into the model (above);
+- the mechanism cannot be separated from the reflections in 4–60 ms.
+
+`--recorder 20 --room room` renders through a stand-in for that chain and
+that space, so a render and the recording can be compared on equal terms.
+Calibrating the blast and the mechanism needs recordings made for it:
+manual gain with 20 dB of headroom, lossless, a known distance and angle in
+open ground, plus dry fire, a hand-racked slide and cases dropped on concrete
+recorded close and separately.
 
 ## What is not known yet
 

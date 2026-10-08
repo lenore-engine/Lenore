@@ -29,6 +29,19 @@ to the bullet leaving the muzzle.
 `--drive DB` saturates the result as an ear or a recorder overloaded by a
 155 dB peak does; most recorded gunshots carry that overload.
 
+`--recorder DB` passes the result through a phone or camera: a 150 Hz
+high-pass, an MP3-like 16 kHz limit, and gain control holding the blast DB
+under its peak. Use it with `--room room` to compare against a recording made
+that way.
+
+```sh
+python3 -m gunshot.analyze real.wav --synth out/shot_000.wav --plot cmp.png
+```
+
+measures each shot in a recording and in a render the same way: peak,
+clipping, rise, positive phase, envelope, brass ticks, decay and 1/3-octave
+spectra over the first 5 ms and the whole shot.
+
 | Preset | |
 |---|---|
 | `game` | mechanism +8 dB, brass +26 dB, so they read under the blast |

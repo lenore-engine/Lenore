@@ -107,17 +107,55 @@ def room(x: np.ndarray, kind: str, k, fs, rng) -> np.ndarray:
         y[lag:] += 0.8 * (d1 / d2) * x[:len(x) - lag]
         return y
     if kind == "room":
-        rt60, n = 0.7, int(1.2 * fs)
+        # Octave bands of noise, each decaying at its own rate: air and
+        # surfaces take the highs first. Shaped on a covered CZ 75 recording
+        # whose reverberant field carried 300 Hz-5 kHz for ~250 ms.
+        rt60, n = 0.45, int(1.2 * fs)
         t = np.arange(n) / fs
-        lo = dsp.shaped_noise(rng, n, fs, 400, 1.5) * np.exp(-6.9 * t / rt60)
-        hi = dsp.shaped_noise(rng, n, fs, 4000, 1.5) * np.exp(-6.9 * t / (0.5 * rt60))
-        ir = (lo + 0.5 * hi) * 0.02
+        ir = np.zeros(n)
+        for fc in (125, 250, 500, 1000, 2000, 4000, 8000, 16000):
+            if fc > 0.45 * fs:
+                break
+            rt = rt60 * min(1.0, (4000 / fc) ** 0.3)
+            ir += dsp.shaped_noise(rng, n, fs, fc, 0.5) * np.exp(-6.9 * t / rt)
+        ir *= 0.012 * (1 - np.exp(-t / 0.004))  # the field builds up over a few ms
         ir[0] = 1.0
-        ir[int(0.004 * fs)] += 0.5
-        ir[int(0.009 * fs)] += 0.35
+        for lag, g in ((0.004, 0.5), (0.009, 0.35), (0.017, 0.3), (0.28, 0.08)):
+            ir[int(lag * fs)] += g
         size = len(x) + n
         return np.fft.irfft(np.fft.rfft(x, size) * np.fft.rfft(ir, size), size)
     raise ValueError(kind)
+
+
+def recorder(x: np.ndarray, fs: float, squash_db: float) -> np.ndarray:
+    """Audition only: a phone or camera. High-pass at 150 Hz, MP3-like
+    cut at 16 kHz, and an automatic gain control that holds the blast
+    ``squash_db`` under its natural peak and lets the tail come up behind it."""
+    n = len(x)
+    # Causal 2nd-order Butterworth high-pass at 150 Hz: a zero-phase one
+    # would smear the low end ahead of the front.
+    k = np.tan(np.pi * 150.0 / fs)
+    q = 1 / np.sqrt(2)
+    norm = 1 / (1 + k / q + k * k)
+    b0, b1, b2 = norm, -2 * norm, norm
+    a1, a2 = 2 * (k * k - 1) * norm, (1 - k / q + k * k) * norm
+    y = np.empty(n)
+    x1 = x2 = y1 = y2 = 0.0
+    for i, v in enumerate(x):
+        out = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        x2, x1, y2, y1 = x1, v, y1, out
+        y[i] = out
+    spec = np.fft.rfft(y)
+    f = np.fft.rfftfreq(n, 1 / fs)
+    spec *= 1 / np.sqrt(1 + (f / 16000.0) ** 24)
+    x = np.fft.irfft(spec, n)
+    thr = np.max(np.abs(x)) * 10 ** (-squash_db / 20)
+    rel = np.exp(-1 / (0.12 * fs))
+    env, gain = 0.0, np.empty(n)
+    for i, v in enumerate(np.abs(x)):
+        env = v if v > env else env * rel  # instant attack, slow release
+        gain[i] = min(1.0, thr / (env + 1e-20))
+    return x * gain
 
 
 def write_wav(path: Path, x: np.ndarray, fs: int, pcm16: bool) -> None:
@@ -164,6 +202,8 @@ def main(argv=None):
                     help="audition space (not part of the source model)")
     ap.add_argument("--drive", type=float, default=0.0, metavar="DB",
                     help="audition: saturate this many dB into tanh, as an overloaded ear or recorder does at 155 dB")
+    ap.add_argument("--recorder", type=float, metavar="DB",
+                    help="audition: a phone's high-pass, MP3 band limit and AGC squashing the blast by DB")
     ap.add_argument("--rate", type=int, default=48000)
     ap.add_argument("--stems", action="store_true", help="also write each layer")
     ap.add_argument("--normalize", action="store_true", help="peak-normalise each file to -1 dBFS")
@@ -198,6 +238,8 @@ def main(argv=None):
     fs = a.rate
 
     def finish(x):
+        if a.recorder:
+            x = recorder(x, fs, a.recorder)
         if a.drive > 0:
             g = 10 ** (a.drive / 20)
             x = np.tanh(g * x) / g
