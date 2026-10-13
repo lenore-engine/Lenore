@@ -20,6 +20,10 @@ const shaders = @import("shaders.zig");
 const translate = @import("translate.zig");
 const ui = @import("ui.zig");
 const camera_control = @import("camera_control.zig");
+const console = @import("console.zig");
+const debug_overlay = @import("debug_overlay.zig");
+const journal = @import("journal.zig");
+const link = @import("link.zig");
 const frame_log = @import("frame_log.zig");
 const world = @import("world.zig");
 
@@ -67,6 +71,21 @@ pub const uiScale = translate.uiScale;
 
 pub const UiHost = ui.Host;
 pub const WidgetCapacity = ui.Capacity;
+
+// Debug tools an application drives from its own UI hooks.
+pub const Console = console.Console;
+pub const DebugOverlay = debug_overlay.DebugOverlay;
+pub const DebugLines = debug_overlay.Lines;
+pub const DebugOverlaySide = debug_overlay.Side;
+
+// A host and a client in one process, and the record that replays a run.
+pub const Pipe = link.Pipe;
+pub const Link = link.Link;
+pub const Journal = journal.Journal;
+pub const JournalEntry = journal.Entry;
+pub const JournalRun = journal.Run;
+pub const JournalParseError = journal.ParseError;
+pub const JournalWriteError = journal.WriteError;
 
 pub const Fonts = font.Fonts;
 pub const FontCapacity = font.Capacity;

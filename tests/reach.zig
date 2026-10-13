@@ -53,4 +53,13 @@ test "the device-facing surface is compiled" {
     _ = &lenore.Level.openEnvironment;
     _ = &lenore.Level.uploadLightmap;
     _ = &lenore.Level.install;
+
+    // The debug tools lay themselves out against the swapchain and shape with
+    // the engine's fonts. Their state is tested on the host in
+    // `tests/console.zig`; these compile the halves that need a window.
+    _ = &lenore.Console.init;
+    _ = &lenore.Console.regions;
+    _ = &lenore.Console.draw;
+    _ = &lenore.DebugOverlay.init;
+    _ = &lenore.DebugOverlay.draw;
 }
