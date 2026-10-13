@@ -22,3 +22,6 @@
 [submodule "lenore-text"]
 	path = lenore-text
 	url = https://github.com/lenore-engine/lenore-text.git
+[submodule "lenore-fps"]
+	path = lenore-fps
+	url = https://github.com/lenore-engine/lenore-fps.git

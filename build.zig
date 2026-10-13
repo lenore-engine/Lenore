@@ -25,6 +25,11 @@ pub fn build(b: *std.Build) void {
     // a KTX2 image it is handed, which is format support rather than policy.
     const ktx = b.dependency("lenore_ktx", .{ .target = target, .optimize = optimize });
     const ktx_import: std.Build.Module.Import = .{ .name = "lenore-ktx", .module = ktx.module("lenore-ktx") };
+    // A genre module: first-person movement and weapon handling. Nothing in
+    // `src/` imports it; it is here to be re-exported to the games and the
+    // examples, like the converter above.
+    const fps = b.dependency("lenore_fps", .{ .target = target, .optimize = optimize });
+    const fps_import: std.Build.Module.Import = .{ .name = "lenore-fps", .module = fps.module("lenore-fps") };
     const gltf = b.dependency("lenore_gltf", .{ .target = target, .optimize = optimize });
     const gltf_import: std.Build.Module.Import = .{ .name = "lenore-gltf", .module = gltf.module("lenore-gltf") };
     const resources = b.dependency("lenore_resources", .{ .target = target, .optimize = optimize });
@@ -79,6 +84,7 @@ pub fn build(b: *std.Build) void {
     // `addModule` is exactly this put, so nothing here is a private mechanism;
     // what it adds is that the module already exists and must not be recreated.
     for ([_]std.Build.Module.Import{
+        fps_import,
         gltf_import,
         gpu_import,
         imui_import,
@@ -107,6 +113,7 @@ pub fn build(b: *std.Build) void {
     // is its `tests/reach.zig`, not an example.
     const imports = [_]std.Build.Module.Import{
         engine_import,
+        fps_import,
         gltf_import,
         ktx_import,
         gpu_import,
@@ -242,6 +249,7 @@ pub fn build(b: *std.Build) void {
     // with it, which is the same set `examples` builds.
     for ([_]struct { []const u8, []const u8 }{
         .{ "mandelbox", "reference.zig" },
+        .{ "fps_range", "range.zig" },
     }) |entry| {
         const example, const file = entry;
         if (!isAmong(example_names, example)) continue;
