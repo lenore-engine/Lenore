@@ -20,6 +20,7 @@ const shaders = @import("shaders.zig");
 const translate = @import("translate.zig");
 const ui = @import("ui.zig");
 const camera_control = @import("camera_control.zig");
+const frame_log = @import("frame_log.zig");
 const world = @import("world.zig");
 
 pub const Engine = engine.Engine;
@@ -33,6 +34,7 @@ pub const FlyCamera = camera_control.FlyCamera;
 pub const OrbitCamera = camera_control.OrbitCamera;
 pub const MouseLook = camera_control.MouseLook;
 pub const MoveKeys = camera_control.MoveKeys;
+pub const FrameLog = frame_log.FrameLog;
 pub const Sun = engine.Sun;
 pub const FramePhases = time.FramePhases;
 pub const ShadowBakeRequest = engine.ShadowBakeRequest;

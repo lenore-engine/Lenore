@@ -7,8 +7,8 @@ const platform = @import("lenore-platform");
 const log = std.log.scoped(.minimal);
 
 // The smallest application that draws a model: a window, one glTF file, one
-// light, the engine's orbiting camera and one component of its own. Every
-// other example has this shape and adds what it demonstrates.
+// light, the engine's orbiting camera, its frame report and one component of
+// its own. Every other example has this shape and adds what it demonstrates.
 //
 // Usage: run-minimal -- <model.glb>
 //
@@ -92,6 +92,7 @@ pub fn main(process: std.process.Init.Minimal) !void {
     // order. `run` returns with the device drained, so the defers above may
     // destroy what they own at once.
     var orbit: lenore.OrbitCamera = .{};
+    var report: lenore.FrameLog = .{};
     var quit: Quit = .{};
-    try engine.run(&level, .{ &orbit, &quit });
+    try engine.run(&level, .{ &orbit, &report, &quit });
 }
