@@ -91,7 +91,7 @@ test "an image is claimed by every slot that names it, once each" {
     };
     const model = modelWith(&images, &materials);
 
-    var loader = try lenore.ImageLoader.init(allocator, &model);
+    var loader = try lenore.ImageLoader.init(allocator, &model, "");
     defer loader.deinit(allocator);
 
     try testing.expectEqual(@as(usize, 3), loader.uses[0].count());
@@ -111,7 +111,7 @@ test "an image nothing names is claimed by nothing" {
     var materials = [_]res.MaterialInfo{material(.{ .base_colour = slotWith("used") })};
     const model = modelWith(&images, &materials);
 
-    var loader = try lenore.ImageLoader.init(allocator, &model);
+    var loader = try lenore.ImageLoader.init(allocator, &model, "");
     defer loader.deinit(allocator);
 
     // A count of zero is what makes the load pass skip it entirely, so an
@@ -127,7 +127,7 @@ test "a material naming an image the document does not carry is refused" {
     const model = modelWith(&images, &materials);
 
     // Before a device exists, which is the point of answering it here.
-    try testing.expectError(error.ImageNotFound, lenore.ImageLoader.init(allocator, &model));
+    try testing.expectError(error.ImageNotFound, lenore.ImageLoader.init(allocator, &model, ""));
 }
 
 test "a slot whose image was never uploaded is refused rather than left neutral" {
@@ -137,7 +137,7 @@ test "a slot whose image was never uploaded is refused rather than left neutral"
     var materials = [_]res.MaterialInfo{material(.{ .base_colour = slotWith("named") })};
     const model = modelWith(&images, &materials);
 
-    var loader = try lenore.ImageLoader.init(allocator, &model);
+    var loader = try lenore.ImageLoader.init(allocator, &model, "");
     defer loader.deinit(allocator);
 
     // Nothing has been loaded, so the slot has no resident image behind it. A
@@ -186,7 +186,7 @@ test "a report sized for the wrong document is refused before the device is touc
     var materials = [_]res.MaterialInfo{material(.{})};
     const model = modelWith(&images, &materials);
 
-    var loader = try lenore.ImageLoader.init(testing.allocator, &model);
+    var loader = try lenore.ImageLoader.init(testing.allocator, &model, "");
     defer loader.deinit(testing.allocator);
 
     var records = [_]lenore.ImageRecord{.{}};

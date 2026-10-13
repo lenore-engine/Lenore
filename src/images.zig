@@ -280,8 +280,24 @@ pub const ImageLoader = struct {
     // resident image it produced lands in `bound` under the same slot.
     uses: []std.EnumSet(gpu.MaterialSlot),
     bound: []std.EnumArray(gpu.MaterialSlot, ?gpu.ResidentTexture),
+    // Put in front of every image key this loader hands the texture cache, and
+    // empty for none. Borrowed; read only while `load` runs.
+    //
+    // The cache is shared by every model resident at once and a key is only
+    // unique inside its own document: an embedded image is keyed by its index
+    // in the document, so two GLB files both hold an `embedded:0`, and two
+    // directories may each hold a `base.png`. The cache answers a second
+    // request under one key with the first image, or with `KeyConflict` when
+    // the two differ in format or extent, so two models resident together need
+    // keys that cannot meet. What tells them apart is the
+    // caller's to say, as cache identity is everywhere else.
+    namespace: []const u8 = "",
 
-    pub fn init(allocator: Allocator, model: *const gltf.importer.Model) !ImageLoader {
+    pub fn init(
+        allocator: Allocator,
+        model: *const gltf.importer.Model,
+        namespace: []const u8,
+    ) !ImageLoader {
         const uses = try allocator.alloc(std.EnumSet(gpu.MaterialSlot), model.images.len);
         errdefer allocator.free(uses);
         @memset(uses, .empty);
@@ -303,7 +319,7 @@ pub const ImageLoader = struct {
                 }
             }
         }
-        return .{ .uses = uses, .bound = bound };
+        return .{ .uses = uses, .bound = bound, .namespace = namespace };
     }
 
     pub fn deinit(self: *ImageLoader, allocator: Allocator) void {
@@ -348,7 +364,7 @@ pub const ImageLoader = struct {
             // the caller put in the model, which is what lets a converted asset
             // tree and a source one go through the same load.
             if (gpu.isKtx2(bytes)) {
-                try self.uploadResident(index, bytes, batch, model, report);
+                try self.uploadResident(allocator, index, bytes, batch, model, report);
                 continue;
             }
 
@@ -372,6 +388,7 @@ pub const ImageLoader = struct {
     // that shows a distinct image with no decode is telling the truth about it.
     fn uploadResident(
         self: *ImageLoader,
+        allocator: Allocator,
         index: usize,
         bytes: []const u8,
         batch: *gpu.UploadBatch,
@@ -383,8 +400,10 @@ pub const ImageLoader = struct {
         record.width = 0;
         record.height = 0;
 
+        const key = try self.cacheKey(allocator, model, index);
+        defer if (self.namespace.len > 0) allocator.free(key);
         const request: gpu.TextureRequest = .{
-            .key = model.images[index].key,
+            .key = key,
             .source = .{ .ktx2 = bytes },
         };
         inline for (decoded_slots) |which| {
@@ -437,8 +456,10 @@ pub const ImageLoader = struct {
             record.alpha_high = @max(record.alpha_high, texel.a);
         }
 
+        const key = try self.cacheKey(allocator, model, index);
+        defer if (self.namespace.len > 0) allocator.free(key);
         const request: gpu.TextureRequest = .{
-            .key = model.images[index].key,
+            .key = key,
             .source = .{ .raw = .{
                 .width = produced.image.cols,
                 .height = produced.image.rows,
@@ -451,6 +472,20 @@ pub const ImageLoader = struct {
             if (self.uses[index].contains(which))
                 self.bound[index].set(which, (try batch.addTexture(which, request)).resident());
         }
+    }
+
+    // The key an image is cached under. The batch keeps its own copy of what it
+    // is handed, so a namespaced key lives only as long as the request does; the
+    // caller frees it when `namespace` is not empty.
+    fn cacheKey(
+        self: *const ImageLoader,
+        allocator: Allocator,
+        model: *const gltf.importer.Model,
+        index: usize,
+    ) ![]const u8 {
+        const key = model.images[index].key;
+        if (self.namespace.len == 0) return key;
+        return allocator.print("{s}:{s}", .{ self.namespace, key });
     }
 
     // What a material's slot binds: the image this loader already uploaded,

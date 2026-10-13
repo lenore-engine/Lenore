@@ -31,7 +31,48 @@ pub const WorldError = error{
     EmptySkin,
     JointIndexOutOfRange,
     AnchoredMeshWithoutAnimator,
+    PropWithoutGeometry,
+    PropNotRigid,
+    PropCountMismatch,
+    TooManyMaterials,
+    NoSuchProp,
 };
+
+// A model drawn at a matrix the application sets every frame: a held weapon, a
+// moving crate, another player's figure.
+//
+// It shares everything with the model it is drawn beside. Its draws join that
+// model's plan, so one ordering puts a blended prop in the same back-to-front
+// run as the level's glass and one visible prefix serves the camera. Its
+// materials follow the level's in the one table the renderer indexes, and its
+// meshes are in the instance ring `FrameCapacity` bounds. Two plans could do
+// neither: the renderer takes one batch list with one visible count.
+//
+// Rigid, and refused otherwise by `checkProp`. The world's animators belong to
+// the level model: an anchor slot, a skin and a morph template are indices into
+// that model's arrays, and a second model's would need its own. A prop moves as
+// a whole by its placement.
+pub const PropSource = struct {
+    // Read only by `World.init`, which keeps nothing of it. The resident
+    // meshes below are kept, as the level model's are.
+    model: *const gltf.importer.Model,
+    // The model's meshes made resident, in model order.
+    meshes: []const *const gpu.Mesh,
+};
+
+// What a prop's model is refused for. Asked before a device is reached, so the
+// refusal is cheap, and again by `World.init`, which is the one that relies on
+// it.
+pub fn checkProp(model: *const gltf.importer.Model) WorldError!void {
+    if (model.meshes.len == 0) return error.PropWithoutGeometry;
+    if (model.node_animation != null or model.skins.len > 0 or model.morph_templates.len > 0)
+        return error.PropNotRigid;
+    for (model.meshes) |*mesh| {
+        if (mesh.anchor != null or mesh.skin != null or mesh.morph != null or mesh.streams.skinned)
+            return error.PropNotRigid;
+        if (mesh.material >= model.materials.len) return error.MaterialIndexOutOfRange;
+    }
+}
 
 // The one definition of a draw's object-to-world transform. Everything that
 // needs it comes through here: the instance record the shader reads, the depth
@@ -88,9 +129,11 @@ pub const Skeleton = struct {
 // Nothing here allocates. Every buffer belongs to the `World` that owns the
 // plan, which is what lets this sit in the frame loop.
 pub const DrawPlan = struct {
-    // In mesh order. Everything but `front_face` is settled when the level is
-    // built; that one follows the sign of the instance matrix and is rewritten
-    // every frame beside the matrix it comes from.
+    // In mesh order: the level model's meshes, then every prop's. Everything
+    // but `front_face` is settled when the level is built; that one follows the
+    // sign of the instance matrix and is rewritten every frame beside the
+    // matrix it comes from. `material` is the index into the whole table, a
+    // prop's already offset past the materials before it.
     candidates: []RecordPlan.Draw,
     // The centre of each draw in the space its instance matrix maps from. A
     // skinned mesh carries its bind placement here instead, because its instance
@@ -101,6 +144,9 @@ pub const DrawPlan = struct {
     // `worldAabb`, which is exact for any linear map where scaling a radius is
     // an underestimate under shear.
     local_bounds: []const res.Aabb,
+    // Where each prop's draws sit in the arrays here, in prop order, after the
+    // level model's meshes. Planned once, like everything else in this group.
+    prop_runs: []const Run,
     // Whether a mesh's box describes where its vertices are this frame. False
     // for a skinned or morphed mesh, whose box is its bind pose while the
     // vertices have moved, and such a mesh is never culled.
@@ -137,28 +183,46 @@ pub const DrawPlan = struct {
     // the whole scene rather than around what is on screen.
     visible_records: usize = 0,
 
+    pub const Run = struct {
+        first: u32,
+        count: u32,
+    };
+
+    // `meshes` are the level model's, and `prop_placements` holds one matrix
+    // per entry of `prop_runs`.
     pub fn rebuild(
         self: *DrawPlan,
         meshes: []const gltf.importer.Mesh,
         animator: ?*const res.NodeAnimator,
         placement: zm.Mat,
+        prop_placements: []const zm.Mat,
         eye: res.Vec3,
         view_projection: zm.Mat,
     ) !void {
+        const level_draws = if (self.prop_runs.len > 0) self.prop_runs[0].first else self.matrices.len;
+        if (meshes.len != level_draws) return error.MeshCountMismatch;
+        if (prop_placements.len != self.prop_runs.len) return error.PropCountMismatch;
+
         // One extraction for the whole list, because the camera is a property of
         // the frame and not of a draw.
         const frustum: scene.Frustum = .fromViewProj(view_projection);
 
+        for (meshes, self.matrices[0..meshes.len]) |*mesh, *matrix| {
+            matrix.* = instanceMatrix(mesh.anchor, animator, placement);
+        }
+        // A prop is rigid, so every draw of it takes its placement unchanged.
+        for (self.prop_runs, prop_placements) |run, prop| {
+            @memset(self.matrices[run.first..][0..run.count], prop);
+        }
+
         for (
-            meshes,
             self.centres,
             self.local_bounds,
             self.cullable,
             self.matrices,
             self.keys,
             self.candidates,
-        ) |*mesh, centre, bounds, cullable, *matrix, *key, *candidate| {
-            matrix.* = instanceMatrix(mesh.anchor, animator, placement);
+        ) |centre, bounds, cullable, matrix, *key, *candidate| {
             // glTF 2.0, section 3.7.4: the determinant of the node's global
             // transform decides the winding. The importer settled the part it
             // baked into the vertices, so what is left is exactly this matrix,
@@ -168,16 +232,16 @@ pub const DrawPlan = struct {
             // A skinned draw's joint matrices can mirror it again per vertex,
             // which no plan can answer for. That is why such a draw keeps its
             // culling off rather than being trusted to one winding.
-            candidate.front_face = if (zm.determinant(matrix.*)[0] < 0)
+            candidate.front_face = if (zm.determinant(matrix)[0] < 0)
                 .clockwise
             else
                 .counter_clockwise;
-            key.depth = scene.depthOf(eye, placePoint(centre, matrix.*));
+            key.depth = scene.depthOf(eye, placePoint(centre, matrix));
             // The box is carried into world space rather than the frustum into
             // the mesh's: six planes against one box either way, and this
             // direction needs no inverse.
             key.visible = !cullable or
-                frustum.intersectsAabb(scene.worldAabb(bounds, matrix.*));
+                frustum.intersectsAabb(scene.worldAabb(bounds, matrix));
         }
 
         // Every draw, with the visible ones first. The culled half is kept
@@ -190,7 +254,7 @@ pub const DrawPlan = struct {
             instance.* = .{
                 .model = gpu.mat4(self.matrices[draw_index]),
                 .joint_base = translate.jointBase(self.joint_bases[draw_index]),
-                .material_index = meshes[draw_index].material,
+                .material_index = self.candidates[draw_index].material,
             };
         }
 
@@ -252,8 +316,9 @@ pub const World = struct {
     node_animator: ?res.NodeAnimator,
     morph_animators: []res.MorphAnimator,
     morph_ready: usize,
-    // Which prepass registration each mesh draws through, by mesh index. Null is
-    // a mesh with no shape targets, which is every mesh of most assets.
+    // Which prepass registration each draw reads through, by mesh index across
+    // the level model and the props. Null is a mesh with no shape targets,
+    // which is every mesh of most assets and every mesh of a prop.
     morph_registrations: []?u32,
 
     plan: DrawPlan,
@@ -267,8 +332,21 @@ pub const World = struct {
     // instance matrix composes against, and only one order is correct.
     placement: zm.Mat,
 
-    // The bind pose's extent, which is what a camera frames on and a shadow fit
-    // is built from. An animation can carry a draw outside it.
+    // Where each prop stands, in the order the props were given. Identity until
+    // `placeProp` says otherwise.
+    prop_placements: []zm.Mat,
+    // Whether a placement has changed since `update` last took them, and
+    // whether one had when it did. Two flags because the frame that reads the
+    // second is the one `update` built: a prop placed from a component's
+    // `update` hook moves in that frame, and the shadow decision is taken after
+    // `update` has run.
+    props_moved: bool,
+    props_moved_in_frame: bool,
+
+    // The level model's bind pose, which is what a camera frames on and a
+    // shadow fit is built from. An animation can carry a draw outside it. No
+    // prop is in it, because a prop has no extent until it is placed, so a prop
+    // carried outside this sphere is outside the sun's fit as well.
     bounds: res.Aabb,
     sphere: res.Sphere,
 
@@ -283,12 +361,11 @@ pub const World = struct {
         // document, so the same index is the same authored animation in both.
         // Morph templates are the exception and are described at `playClip`.
         clip: ?u16 = 0,
+        // Drawn beside the model, each at the matrix `placeProp` last gave it.
+        // Their materials follow the model's in the table, in this order.
+        props: []const PropSource = &.{},
     };
 
-    // Everything an asset got wrong is answered here, once, before a frame is
-    // ever built. Past this point the per-frame path carries no check on
-    // document data at all: a joint index, an anchor slot and a material index
-    // are all indices into arrays this has already measured.
     // A world with nothing in it, for an application whose picture is not made
     // of meshes.
     //
@@ -319,6 +396,7 @@ pub const World = struct {
                 .candidates = &.{},
                 .centres = &.{},
                 .local_bounds = &.{},
+                .prop_runs = &.{},
                 .cullable = &.{},
                 .joint_bases = &.{},
                 .matrices = &.{},
@@ -332,11 +410,18 @@ pub const World = struct {
             .joint_storage = &.{},
             .joint_total = 0,
             .placement = zm.identity(),
+            .prop_placements = &.{},
+            .props_moved = false,
+            .props_moved_in_frame = false,
             .bounds = .{ .min = @splat(0), .max = @splat(0) },
             .sphere = .{ .centre = @splat(0), .radius = 0 },
         };
     }
 
+    // Everything an asset got wrong is answered here, once, before a frame is
+    // ever built. Past this point the per-frame path carries no check on
+    // document data at all: a joint index, an anchor slot and a material index
+    // are all indices into arrays this has already measured.
     pub fn init(
         allocator: Allocator,
         model: *const gltf.importer.Model,
@@ -347,11 +432,25 @@ pub const World = struct {
         if (model.meshes.len == 0) return error.NoGeometry;
         if (meshes.len != model.meshes.len) return error.MeshCountMismatch;
         if (morph_registrations.len != model.meshes.len) return error.MeshCountMismatch;
-        if (model.meshes.len > options.capacity.instances) return error.InstanceCapacityExceeded;
 
         for (model.meshes) |*mesh| {
             if (mesh.material >= model.materials.len) return error.MaterialIndexOutOfRange;
         }
+
+        // Summed in `usize` and compared before anything is narrowed: the
+        // instance capacity bounds the draws, and every draw index and material
+        // index the plan carries is a u32.
+        var draws: usize = model.meshes.len;
+        var materials: usize = model.materials.len;
+        for (options.props) |prop| {
+            try checkProp(prop.model);
+            if (prop.meshes.len != prop.model.meshes.len) return error.MeshCountMismatch;
+            draws += prop.model.meshes.len;
+            materials += prop.model.materials.len;
+        }
+        if (draws > options.capacity.instances) return error.InstanceCapacityExceeded;
+        if (draws > std.math.maxInt(u32)) return error.InstanceCapacityExceeded;
+        if (materials > std.math.maxInt(u32)) return error.TooManyMaterials;
 
         // Every owning field starts empty rather than undefined, because the
         // errdefer below is `deinit` and it reads all of them. A field left
@@ -370,6 +469,7 @@ pub const World = struct {
                 .candidates = &.{},
                 .centres = &.{},
                 .local_bounds = &.{},
+                .prop_runs = &.{},
                 .cullable = &.{},
                 .joint_bases = &.{},
                 .matrices = &.{},
@@ -383,6 +483,9 @@ pub const World = struct {
             .joint_storage = &.{},
             .joint_total = 0,
             .placement = options.placement,
+            .prop_placements = &.{},
+            .props_moved = false,
+            .props_moved_in_frame = false,
             .bounds = .{ .min = @splat(0), .max = @splat(0) },
             .sphere = .{ .centre = @splat(0), .radius = 0 },
         };
@@ -390,7 +493,11 @@ pub const World = struct {
 
         try self.buildSkeletons(model);
         try self.buildAnimators(model);
-        self.morph_registrations = try allocator.dupe(?u32, morph_registrations);
+        self.morph_registrations = try allocator.alloc(?u32, draws);
+        @memcpy(self.morph_registrations[0..model.meshes.len], morph_registrations);
+        @memset(self.morph_registrations[model.meshes.len..], null);
+        self.prop_placements = try allocator.alloc(zm.Mat, options.props.len);
+        @memset(self.prop_placements, zm.identity());
 
         // An anchor is a slot inside the rigid template, so geometry cannot
         // carry one unless the importer produced a template to resolve it
@@ -401,7 +508,7 @@ pub const World = struct {
                 return error.AnchoredMeshWithoutAnimator;
         }
 
-        try self.buildPlan(model, meshes, options.capacity);
+        try self.buildPlan(model, meshes, options.props, draws, options.capacity);
 
         // Started last, so nothing is playing while the bounds above are taken:
         // those describe the bind pose, and a camera framed on a mid-clip pose
@@ -421,6 +528,8 @@ pub const World = struct {
     pub fn deinit(self: *World) void {
         const allocator = self.allocator;
 
+        allocator.free(self.prop_placements);
+        allocator.free(self.plan.prop_runs);
         allocator.free(self.plan.record_storage);
         allocator.free(self.plan.batch_storage);
         allocator.free(self.plan.vertex_sources);
@@ -480,7 +589,7 @@ pub const World = struct {
         // The weights reach the device through the prepass rather than through
         // an instance record, so this is their only path and it has to follow
         // the advance above.
-        for (self.meshes, self.morph_registrations) |*mesh, registration| {
+        for (self.meshes, self.morph_registrations[0..self.meshes.len]) |*mesh, registration| {
             const index = registration orelse continue;
             const template = mesh.morph_template orelse continue;
             try morph_pass.writeWeights(frame_index, index, self.morph_animators[template].weights);
@@ -499,9 +608,12 @@ pub const World = struct {
             self.meshes,
             if (self.node_animator) |*animator| animator else null,
             self.placement,
+            self.prop_placements,
             eye,
             view_projection,
         );
+        self.props_moved_in_frame = self.props_moved;
+        self.props_moved = false;
 
         self.packJoints();
         return .{
@@ -544,7 +656,8 @@ pub const World = struct {
     // which would leave the one place three arrays have to agree reachable by
     // nothing a test can run.
     pub fn packJoints(self: *World) void {
-        for (self.skin_of_mesh, self.plan.joint_bases) |maybe_skin, base| {
+        // The level model's draws only: a prop is rigid and carries no skin.
+        for (self.skin_of_mesh, self.plan.joint_bases[0..self.skin_of_mesh.len]) |maybe_skin, base| {
             const skin = maybe_skin orelse continue;
             // The mesh's own run of its skeleton's joints, not the whole of
             // them: a skeleton shared by several skins holds all of their joints
@@ -601,9 +714,42 @@ pub const World = struct {
         return null;
     }
 
+    // Puts a prop where the frame being built draws it: `index` in the order
+    // `Options.props` gave them, and a row-vector model-to-world matrix.
+    //
+    // Read by the plan rebuild in `update`, which the loop runs after every
+    // component's `update` hook and after the camera has been read. A prop
+    // placed from that hook against this frame's camera is therefore drawn
+    // with the camera it was placed against, not one frame behind it.
+    pub fn placeProp(self: *World, index: usize, placement: zm.Mat) WorldError!void {
+        if (index >= self.prop_placements.len) return error.NoSuchProp;
+        const current = &self.prop_placements[index];
+        // Exact comparison on purpose: a prop set to the same matrix every frame
+        // has not moved, and anything else has.
+        if (@reduce(.Or, current[0] != placement[0]) or
+            @reduce(.Or, current[1] != placement[1]) or
+            @reduce(.Or, current[2] != placement[2]) or
+            @reduce(.Or, current[3] != placement[3]))
+        {
+            current.* = placement;
+            self.props_moved = true;
+        }
+    }
+
     // Whether anything the frame draws can move. A world where nothing does lets
     // the renderer bake its shadow map once instead of every frame.
+    //
+    // A prop counts in the frame it was moved and not otherwise, so a prop that
+    // stands still costs no bake.
     pub fn castersMove(self: *const World) bool {
+        // DECIDE: whether a prop may stay out of the shadow bake. Every prop is
+        // a caster, so a held weapon re-bakes the whole map in every frame it
+        // moves and casts a shadow with no body above it. Leaving it out means
+        // a third range in the batch list beside the visible prefix. Closed by
+        // running the first-person example with `gpu_timing` on and comparing
+        // the shadow phase with the weapon still and moving, and by looking at
+        // the floor below it.
+        if (self.props_moved_in_frame) return true;
         if (self.node_animator != null) return true;
         if (self.morph_animators.len > 0) return true;
         for (self.skeletons) |*skeleton| {
@@ -692,10 +838,12 @@ pub const World = struct {
         self: *World,
         model: *const gltf.importer.Model,
         meshes: []const *const gpu.Mesh,
+        props: []const PropSource,
+        count: usize,
         capacity: gpu.FrameCapacity,
     ) !void {
         const allocator = self.allocator;
-        const count = model.meshes.len;
+        const level_count = model.meshes.len;
 
         const candidates = try allocator.alloc(RecordPlan.Draw, count);
         self.plan.candidates = candidates;
@@ -707,6 +855,8 @@ pub const World = struct {
         self.plan.cullable = cullable;
         const joint_bases = try allocator.alloc(u32, count);
         self.plan.joint_bases = joint_bases;
+        const prop_runs = try allocator.alloc(DrawPlan.Run, props.len);
+        self.plan.prop_runs = prop_runs;
         self.plan.matrices = try allocator.alloc(zm.Mat, count);
         self.plan.keys = try allocator.alloc(scene.DrawKey, count);
         self.plan.order = try allocator.alloc(u32, count);
@@ -719,46 +869,26 @@ pub const World = struct {
         self.plan.records = &.{};
         @memset(self.plan.vertex_sources, null);
 
-        for (model.meshes, meshes, candidates, self.plan.keys) |*mesh, resident, *candidate, *key| {
-            candidate.* = .{
-                .mesh = resident,
-                .material = mesh.material,
-                // Section 3.9.5: doubleSided false means the back faces are
-                // culled, and true means neither side is. What makes reading it
-                // safe is that the winding is now settled on both sides of the
-                // load: the importer reverses a mirrored primitive's corners,
-                // and `rebuild` carries the instance matrix's sign into
-                // `front_face` for the recorder to set.
-                //
-                // Skinned geometry is the exception and keeps both sides. Its
-                // joint matrices can mirror a vertex without the instance
-                // matrix saying so, and they are per vertex, so no state on
-                // this draw can answer for its winding. Dropping a side there
-                // would drop parts of a character rather than the back of a
-                // surface.
-                .face_culling = if (mesh.skin != null or
-                    model.materials[mesh.material].rendering.double_sided)
-                    .none
-                else
-                    .back,
-                // Overwritten every frame by `rebuild` before anything reads
-                // it. Named rather than left undefined so that a plan built and
-                // never rebuilt is still a plan and not a trap.
-                .front_face = .counter_clockwise,
-            };
-            key.* = .{
-                .layer = switch (model.materials[mesh.material].rendering.alpha_mode) {
-                    .@"opaque", .mask => .solid,
-                    .blend => .blended,
-                },
-                .depth = undefined,
-            };
+        for (
+            model.meshes,
+            meshes,
+            candidates[0..level_count],
+            self.plan.keys[0..level_count],
+        ) |*mesh, resident, *candidate, *key| {
+            candidate.* = drawFor(mesh, resident, model.materials, 0);
+            key.* = keyFor(mesh, model.materials);
         }
 
         // Kept per mesh as well as unioned, because the blended run is ordered
         // by each draw's own distance from the eye and recomputing these beside
         // the plan would walk every vertex a second time.
-        for (model.meshes, centres, local_bounds, cullable, 0..) |
+        for (
+            model.meshes,
+            centres[0..level_count],
+            local_bounds[0..level_count],
+            cullable[0..level_count],
+            0..,
+        ) |
             *mesh,
             *centre,
             *box,
@@ -793,15 +923,45 @@ pub const World = struct {
         }
         self.sphere = scene.sphereAroundAabb(self.bounds);
 
+        // Every prop's draws follow the level's, in prop order, and so do its
+        // materials. `init` summed both and checked them against u32, so the
+        // narrowing casts below cannot truncate.
+        var first: usize = level_count;
+        var material_base: usize = model.materials.len;
+        for (props, prop_runs) |prop, *run| {
+            const draws = prop.model.meshes.len;
+            run.* = .{ .first = @intCast(first), .count = @intCast(draws) };
+            for (
+                prop.model.meshes,
+                prop.meshes,
+                candidates[first..][0..draws],
+                self.plan.keys[first..][0..draws],
+                centres[first..][0..draws],
+                local_bounds[first..][0..draws],
+                cullable[first..][0..draws],
+            ) |*mesh, resident, *candidate, *key, *centre, *box, *may_cull| {
+                candidate.* = drawFor(mesh, resident, prop.model.materials, @intCast(material_base));
+                key.* = keyFor(mesh, prop.model.materials);
+                box.* = .compute(mesh.vertices);
+                centre.* = scene.sphereAroundAabb(box.*).centre;
+                // Rigid, so the box is where the vertices are under whatever
+                // placement the frame gives it.
+                may_cull.* = true;
+            }
+            first += draws;
+            material_base += prop.model.materials.len;
+        }
+
         // Planned once: the offsets are a pure function of the joint counts
         // being drawn, and no draw is added or removed after this.
         //
         // Each mesh's own count, not its skeleton's. A skeleton shared by
         // several skins holds every one of their joints, and a mesh uploads only
-        // the run it reads.
+        // the run it reads. A prop's draws have none.
         const joint_counts = try allocator.alloc(?u32, count);
         defer allocator.free(joint_counts);
-        for (self.skin_of_mesh, joint_counts) |maybe_skin, *joints| {
+        @memset(joint_counts[level_count..], null);
+        for (self.skin_of_mesh, joint_counts[0..level_count]) |maybe_skin, *joints| {
             joints.* = if (maybe_skin) |skin| skin.joint_count else null;
         }
         self.joint_total = try scene.assignJointOffsets(
@@ -812,3 +972,46 @@ pub const World = struct {
         self.joint_storage = try allocator.alloc(gpu.Joint, capacity.joints);
     }
 };
+
+// One draw's fixed state, from its mesh and the material table it indexes.
+// `material_base` is where that table starts in the one the renderer holds.
+fn drawFor(
+    mesh: *const gltf.importer.Mesh,
+    resident: *const gpu.Mesh,
+    materials: []const res.MaterialInfo,
+    material_base: u32,
+) RecordPlan.Draw {
+    return .{
+        .mesh = resident,
+        .material = material_base + mesh.material,
+        // Section 3.9.5: doubleSided false means the back faces are culled, and
+        // true means neither side is. What makes reading it safe is that the
+        // winding is settled on both sides of the load: the importer
+        // reverses a mirrored primitive's corners, and `rebuild` carries the
+        // instance matrix's sign into `front_face` for the recorder to set.
+        //
+        // Skinned geometry is the exception and keeps both sides. Its joint
+        // matrices can mirror a vertex without the instance matrix saying so,
+        // and they are per vertex, so no state on this draw can answer for its
+        // winding. Dropping a side there would drop parts of a character rather
+        // than the back of a surface.
+        .face_culling = if (mesh.skin != null or materials[mesh.material].rendering.double_sided)
+            .none
+        else
+            .back,
+        // Overwritten every frame by `rebuild` before anything reads it. Named
+        // rather than left undefined so that a plan built and never rebuilt is
+        // still a plan and not a trap.
+        .front_face = .counter_clockwise,
+    };
+}
+
+fn keyFor(mesh: *const gltf.importer.Mesh, materials: []const res.MaterialInfo) scene.DrawKey {
+    return .{
+        .layer = switch (materials[mesh.material].rendering.alpha_mode) {
+            .@"opaque", .mask => .solid,
+            .blend => .blended,
+        },
+        .depth = undefined,
+    };
+}

@@ -60,3 +60,54 @@ test "a model with no materials is refused before the device is reached" {
         .{ .capacity = .{ .instances = 8, .joints = 16 } },
     ));
 }
+
+test "a prop that animates is refused before the device is reached" {
+    var vertices = [_]res.Vertex3D{.{
+        .position = .{ 0, 0, 0 },
+        .normal = .{ 0, 1, 0 },
+        .uv = .{ 0, 0 },
+        .tangent = .{ 1, 0, 0, 1 },
+    }};
+    var meshes = [_]gltf.importer.Mesh{.{
+        .vertices = &vertices,
+        .indices = &.{},
+        .streams = .{},
+        .morph = null,
+        .material = 0,
+        .anchor = null,
+        .skin = null,
+        .morph_template = null,
+    }};
+    var materials = [_]res.MaterialInfo{.{
+        .name = "",
+        .textures = .{},
+        .factors = .{},
+        .rendering = .{},
+    }};
+    const model: gltf.importer.Model = .{
+        .meshes = &meshes,
+        .materials = &materials,
+        .images = &.{},
+        .lights = &.{},
+        .skins = &.{},
+        .node_animation = null,
+        .morph_templates = &.{},
+    };
+    var prop_meshes = meshes;
+    prop_meshes[0].anchor = 0;
+    var prop = model;
+    prop.meshes = &prop_meshes;
+
+    // As above: every dependency is undefined, and reaching any of them would
+    // be the failure.
+    const deps: lenore.LevelDeps = undefined;
+    try testing.expectError(error.PropNotRigid, lenore.Level.init(
+        testing.allocator,
+        deps,
+        &model,
+        .{
+            .capacity = .{ .instances = 8, .joints = 16 },
+            .props = &.{.{ .model = &prop, .name = "prop" }},
+        },
+    ));
+}

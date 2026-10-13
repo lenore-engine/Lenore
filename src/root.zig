@@ -83,6 +83,8 @@ pub const instanceMatrix = world.instanceMatrix;
 pub const placePoint = world.placePoint;
 pub const skinForIndex = world.skinForIndex;
 pub const WorldOptions = world.World.Options;
+pub const PropSource = world.PropSource;
+pub const checkProp = world.checkProp;
 
 pub const ImageLoader = images.ImageLoader;
 pub const ImageError = images.ImageError;
@@ -114,6 +116,7 @@ pub const rendererShaders = shaders.renderer;
 pub const Level = level.Level;
 pub const LevelDeps = level.Deps;
 pub const LevelOptions = level.Options;
+pub const LevelProp = level.Prop;
 pub const LevelError = level.LevelError;
 pub const LevelTimings = level.Timings;
 pub const decoded_slots = images.decoded_slots;

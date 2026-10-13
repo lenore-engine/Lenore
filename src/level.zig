@@ -2,6 +2,7 @@ const std = @import("std");
 const gltf = @import("lenore-gltf");
 const gpu = @import("lenore-gpu");
 const platform = @import("lenore-platform");
+const res = @import("lenore-resources");
 const zm = @import("zmath");
 
 const env = @import("environment.zig");
@@ -13,7 +14,7 @@ const Allocator = std.mem.Allocator;
 const PhaseTimer = time_module.PhaseTimer;
 const World = world_module.World;
 
-// One model, resident.
+// One model, resident, and the props drawn beside it.
 //
 // The split against the engine is lifetime and nothing else. Everything here
 // belongs to the model that was opened and dies with it; the device, the caches
@@ -63,6 +64,42 @@ pub const Options = struct {
     capacity: gpu.FrameCapacity,
     placement: zm.Mat = zm.identity(),
     clip: ?u16 = 0,
+    // Models drawn beside this one, each at the matrix the application gives it
+    // through `World.placeProp`. They are uploaded in the same batch, their
+    // materials follow this model's in the one table the renderer indexes, and
+    // their draws share its plan and its instance capacity.
+    props: []const Prop = &.{},
+};
+
+pub const Prop = struct {
+    // Borrowed, and it has to outlive the level for the reason the level's own
+    // model does: `install` reads its materials.
+    model: *const gltf.importer.Model,
+    // What this model's images are cached under, in front of the keys its
+    // document gives them. Read only while the level is opened. It has to tell
+    // this model apart from every other one resident at the same time, and two
+    // levels opening the same prop under the same name share its images.
+    name: []const u8,
+};
+
+// What a level keeps of each prop beyond its draws, which the world holds.
+const LoadedProp = struct {
+    model: *const gltf.importer.Model,
+    image_loader: images.ImageLoader,
+    image_records: []images.ImageRecord,
+    image_report: images.Report,
+
+    const empty: LoadedProp = .{
+        .model = undefined,
+        .image_loader = .{ .uses = &.{}, .bound = &.{} },
+        .image_records = &.{},
+        .image_report = .{ .records = &.{} },
+    };
+
+    fn deinit(self: *LoadedProp, allocator: Allocator) void {
+        allocator.free(self.image_records);
+        self.image_loader.deinit(allocator);
+    }
 };
 
 const LoadedLightmap = struct {
@@ -89,6 +126,10 @@ pub const Level = struct {
     image_loader: images.ImageLoader,
     image_records: []images.ImageRecord,
     image_report: images.Report,
+
+    // In the order `Options.props` gave them, which is also the order of their
+    // meshes in `meshes` and of their materials in `packed_materials`.
+    props: []LoadedProp,
 
     // The packed array every fragment indexes. One buffer for the whole scene
     // rather than one per material: what selects a record is the index the
@@ -137,6 +178,7 @@ pub const Level = struct {
             .image_loader = .{ .uses = &.{}, .bound = &.{} },
             .image_records = &.{},
             .image_report = .{ .records = &.{} },
+            .props = &.{},
             .packed_materials = &.{},
             .morph_registrations = &.{},
             .morph_overflow = 0,
@@ -155,6 +197,7 @@ pub const Level = struct {
         if (model.materials.len == 0) return error.NoMaterials;
         if (model.meshes.len > std.math.maxInt(u32)) return error.TooManyMeshes;
         if (model.materials.len > std.math.maxInt(u32)) return error.TooManyMaterials;
+        for (options.props) |prop| try world_module.checkProp(prop.model);
 
         var timer: PhaseTimer = .begin(deps.clock);
 
@@ -168,6 +211,7 @@ pub const Level = struct {
             .image_loader = .{ .uses = &.{}, .bound = &.{} },
             .image_records = &.{},
             .image_report = .{ .records = &.{} },
+            .props = &.{},
             .packed_materials = &.{},
             .morph_registrations = &.{},
             .morph_overflow = 0,
@@ -180,23 +224,61 @@ pub const Level = struct {
         var world_built = false;
         errdefer self.release(deps.textures, world_built);
 
-        self.image_loader = try .init(allocator, model);
+        self.image_loader = try .init(allocator, model, "");
         self.image_records = try allocator.alloc(images.ImageRecord, model.images.len);
         @memset(self.image_records, .{});
         self.image_report = .{ .records = self.image_records };
 
+        self.props = try allocator.alloc(LoadedProp, options.props.len);
+        @memset(self.props, .empty);
+        var material_count: usize = model.materials.len;
+        for (options.props, self.props) |source, *prop| {
+            prop.model = source.model;
+            prop.image_loader = try .init(allocator, source.model, source.name);
+            prop.image_records = try allocator.alloc(images.ImageRecord, source.model.images.len);
+            @memset(prop.image_records, .{});
+            prop.image_report = .{ .records = prop.image_records };
+            material_count += source.model.materials.len;
+        }
+
         try self.upload(deps, model);
         self.timings.upload_ns = timer.split();
 
-        self.packed_materials = try allocator.alloc(gpu.MaterialData, model.materials.len);
-        for (model.materials, self.packed_materials) |*source, *record| record.* = .fromInfo(source);
+        self.packed_materials = try allocator.alloc(gpu.MaterialData, material_count);
+        var packed_index: usize = 0;
+        for (model.materials) |*source| {
+            self.packed_materials[packed_index] = .fromInfo(source);
+            packed_index += 1;
+        }
+        for (self.props) |*prop| {
+            for (prop.model.materials) |*source| {
+                self.packed_materials[packed_index] = .fromInfo(source);
+                packed_index += 1;
+            }
+        }
 
         try self.registerMorph(deps, model);
-        self.world = try .init(allocator, model, self.meshes, self.morph_registrations, .{
-            .capacity = options.capacity,
-            .placement = options.placement,
-            .clip = options.clip,
-        });
+
+        const prop_sources = try allocator.alloc(world_module.PropSource, self.props.len);
+        defer allocator.free(prop_sources);
+        var first_mesh: usize = model.meshes.len;
+        for (self.props, prop_sources) |*prop, *source| {
+            const count = prop.model.meshes.len;
+            source.* = .{ .model = prop.model, .meshes = self.meshes[first_mesh..][0..count] };
+            first_mesh += count;
+        }
+        self.world = try .init(
+            allocator,
+            model,
+            self.meshes[0..model.meshes.len],
+            self.morph_registrations,
+            .{
+                .capacity = options.capacity,
+                .placement = options.placement,
+                .clip = options.clip,
+                .props = prop_sources,
+            },
+        );
         world_built = true;
         self.timings.world_ns = timer.split();
         return self;
@@ -226,6 +308,8 @@ pub const Level = struct {
         allocator.free(self.packed_materials);
         allocator.free(self.image_records);
         self.image_loader.deinit(allocator);
+        for (self.props) |*prop| prop.deinit(allocator);
+        allocator.free(self.props);
         allocator.free(self.meshes);
 
         self.uploaded.deinit(allocator, &self.storage, textures);
@@ -338,13 +422,19 @@ pub const Level = struct {
         materials: *gpu.MaterialStorage,
         textures: *gpu.TextureCache,
     ) !void {
-        for (self.uploaded.texture_sets.items, 0..) |handle, index| {
-            const set = self.storage.textureSet(handle) orelse return error.UploadedTextureSetMissing;
-            try renderer.setMaterialTextures(
-                @intCast(index),
-                set,
-                .forMaterial(&model.materials[index]),
-            );
+        // One set per material, in the table's order: the model's, then each
+        // prop's. `World.init` refused a table whose indices outgrow a u32.
+        var index: u32 = 0;
+        const sets = self.uploaded.texture_sets.items;
+        for (model.materials) |*material| {
+            try self.installMaterial(renderer, sets, index, material);
+            index += 1;
+        }
+        for (self.props) |*prop| {
+            for (prop.model.materials) |*material| {
+                try self.installMaterial(renderer, sets, index, material);
+                index += 1;
+            }
         }
 
         // Nothing has been submitted for this level yet, so the cold-path
@@ -371,6 +461,18 @@ pub const Level = struct {
             try gpu.Lightmap.none(textures));
     }
 
+    fn installMaterial(
+        self: *const Level,
+        renderer: *gpu.Renderer,
+        sets: []const gpu.TextureSetHandle,
+        index: u32,
+        material: *const res.MaterialInfo,
+    ) !void {
+        if (index >= sets.len) return error.UploadedTextureSetMissing;
+        const set = self.storage.textureSet(sets[index]) orelse return error.UploadedTextureSetMissing;
+        try renderer.setMaterialTextures(index, set, .forMaterial(material));
+    }
+
     // Whether the environment is something to draw behind the model. With none
     // loaded the cube behind it is the black fallback, so a background draw
     // would put black over a black clear.
@@ -393,20 +495,9 @@ pub const Level = struct {
         {
             errdefer batch.deinit();
 
-            for (model.meshes) |*mesh| {
-                _ = try batch.addMesh(u32, .{
-                    .vertices = mesh.vertices,
-                    .indices = mesh.indices,
-                    .streams = mesh.streams,
-                    // A mesh with no targets passes null and gets no morph
-                    // buffer, which is what `MorphPass.register` refuses as
-                    // NotMorphed.
-                    .morph = if (mesh.morph) |deltas| .{
-                        .positions = deltas.positions,
-                        .normals = deltas.normals,
-                        .target_count = deltas.target_count,
-                    } else null,
-                });
+            for (model.meshes) |*mesh| try addMesh(&batch, mesh);
+            for (self.props) |*prop| {
+                for (prop.model.meshes) |*mesh| try addMesh(&batch, mesh);
             }
 
             // Images before materials. An image is decoded once and uploaded
@@ -420,11 +511,27 @@ pub const Level = struct {
                 model,
                 &self.image_report,
             );
+            for (self.props) |*prop| {
+                try prop.image_loader.load(
+                    allocator,
+                    deps.io,
+                    deps.clock,
+                    &batch,
+                    prop.model,
+                    &prop.image_report,
+                );
+            }
 
             // Nothing is decoded or uploaded here: a slot names an image the
-            // pass above made resident and the sampler this use wants.
+            // passes above made resident and the sampler this use wants. In
+            // the material table's order, which `install` walks.
             for (model.materials) |*material| {
                 _ = try batch.addTextureSet(try self.image_loader.textureSet(model, material));
+            }
+            for (self.props) |*prop| {
+                for (prop.model.materials) |*material| {
+                    _ = try batch.addTextureSet(try prop.image_loader.textureSet(prop.model, material));
+                }
             }
             // Read before finishing, which consumes the batch. Only a
             // reservation raises the count, so it is already final.
@@ -432,7 +539,8 @@ pub const Level = struct {
             self.uploaded = try batch.finish();
         }
 
-        self.meshes = try allocator.alloc(*const gpu.Mesh, model.meshes.len);
+        // Every mesh the batch took, the props' after the model's.
+        self.meshes = try allocator.alloc(*const gpu.Mesh, self.uploaded.meshes.items.len);
         for (self.uploaded.meshes.items, self.meshes) |handle, *resident| {
             resident.* = self.storage.mesh(handle) orelse return error.UploadedMeshMissing;
         }
@@ -442,7 +550,12 @@ pub const Level = struct {
         self.morph_registrations = try self.allocator.alloc(?u32, model.meshes.len);
         @memset(self.morph_registrations, null);
 
-        for (model.meshes, self.meshes, self.morph_registrations) |*mesh, resident, *registration| {
+        // The model's meshes only: a prop has no shape targets.
+        for (
+            model.meshes,
+            self.meshes[0..model.meshes.len],
+            self.morph_registrations,
+        ) |*mesh, resident, *registration| {
             if (mesh.morph == null) continue;
             registration.* = deps.morph_pass.register(deps.memory, resident) catch |err| switch (err) {
                 error.MeshCapacityExceeded, error.WeightCapacityExceeded => {
@@ -454,3 +567,18 @@ pub const Level = struct {
         }
     }
 };
+
+fn addMesh(batch: *gpu.UploadBatch, mesh: *const gltf.importer.Mesh) !void {
+    _ = try batch.addMesh(u32, .{
+        .vertices = mesh.vertices,
+        .indices = mesh.indices,
+        .streams = mesh.streams,
+        // A mesh with no targets passes null and gets no morph buffer, which is
+        // what `MorphPass.register` refuses as NotMorphed.
+        .morph = if (mesh.morph) |deltas| .{
+            .positions = deltas.positions,
+            .normals = deltas.normals,
+            .target_count = deltas.target_count,
+        } else null,
+    });
+}

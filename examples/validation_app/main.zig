@@ -1340,6 +1340,7 @@ fn reportPlan(
         world.meshes,
         if (world.node_animator) |*animator| animator else null,
         world.placement,
+        world.prop_placements,
         engine.camera.placement().position,
         view_projection,
     );
@@ -1463,6 +1464,7 @@ fn reportPlan(
         world.meshes,
         animator,
         world.placement,
+        world.prop_placements,
         engine.camera.placement().position,
         try engine.camera.viewProjection(engine.aspect()),
     );
@@ -1481,6 +1483,7 @@ fn reportPlan(
         world.meshes,
         animator,
         world.placement,
+        world.prop_placements,
         engine.camera.placement().position,
         try engine.camera.viewProjection(engine.aspect()),
     );

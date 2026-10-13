@@ -213,7 +213,7 @@ test "the blended run follows the solid one and descends away from the eye" {
     try fixture.init(testing.allocator, zm.identity(), &.{ null, null, null });
     defer fixture.world.deinit();
 
-    try fixture.world.plan.rebuild(fixture.world.meshes, null, zm.identity(), .{ 0, 0, 0 }, seesEverything());
+    try fixture.world.plan.rebuild(fixture.world.meshes, null, zm.identity(), &.{}, .{ 0, 0, 0 }, seesEverything());
 
     const ordered = fixture.world.plan.ordered;
     try testing.expectEqual(@as(usize, 3), ordered.len);
@@ -225,7 +225,7 @@ test "the instance ring is packed in draw order and not in mesh order" {
     try fixture.init(testing.allocator, zm.identity(), &.{ null, null, null });
     defer fixture.world.deinit();
 
-    try fixture.world.plan.rebuild(fixture.world.meshes, null, zm.identity(), .{ 0, 0, 0 }, seesEverything());
+    try fixture.world.plan.rebuild(fixture.world.meshes, null, zm.identity(), &.{}, .{ 0, 0, 0 }, seesEverything());
 
     // Each mesh has its own material, so the material index is what says which
     // draw a slot of the ring belongs to. Packed by mesh index these would read
@@ -251,7 +251,7 @@ test "moving the eye past the model reverses the blended run" {
 
     // From beyond the far draw, the near one is now the farthest. A plan built
     // once and never rebuilt keeps the previous answer.
-    try fixture.world.plan.rebuild(fixture.world.meshes, null, zm.identity(), .{ 0, 0, 30 }, seesEverything());
+    try fixture.world.plan.rebuild(fixture.world.meshes, null, zm.identity(), &.{}, .{ 0, 0, 30 }, seesEverything());
     try testing.expectEqualSlices(u32, &.{ 1, 0, 2 }, fixture.world.plan.ordered);
 }
 
@@ -268,6 +268,7 @@ test "the sort key is measured where the draw ends up, not where it was authored
         fixture.world.meshes,
         null,
         fixture.world.placement,
+        &.{},
         .{ 0, 0, 0 },
         seesEverything(),
     );
@@ -280,7 +281,7 @@ test "an instance record carries its draw's matrix" {
     try fixture.init(testing.allocator, placement, &.{ null, null, null });
     defer fixture.world.deinit();
 
-    try fixture.world.plan.rebuild(fixture.world.meshes, null, placement, .{ 0, 0, 0 }, seesEverything());
+    try fixture.world.plan.rebuild(fixture.world.meshes, null, placement, &.{}, .{ 0, 0, 0 }, seesEverything());
 
     // Nothing is anchored, so every draw's matrix is the placement itself. A
     // record filled with the identity, or with a matrix belonging to another
@@ -317,7 +318,7 @@ test "a draw is sorted on its centre, not on the near face of its box" {
     });
     defer world.deinit();
 
-    try world.plan.rebuild(world.meshes, null, zm.identity(), .{ 0, 0, 0 }, seesEverything());
+    try world.plan.rebuild(world.meshes, null, zm.identity(), &.{}, .{ 0, 0, 0 }, seesEverything());
     // By centre the wide box sits at 5 and the narrow one at 3.5, so the wide
     // one is farther and is drawn first. By nearest corner it would be 0
     // against 3, and the order would be the other way round.
@@ -978,6 +979,7 @@ test "a mesh outside the frustum is ordered behind the visible ones" {
         fixture.world.meshes,
         null,
         zm.identity(),
+        &.{},
         .{ 0, 0, 0 },
         seesNearHalf(),
     );
@@ -1001,6 +1003,7 @@ test "a morphed mesh is not culled" {
         fixture.world.meshes,
         null,
         zm.identity(),
+        &.{},
         .{ 0, 0, 0 },
         seesNearHalf(),
     );
@@ -1081,6 +1084,7 @@ test "a skinned mesh is not culled" {
         fixture.world.meshes,
         null,
         zm.identity(),
+        &.{},
         .{ 0, 0, 0 },
         seesNearHalf(),
     );
@@ -1111,7 +1115,7 @@ test "the empty world plans no draws and moves no casters" {
     // `rebuild` over no meshes rather than a branch that skips it: the record
     // path a fullscreen application takes is the same one every other frame
     // takes, and this is where that stops being an assumption.
-    try world.plan.rebuild(world.meshes, null, zm.identity(), .{ 0, 0, 0 }, zm.identity());
+    try world.plan.rebuild(world.meshes, null, zm.identity(), &.{}, .{ 0, 0, 0 }, zm.identity());
     try testing.expectEqual(@as(usize, 0), world.plan.records.len);
     try testing.expectEqual(@as(usize, 0), world.plan.visible_records);
 }
@@ -1160,7 +1164,7 @@ test "culling follows the material and the winding follows the instance matrix" 
     try testing.expectEqual(scene.FaceCulling.none, world.plan.candidates[2].face_culling);
 
     // An unmirrored placement leaves every draw wound the way glTF defines.
-    try world.plan.rebuild(world.meshes, null, zm.identity(), .{ 0, 0, 0 }, seesEverything());
+    try world.plan.rebuild(world.meshes, null, zm.identity(), &.{}, .{ 0, 0, 0 }, seesEverything());
     for (world.plan.candidates) |candidate|
         try testing.expectEqual(scene.FrontFace.counter_clockwise, candidate.front_face);
 
@@ -1170,9 +1174,229 @@ test "culling follows the material and the winding follows the instance matrix" 
         world.meshes,
         null,
         zm.scaling(-1, 1, 1),
+        &.{},
         .{ 0, 0, 0 },
         seesEverything(),
     );
     for (world.plan.candidates) |candidate|
         try testing.expectEqual(scene.FrontFace.clockwise, candidate.front_face);
+}
+
+// A level of one solid mesh at the origin and a prop of two meshes, one solid
+// and one blended, each with a material of its own.
+const WithProp = struct {
+    world: lenore.World,
+    level_vertices: [2]res.Vertex3D,
+    prop_vertices: [2][2]res.Vertex3D,
+    level_meshes: [1]gltf.importer.Mesh,
+    prop_meshes: [2]gltf.importer.Mesh,
+    level_materials: [1]res.MaterialInfo,
+    prop_materials: [2]res.MaterialInfo,
+    level: gltf.importer.Model,
+    prop: gltf.importer.Model,
+
+    fn init(self: *WithProp, allocator: std.mem.Allocator) !void {
+        self.level_vertices = .{ vertexAt(.{ -1, -1, -1 }), vertexAt(.{ 1, 1, 1 }) };
+        self.prop_vertices = .{
+            .{ vertexAt(.{ -0.1, -0.1, -0.1 }), vertexAt(.{ 0.1, 0.1, 0.1 }) },
+            .{ vertexAt(.{ -0.1, -0.1, 0.2 }), vertexAt(.{ 0.1, 0.1, 0.4 }) },
+        };
+        self.level_meshes = .{meshAt(&self.level_vertices, 0)};
+        self.prop_meshes = .{
+            meshAt(&self.prop_vertices[0], 1),
+            meshAt(&self.prop_vertices[1], 0),
+        };
+        self.level_materials = .{material(.@"opaque")};
+        self.prop_materials = .{ material(.blend), material(.@"opaque") };
+        self.level = .{
+            .meshes = &self.level_meshes,
+            .materials = &self.level_materials,
+            .images = &.{},
+            .lights = &.{},
+            .skins = &.{},
+            .node_animation = null,
+            .morph_templates = &.{},
+        };
+        self.prop = self.level;
+        self.prop.meshes = &self.prop_meshes;
+        self.prop.materials = &self.prop_materials;
+
+        const level_resident = [_]*const gpu.Mesh{&mesh_a};
+        const prop_resident = [_]*const gpu.Mesh{ &mesh_a, &mesh_a };
+        self.world = try lenore.World.init(allocator, &self.level, &level_resident, &.{null}, .{
+            .capacity = capacity,
+            .props = &.{.{ .model = &self.prop, .meshes = &prop_resident }},
+        });
+    }
+};
+
+test "a prop's draws follow the level's and its materials follow the level's table" {
+    var fixture: WithProp = undefined;
+    try fixture.init(testing.allocator);
+    defer fixture.world.deinit();
+
+    const plan = &fixture.world.plan;
+    try testing.expectEqual(@as(usize, 3), plan.candidates.len);
+    try testing.expectEqual(@as(usize, 1), plan.prop_runs.len);
+    try testing.expectEqual(@as(u32, 1), plan.prop_runs[0].first);
+    try testing.expectEqual(@as(u32, 2), plan.prop_runs[0].count);
+    // The level has one material, so the prop's local 1 and 0 are 2 and 1.
+    try testing.expectEqual(@as(u32, 0), plan.candidates[0].material);
+    try testing.expectEqual(@as(u32, 2), plan.candidates[1].material);
+    try testing.expectEqual(@as(u32, 1), plan.candidates[2].material);
+    // The layer comes from the prop's own table and not from the index it was
+    // moved to: the level's material 0 is solid, the prop's local 0 blends.
+    try testing.expectEqual(scene.Layer.solid, plan.keys[1].layer);
+    try testing.expectEqual(scene.Layer.blended, plan.keys[2].layer);
+    // The level's extent alone.
+    try testing.expectEqual(res.Vec3{ -1, -1, -1 }, fixture.world.bounds.min);
+    try testing.expectEqual(res.Vec3{ 1, 1, 1 }, fixture.world.bounds.max);
+}
+
+test "a prop is drawn at the matrix placed for it, and the level is not" {
+    var fixture: WithProp = undefined;
+    try fixture.init(testing.allocator);
+    defer fixture.world.deinit();
+
+    const held = zm.mul(zm.rotationY(0.5), zm.translation(0, 0, 7));
+    try fixture.world.placeProp(0, held);
+    try fixture.world.plan.rebuild(
+        fixture.world.meshes,
+        null,
+        fixture.world.placement,
+        fixture.world.prop_placements,
+        .{ 0, 0, 0 },
+        seesEverything(),
+    );
+
+    // Matched through the material index, which is unique per draw here, so
+    // the check does not depend on the order the ring was packed in.
+    for (fixture.world.plan.instances) |instance| {
+        const expected = if (instance.material_index == 0) zm.identity() else held;
+        try testing.expectEqual(gpu.mat4(expected), instance.model);
+    }
+}
+
+test "a prop is culled through its placement" {
+    var fixture: WithProp = undefined;
+    try fixture.init(testing.allocator);
+    defer fixture.world.deinit();
+
+    // `seesNearHalf` ends at z 12. Beyond it the prop is behind the visible
+    // prefix, and in front of it the prop is in it.
+    try fixture.world.placeProp(0, zm.translation(0, 0, 50));
+    try fixture.world.plan.rebuild(
+        fixture.world.meshes,
+        null,
+        fixture.world.placement,
+        fixture.world.prop_placements,
+        .{ 0, 0, 0 },
+        seesNearHalf(),
+    );
+    try testing.expect(!fixture.world.plan.keys[1].visible);
+    try testing.expect(!fixture.world.plan.keys[2].visible);
+
+    try fixture.world.placeProp(0, zm.translation(0, 0, 5));
+    try fixture.world.plan.rebuild(
+        fixture.world.meshes,
+        null,
+        fixture.world.placement,
+        fixture.world.prop_placements,
+        .{ 0, 0, 0 },
+        seesNearHalf(),
+    );
+    try testing.expect(fixture.world.plan.keys[1].visible);
+    try testing.expect(fixture.world.plan.keys[2].visible);
+}
+
+test "a prop counts as a moving caster only in the frame it moved" {
+    var fixture: WithProp = undefined;
+    try fixture.init(testing.allocator);
+    defer fixture.world.deinit();
+
+    // Never dereferenced: nothing in this world is morphed, so neither the
+    // weights nor the vertex sources ask the prepass anything.
+    var morph_pass: gpu.MorphPass = undefined;
+    const time: lenore.FrameTime = .{ .elapsed_ns = 0, .interval_ns = 0, .delta = 0, .index = 0 };
+
+    _ = try fixture.world.update(&morph_pass, 0, time, .{ 0, 0, 0 }, seesEverything());
+    try testing.expect(!fixture.world.castersMove());
+
+    // Placed before `update`, as a component's `update` hook does, and read
+    // after it, where the shadow decision is taken.
+    try fixture.world.placeProp(0, zm.translation(1, 0, 0));
+    _ = try fixture.world.update(&morph_pass, 1, time, .{ 0, 0, 0 }, seesEverything());
+    try testing.expect(fixture.world.castersMove());
+
+    // The same matrix again is not a move.
+    try fixture.world.placeProp(0, zm.translation(1, 0, 0));
+    _ = try fixture.world.update(&morph_pass, 0, time, .{ 0, 0, 0 }, seesEverything());
+    try testing.expect(!fixture.world.castersMove());
+}
+
+test "placing a prop that was not given is refused" {
+    var fixture: WithProp = undefined;
+    try fixture.init(testing.allocator);
+    defer fixture.world.deinit();
+
+    try testing.expectError(error.NoSuchProp, fixture.world.placeProp(1, zm.identity()));
+}
+
+test "a prop's draws count against the instance capacity" {
+    var fixture: WithProp = undefined;
+    fixture.level_vertices = .{ vertexAt(.{ 0, 0, 0 }), vertexAt(.{ 1, 1, 1 }) };
+    fixture.level_meshes = .{meshAt(&fixture.level_vertices, 0)};
+    fixture.level_materials = .{material(.@"opaque")};
+    fixture.level = .{
+        .meshes = &fixture.level_meshes,
+        .materials = &fixture.level_materials,
+        .images = &.{},
+        .lights = &.{},
+        .skins = &.{},
+        .node_animation = null,
+        .morph_templates = &.{},
+    };
+    fixture.prop_meshes = .{ meshAt(&fixture.level_vertices, 0), meshAt(&fixture.level_vertices, 0) };
+    fixture.prop = fixture.level;
+    fixture.prop.meshes = &fixture.prop_meshes;
+
+    const prop_resident = [_]*const gpu.Mesh{ &mesh_a, &mesh_a };
+    // One level mesh and two prop meshes against room for two.
+    try testing.expectError(error.InstanceCapacityExceeded, lenore.World.init(
+        testing.allocator,
+        &fixture.level,
+        &.{&mesh_a},
+        &.{null},
+        .{
+            .capacity = .{ .instances = 2, .joints = 16 },
+            .props = &.{.{ .model = &fixture.prop, .meshes = &prop_resident }},
+        },
+    ));
+}
+
+test "a prop that animates is refused" {
+    var vertices = [_]res.Vertex3D{ vertexAt(.{ 0, 0, 0 }), vertexAt(.{ 1, 1, 1 }) };
+    var meshes = [_]gltf.importer.Mesh{meshAt(&vertices, 0)};
+    var materials = [_]res.MaterialInfo{material(.@"opaque")};
+    var model: gltf.importer.Model = .{
+        .meshes = &meshes,
+        .materials = &materials,
+        .images = &.{},
+        .lights = &.{},
+        .skins = &.{},
+        .node_animation = null,
+        .morph_templates = &.{},
+    };
+    try lenore.checkProp(&model);
+
+    meshes[0].anchor = 0;
+    try testing.expectError(error.PropNotRigid, lenore.checkProp(&model));
+    meshes[0].anchor = null;
+
+    meshes[0].material = 1;
+    try testing.expectError(error.MaterialIndexOutOfRange, lenore.checkProp(&model));
+    meshes[0].material = 0;
+
+    model.meshes = &.{};
+    try testing.expectError(error.PropWithoutGeometry, lenore.checkProp(&model));
 }
