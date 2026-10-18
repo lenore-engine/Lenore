@@ -25,3 +25,6 @@
 [submodule "lenore-fps"]
 	path = lenore-fps
 	url = https://github.com/lenore-engine/lenore-fps.git
+[submodule "lenore-fsr"]
+	path = lenore-fsr
+	url = https://github.com/lenore-engine/lenore-fsr.git
