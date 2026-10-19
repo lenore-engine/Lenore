@@ -949,13 +949,39 @@ float3 imageBasedLight(
     // term of its own, so it takes the same split-sum Fresnel and the same
     // occlusion. Its specular half is read along the reflection unblurred:
     // the hemisphere is already smooth enough that roughness changes it little.
-    const float3 specular = ggx_environment.SampleLevel(reflection, lod).rgb + ambientRadiance(reflection);
+    float3 specular = ggx_environment.SampleLevel(reflection, lod).rgb + lights.ambient.reflected * ambientRadiance(reflection);
     // With a probe field the ambient's diffuse half comes from it instead: the
     // probes carry the sky through the openings they see it through and the
     // light bounced off everything else, where the hemisphere carries the sky
     // everywhere, walls or not. The field returns irradiance; this term holds
     // it over pi, the convention the lambertian map arrives in.
-    const float3 surroundings = surroundingIrradiance(position, normal, to_eye);
+    float3 surroundings;
+    if (lights.probe_grid.enabled == 0)
+    {
+        surroundings = ambientIrradiance(normal);
+    }
+    else
+    {
+        // The environment is the world outside, seen from nowhere in
+        // particular, and a reflection indoors must not show it through the
+        // walls. So the field also says, along the reflection, how much of
+        // the environment the probes see there and what else arrives: the
+        // reflection is the environment by that share, plus the rest of
+        // what the probes carry along it, which is the room's own light
+        // (its lamps, its walls), as a fully rough surface would see it. The
+        // rest is the field's light less the environment's share of the
+        // ambient the probes were lit by, never below zero. Outdoors the
+        // share is near one and the environment stays sharp; in a closed
+        // room it is near zero and the room reflects itself, blurred to the
+        // probes' second-order harmonics.
+        const float pi = 3.14159265358979;
+        const float3 open = ambientIrradiance(normal);
+        const float3 open_along = ambientIrradiance(reflection);
+        const ProbeLookup lookup = sampleProbeReflection(lights.probe_grid, position, normal, to_eye, reflection, open * pi, open_along * pi);
+        surroundings = lookup.irradiance * (1.0 / pi);
+        const float3 room = max(lookup.along * (1.0 / pi) - lookup.visible * open_along, float3(0.0, 0.0, 0.0));
+        specular = specular * lookup.visible + room;
+    }
     const float3 irradiance = lambertian_environment.Sample(normal).rgb + surroundings;
     const float2 f_ab = ggx_lut.Sample(float2(n_dot_v, roughness)).rg;
 

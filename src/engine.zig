@@ -44,6 +44,7 @@ const RendererOptions = struct {
     fps_window_ns: u64,
     gpu_timing: bool,
     metering: bool,
+    atmosphere: bool,
     temporal: bool,
     upscaler: Upscaler,
     fsr_fp16: bool,
@@ -197,6 +198,9 @@ pub const Look = struct {
     local_shadow: gpu.LocalShadowUniform = .{},
     // Light from everywhere, added to the environment's; none by default.
     ambient: gpu.AmbientUniform = .{},
+    // The glow the background draws around each directional light; none by
+    // default.
+    halo: gpu.Halo = .{},
     // One term of the main pass alone, for looking at it; the shaded frame
     // by default.
     debug_view: gpu.DebugView = .shaded,
@@ -418,6 +422,8 @@ pub const Options = struct {
     // `meterCells` and nothing here acts on it: how a camera weights the frame,
     // how fast it follows and what it may reach are the application's answers.
     metering: bool = false,
+    // Upload CPU transport tables and render a physical environment cube.
+    atmosphere: bool = false,
 
     // The temporal resolve: the main pass at `render_scale` gathered over frames
     // into a picture at the window's resolution. Off by default; it is a pass,
@@ -576,6 +582,9 @@ pub const Engine = struct {
     // grid the light block carries to the main pass while it exists.
     probe_field: ?gpu.ProbeField,
     probe_grid: gpu.ProbeGridUniform,
+    // What the field was built with, which `relightIndirect` settles it
+    // with again. Meaningful while `probe_field` is not null.
+    indirect_settings: IndirectSettings,
     // How long the last `buildIndirect` took on the host, waiting for the
     // device included: the acceleration structures and every settle update.
     indirect_build_ns: u64,
@@ -602,6 +611,10 @@ pub const Engine = struct {
     // metered frame has come back, and null for good in a run that does not
     // meter.
     last_meter: ?gpu.MeterCells,
+    // Which bank of `sky_table_keys` the installed sky's tables are held
+    // under, and the split-sum table, built once; null until `setAtmosphere`.
+    sky_keys: ?u1,
+    sky_brdf: ?gpu.BoundTexture,
     // Frames that reached `record`. Not the presented count: a present that
     // fails leaves the frame recorded, and everything the recording counted
     // happened either way.
@@ -762,6 +775,7 @@ pub const Engine = struct {
             .fps_window_ns = options.fps_window_ns,
             .gpu_timing = options.gpu_timing,
             .metering = options.metering,
+            .atmosphere = options.atmosphere,
             .temporal = options.temporal,
             .upscaler = options.upscaler,
             .fsr_fp16 = options.fsr_fp16,
@@ -787,6 +801,7 @@ pub const Engine = struct {
         renderer_shaders.scene_extra_layout = scene_extra_layout;
         renderer_shaders.scene_shading = options.scene_shading;
         if (options.metering) renderer_shaders.meter = shaders.meter;
+        if (options.atmosphere) renderer_shaders.atmosphere = shaders.atmosphere;
         if (options.temporal) renderer_shaders.temporal = shaders.temporal;
         if (options.upscaler == .fsr) renderer_shaders.temporal_writer = .external;
         if (options.background_shader) |background| renderer_shaders.sky = background;
@@ -938,6 +953,8 @@ pub const Engine = struct {
         self.gpu_timer = null;
         self.last_gpu = null;
         self.last_meter = null;
+        self.sky_keys = null;
+        self.sky_brdf = null;
         if (options.gpu_timing) {
             const support = self.context.timestampSupport();
             if (support.available()) {
@@ -972,6 +989,7 @@ pub const Engine = struct {
         self.local_shadow_dirty = true;
         self.probe_field = null;
         self.probe_grid = .none;
+        self.indirect_settings = undefined;
         self.indirect_build_ns = 0;
         self.frame_clock = .start(self.clock);
         self.metrics = .init(options.fps_window_ns);
@@ -998,6 +1016,11 @@ pub const Engine = struct {
                     if (self.fsr_state.upscaler) |upscaler| upscaler.deinit();
                 }
                 self.renderer.deinit();
+                if (self.sky_keys) |bank| {
+                    self.textures.release(sky_table_keys[bank].transmittance);
+                    self.textures.release(sky_table_keys[bank].multiple);
+                }
+                if (self.sky_brdf != null) self.textures.release(sky_brdf_key);
                 self.ui_pass.deinit();
                 self.ui.deinit(self.allocator);
                 // After the pass, whose registry held the view and the sampler
@@ -1115,6 +1138,146 @@ pub const Engine = struct {
         self.dropIndirect();
     }
 
+    // Installs the physical sky. The host's transport tables are uploaded as
+    // they are (one source for the light the application computes and the sky
+    // the device draws), the split-sum table is built the first time, and the
+    // scene's environment becomes a black diffuse cube, the cube the
+    // atmosphere is drawn into, and that table. While installed it takes
+    // precedence over any environment a level installs, and the ambient's
+    // reflected share is zeroed each frame, since the cube holds the sky. Where
+    // the sun stands is `relightSky`'s.
+    //
+    // A load-time call: it waits for the device. A sky installed again uploads
+    // under the other of two banks of keys, so the tables in use stay
+    // acquired until their replacements are in place.
+    //
+    // RGBA32F for the tables, which keeps the host's f32 values whole; the
+    // alpha is unused. The cube is RGBA16F and the split-sum table RG16F.
+    pub fn setAtmosphere(self: *Engine, atmosphere: scene.Atmosphere, tables: *const scene.Tables) !void {
+        if (self.renderer.atmosphere_shader == null) return error.AtmosphereDisabled;
+        try atmosphere.validate();
+        try self.context.waitIdle();
+        const bank: u1 = if (self.sky_keys) |old| old ^ 1 else 0;
+        const keys = sky_table_keys[bank];
+
+        // Staging for the larger table; the smaller is written into its front.
+        const pixels = try self.allocator.alloc([4]f32, 256 * 64);
+        defer self.allocator.free(pixels);
+        var transfer: gpu.Transfer = try .begin(&self.context, self.setup_pool.handle, &self.staging);
+        defer transfer.deinit();
+
+        try rgba(pixels, &tables.transmittance_lut);
+        const transmittance = try self.textures.acquireRaw(keys.transmittance, .{
+            .width = 256,
+            .height = 64,
+            .bytes = std.mem.sliceAsBytes(pixels),
+        }, .r32g32b32a32_sfloat, gpu.environmentSampler, &transfer);
+        errdefer if (!transfer.abandoned()) self.textures.release(keys.transmittance);
+
+        try rgba(pixels[0 .. 32 * 32], &tables.multiple_scattering_lut);
+        const multiple = try self.textures.acquireRaw(keys.multiple, .{
+            .width = 32,
+            .height = 32,
+            .bytes = std.mem.sliceAsBytes(pixels[0 .. 32 * 32]),
+        }, .r32g32b32a32_sfloat, gpu.environmentSampler, &transfer);
+        errdefer if (!transfer.abandoned()) self.textures.release(keys.multiple);
+
+        var brdf = self.sky_brdf;
+        if (brdf == null) {
+            const table = try self.allocator.create(scene.split_sum.Table);
+            defer self.allocator.destroy(table);
+            scene.split_sum.build(table);
+            brdf = try self.textures.acquireRaw(sky_brdf_key, .{
+                .width = scene.split_sum.size,
+                .height = scene.split_sum.size,
+                .bytes = std.mem.asBytes(table),
+            }, .r16g16_sfloat, gpu.environmentSampler, &transfer);
+        }
+        errdefer if (self.sky_brdf == null and !transfer.abandoned()) self.textures.release(sky_brdf_key);
+        try transfer.finish();
+
+        var environment = try gpu.Environment.neutral(&self.textures);
+        environment.lut = brdf.?;
+        try self.renderer.setAtmosphere(atmosphereParameters(atmosphere), transmittance, multiple, environment);
+
+        if (self.sky_keys) |old| {
+            self.textures.release(sky_table_keys[old].transmittance);
+            self.textures.release(sky_table_keys[old].multiple);
+        }
+        self.sky_keys = bank;
+        self.sky_brdf = brdf;
+        self.look.background = .environment;
+    }
+
+    // `gpu.AtmosphereParameters`' rows, in the order its comment lists them.
+    // The viewer stands at the reference's offset above the ground, taken as
+    // the f32 difference of the two radii, which is the altitude the host's
+    // march starts from too.
+    fn atmosphereParameters(a: scene.Atmosphere) gpu.AtmosphereParameters {
+        return .{ .rows = .{
+            .{ a.bottom_radius, a.top_radius, a.rayleigh_scale_height, a.mie_scale_height },
+            .{ a.rayleigh_scattering[0], a.rayleigh_scattering[1], a.rayleigh_scattering[2], 0 },
+            .{ a.mie_scattering[0], a.mie_scattering[1], a.mie_scattering[2], 0 },
+            .{ a.mie_extinction[0], a.mie_extinction[1], a.mie_extinction[2], 0 },
+            .{ a.ozone_absorption[0], a.ozone_absorption[1], a.ozone_absorption[2], 0 },
+            .{ a.ozone_layer_width, a.ozone_linear_0, a.ozone_constant_0, a.ozone_linear_1 },
+            .{ a.ozone_constant_1, a.aerosol, a.ozone, a.mie_g },
+            .{ a.sky_samples_min, a.sky_samples_max, (a.bottom_radius + scene.planet_radius_offset) - a.bottom_radius, 0 },
+            .{ a.ground_albedo[0], a.ground_albedo[1], a.ground_albedo[2], 0 },
+        } };
+    }
+
+    // A host table's RGB texels as RGBA, row by row, refusing anything a
+    // transport table cannot hold.
+    fn rgba(out: [][4]f32, table: anytype) error{InvalidAtmosphereTables}!void {
+        var index: usize = 0;
+        for (table) |row| for (row) |texel| {
+            for (texel) |c| if (!std.math.isFinite(c) or c < 0) return error.InvalidAtmosphereTables;
+            out[index] = .{ texel[0], texel[1], texel[2], 1 };
+            index += 1;
+        };
+    }
+
+    // Moves the sun in the installed sky: the next frame draws the cube again,
+    // before its main pass samples it. `toward_sun` need not be of unit
+    // length and `top` is the sun's irradiance above the atmosphere; a
+    // direction that is zero or not finite, or a negative irradiance, is
+    // refused and the sky keeps its sun.
+    pub fn relightSky(self: *Engine, toward_sun: [3]f32, top: f32) !void {
+        try self.renderer.relightSky(.{ .toward_sun = toward_sun, .top = top });
+    }
+
+    // The sky cube's level zero, read back for comparing against the host's
+    // model. A cold diagnostic that waits for the device. `output` holds the
+    // six faces one after another, each 128 texels square, row major.
+    pub fn readSkyCube(self: *Engine, output: [][4]f16) !void {
+        if (output.len != 6 * 128 * 128) return error.InvalidSkyReadback;
+        try self.context.waitIdle();
+        var buffer = try gpu.Buffer.init(&self.context, &self.memory, output.len * 8, .{ .transfer_dst_bit = true }, .readback);
+        var release_buffer = true;
+        defer if (release_buffer) buffer.deinit();
+        var transfer: gpu.Transfer = try .begin(&self.context, self.setup_pool.handle, &self.staging);
+        defer transfer.deinit();
+        try self.renderer.recordSkyReadback(transfer.commandBuffer(), &buffer);
+        transfer.finish() catch |err| {
+            // A failed wait cannot prove that the copy has stopped using this
+            // buffer. Device loss is dealt with by the engine's teardown.
+            if (transfer.abandoned()) {
+                release_buffer = false;
+                log.err("sky readback buffer leaked because the copy may still be pending", .{});
+            }
+            return err;
+        };
+        const bytes = buffer.mapped() orelse return error.SkyReadbackNotMapped;
+        @memcpy(std.mem.sliceAsBytes(output), bytes[0 .. output.len * 8]);
+    }
+
+    fn withoutReflected(ambient: gpu.AmbientUniform) gpu.AmbientUniform {
+        var kept = ambient;
+        kept.reflected = 0;
+        return kept;
+    }
+
     // Builds the indirect-light probe field over `settings.bounds` from the
     // triangles of `sources`, settles it under the look's current lights and
     // ambient, and points the main pass at it. Replaces a field built before.
@@ -1186,12 +1349,40 @@ pub const Engine = struct {
         self.probe_field = field;
         self.renderer.setProbeField(&self.probe_field.?);
         self.probe_grid = grid;
+        self.indirect_settings = settings;
         self.indirect_build_ns = self.clock.now() - started;
         log.info("indirect: {d} probes over {d} triangles, {d} updates, {d:.2} s", .{
             grid.probeCount(),
             written,
             settings.iterations,
             @as(f64, @floatFromInt(self.indirect_build_ns)) / std.time.ns_per_s,
+        });
+    }
+
+    // Settles the field built last against the look's lights and ambient as
+    // they are now, as many updates as it was built with. The geometry and the
+    // acceleration structures stay; only the light is new.
+    //
+    // Synchronous, and it waits for the device first: the updates alternate
+    // between the two buffers the main pass reads one of, so a frame in flight
+    // would read a buffer being written. A stall the length of the settle,
+    // which suits a jump in time and not a sun moving every few seconds.
+    pub fn relightIndirect(self: *Engine) !void {
+        const field = &(self.probe_field orelse return error.NoIndirectField);
+        const started = self.clock.now();
+        try self.context.waitIdle();
+        const settings = self.indirect_settings;
+        try field.settle(self.setup_pool.handle, .{
+            .lights = self.look.lights,
+            .sky = self.look.ambient.sky,
+            .ground = self.look.ambient.ground,
+            .max_distance = settings.max_distance,
+        }, settings.iterations, settings.hysteresis);
+        // The settled pair is whichever the last update wrote.
+        self.renderer.setProbeField(field);
+        log.info("indirect relit: {d} updates, {d:.2} s", .{
+            settings.iterations,
+            @as(f64, @floatFromInt(self.clock.now() - started)) / std.time.ns_per_s,
         });
     }
 
@@ -1622,9 +1813,15 @@ pub const Engine = struct {
                 } else .off,
                 .local_shadow = localShadowBlock(look.local_shadow),
                 .shadow_view_projections = self.local_matrices[0..self.local_layer_count],
-                .ambient = look.ambient,
+                // With the sky installed the environment cube holds it, so the
+                // reflections and the background take none of the ambient on
+                // top. Set here rather than once in `setAtmosphere`: an
+                // application writing its ambient each step would otherwise
+                // put the default share back and count the sky twice.
+                .ambient = if (self.renderer.atmosphere != null) withoutReflected(look.ambient) else look.ambient,
                 .probe_grid = self.probe_grid,
                 .debug = .{ .view = look.debug_view },
+                .halo = look.halo,
             });
 
             self.metrics.record(.rings, phase.split());
@@ -1652,6 +1849,9 @@ pub const Engine = struct {
             self.morph_pass.record(commands, self.frame_index);
             try callHooks(components, "compute", .{ self, level, commands });
             self.mark(commands, .compute, .end);
+            self.mark(commands, .atmosphere, .begin);
+            self.renderer.recordSky(commands);
+            self.mark(commands, .atmosphere, .end);
 
             // Everything a frame can be refused for is refused here, before a
             // single command is recorded. What comes back is what every stage
@@ -2341,3 +2541,12 @@ fn scaledSide(side: u32, scale: f32) u32 {
 fn lane(direction: res.Vec3) [4]f32 {
     return .{ direction[0], direction[1], direction[2], 0 };
 }
+
+// The texture cache's keys for the sky's tables, in two banks so a sky
+// installed again does not release what is in use before it is replaced.
+const SkyTableKeys = struct { transmittance: []const u8, multiple: []const u8 };
+const sky_table_keys = [2]SkyTableKeys{
+    .{ .transmittance = "lenore.sky.transmittance.0", .multiple = "lenore.sky.multiple.0" },
+    .{ .transmittance = "lenore.sky.transmittance.1", .multiple = "lenore.sky.multiple.1" },
+};
+const sky_brdf_key = "lenore.sky.split_sum";

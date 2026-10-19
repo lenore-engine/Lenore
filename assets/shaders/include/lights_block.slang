@@ -32,9 +32,18 @@ struct LocalShadow
 struct Ambient
 {
     float3 sky;
-    float padding_0;
+    float reflected;
     float3 ground;
     float padding_1;
+};
+
+// Mirrors `uniforms.Halo`.
+struct Halo
+{
+    float narrow;
+    float narrow_degrees;
+    float wide;
+    float wide_degrees;
 };
 
 struct LightsUbo
@@ -49,6 +58,7 @@ struct LightsUbo
     ProbeGridParams probe_grid;
     // Mirrors `uniforms.Debug`: x is the `DebugView`, zero the shaded frame.
     uint4 debug;
+    Halo halo;
 };
 
 [[vk::binding(2, 0)]] ConstantBuffer<LightsUbo> lights;

@@ -64,6 +64,8 @@ const Reflection = struct {
         // How a `resource` is shaped. A structured buffer and a texture are
         // both resources and take different descriptor types.
         baseShape: []const u8 = "",
+        array: bool = false,
+        access: []const u8 = "",
         fields: []const Parameter = &.{},
         sizes: []const Size = &.{},
         // A constant buffer's contents are one level down, in the struct it
@@ -279,7 +281,10 @@ test "the lights block is what the shaders read, field by field" {
     for ([_][]const u8{ "scene", "sky" }) |module| {
         const parsed = try parse(arena.allocator(), reflectionFor(module));
         const lights = find(parsed.parameters, "lights") orelse return error.MissingLightsBlock;
-        try expectMirrors(gpu.LightsUniform, try block(lights));
+        const contents = try block(lights);
+        try expectMirrors(gpu.LightsUniform, contents);
+        const ambient = find(contents.fields, "ambient") orelse return error.MissingAmbient;
+        try expectMirrors(gpu.AmbientUniform, &ambient.type);
     }
 }
 
@@ -1464,4 +1469,50 @@ test "motion is sampled from the scene slot and keeps the shaded varying locatio
             try testing.expectEqual(@as(u32, 6), colour.binding.index);
         }
     }
+}
+
+test "atmosphere resources, parameter rows and sun match the compute interface" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try parse(arena.allocator(), reflectionFor("atmosphere"));
+    const names = [_][]const u8{ "transmittance_lut", "multiple_lut", "model", "sky_cube" };
+    for (gpu.AtmosphereBindings, names) |binding, name| {
+        const parameter = find(parsed.parameters, name) orelse return error.MissingAtmosphereResource;
+        try testing.expectEqual(binding.slot, parameter.binding.index);
+        try testing.expectEqual(@as(u32, 0), parameter.binding.space);
+        if (binding.kind == .storage_image) {
+            try testing.expectEqualStrings("texture2D", parameter.type.baseShape);
+            try testing.expect(parameter.type.array);
+            try testing.expectEqualStrings("readWrite", parameter.type.access);
+        } else try testing.expectEqual(binding.kind, try descriptorTypeOf(parameter));
+    }
+    const model = find(parsed.parameters, "model") orelse return error.MissingAtmosphereModel;
+    const contents = model.type.resultType orelse return error.MissingAtmosphereModel;
+    try testing.expectEqual(@as(u32, @sizeOf(gpu.AtmosphereParameters)), try uniformSize(contents));
+    const rows = [_][]const u8{ "radii", "ray", "mie", "extinction", "absorption", "ozone_tent", "knobs", "samples" };
+    for (rows, 0..) |name, index| {
+        const field = find(contents.fields, name) orelse return error.MissingAtmosphereRow;
+        try testing.expectEqual(@as(u32, @intCast(index * 16)), field.binding.offset);
+        try testing.expectEqual(@as(u32, 16), field.binding.size);
+    }
+    const sun = find(parsed.parameters, "sun") orelse return error.MissingAtmosphereSun;
+    try testing.expectEqualStrings("pushConstantBuffer", sun.binding.kind);
+    try expectMirrors(gpu.AtmosphereSun, try block(sun));
+}
+
+test "sky storage format is RGBA16F without unrequested formatless access" {
+    const words = lenore.Shaders.atmosphere.spirv;
+    var cursor: usize = 5;
+    var storage_images: usize = 0;
+    while (cursor < words.len) : (cursor += words[cursor] >> 16) {
+        const opcode = words[cursor] & 0xffff;
+        // SPIR-V OpCapability: StorageImageRead/WriteWithoutFormat are 55/56.
+        if (opcode == 17) try testing.expect(words[cursor + 1] != 55 and words[cursor + 1] != 56);
+        // SPIR-V OpTypeImage: Sampled=2 means storage, ImageFormat=2 is Rgba16f.
+        if (opcode == 25 and words[cursor + 7] == 2) {
+            storage_images += 1;
+            try testing.expectEqual(@as(u32, 2), words[cursor + 8]);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), storage_images);
 }

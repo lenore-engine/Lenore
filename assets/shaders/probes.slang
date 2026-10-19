@@ -144,6 +144,7 @@ groupshared uint ray_backface[rays_per_probe];
 groupshared float3 ray_direction[rays_per_probe];
 groupshared float ray_distance[rays_per_probe];
 groupshared float3 ray_radiance[rays_per_probe];
+groupshared float ray_escaped[rays_per_probe];
 
 // Stated rather than left for slangc to infer: the module is compiled with
 // the same profile as every other, and the ray query capability is this entry
@@ -178,6 +179,7 @@ void updateMain(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
     float3 radiance;
     float distance;
     uint backface = 0;
+    float escaped = 0.0;
     if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
     {
         distance = query.CommittedRayT();
@@ -205,9 +207,11 @@ void updateMain(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
     {
         distance = update.max_distance;
         radiance = lerp(update.ground, update.sky, direction.y * 0.5 + 0.5);
+        escaped = 1.0;
     }
 
     ray_backface[thread] = backface;
+    ray_escaped[thread] = escaped;
     ray_direction[thread] = direction;
     ray_distance[thread] = distance;
     ray_radiance[thread] = radiance;
@@ -239,7 +243,23 @@ void updateMain(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
             for (uint r = 0; r < rays_per_probe; ++r) count += ray_backface[r];
             backface_share = float(count) / float(rays_per_probe);
         }
-        next_sh[slot] = float4(lerp(estimate, probe_sh[slot].xyz, update.hysteresis), backface_share);
+        // Coefficients 1 to 4 carry, in the fourth lane, the first-order
+        // harmonics of what the rays found of the environment: one for a ray
+        // that left the scene, zero for one that hit. Band 0, then y, z, x,
+        // projected the way the radiance is.
+        float fourth = backface_share;
+        if (thread >= 1 && thread <= 4)
+        {
+            float seen = 0.0;
+            for (uint r = 0; r < rays_per_probe; ++r)
+            {
+                float basis[9];
+                shBasis(ray_direction[r], basis);
+                seen += ray_escaped[r] * basis[thread - 1];
+            }
+            fourth = lerp(seen * (4.0 * pi / float(rays_per_probe)), probe_sh[slot].w, update.hysteresis);
+        }
+        next_sh[slot] = float4(lerp(estimate, probe_sh[slot].xyz, update.hysteresis), fourth);
     }
 
     // Every thread one moment texel: the mean and mean square of the hit

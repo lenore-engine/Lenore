@@ -148,6 +148,16 @@ pub fn build(b: *std.Build) void {
     // a bare file because an example may bring assets of its own, and the two
     // spellings would otherwise be one name meaning two things.
     const examples_step = b.step("examples", "Build every example");
+    // The atmosphere diagnostic is a standalone source file by design.
+    const atmosphere_check = b.addExecutable(.{ .name = "atmosphere_check", .root_module = b.createModule(.{
+        .root_source_file = b.path("examples/atmosphere_check.zig"),
+        .imports = &imports,
+        .target = target,
+        .optimize = optimize,
+    }) });
+    examples_step.dependOn(&b.addInstallArtifact(atmosphere_check, .{}).step);
+    const run_atmosphere = b.addRunArtifact(atmosphere_check);
+    b.step("run-atmosphere_check", "Compare the GPU sky cube with CPU transport").dependOn(&run_atmosphere.step);
     const example_names = directoriesIn(b, "examples");
     for (example_names) |name| {
         const module = b.createModule(.{

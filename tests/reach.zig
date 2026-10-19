@@ -21,7 +21,11 @@ test "the device-facing surface is compiled" {
     _ = &lenore.Engine.retire;
     _ = &lenore.Engine.refitSun;
     _ = &lenore.Engine.refitLocalShadows;
+    _ = &lenore.Engine.setAtmosphere;
+    _ = &lenore.Engine.relightSky;
+    _ = &lenore.Engine.readSkyCube;
     _ = &lenore.Engine.buildIndirect;
+    _ = &lenore.Engine.relightIndirect;
     // The scale it reads comes off the window, so the body needs one. The
     // arithmetic it hands that scale to is `fontPixelsFor`, tested on its own.
     _ = &lenore.Engine.fontPixels;

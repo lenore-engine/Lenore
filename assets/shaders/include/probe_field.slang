@@ -8,6 +8,11 @@
 // names:
 //
 //   StructuredBuffer<float4> probe_sh;       // probe * 9 + i, rgb in xyz
+//
+// The fourth lanes: coefficient 0's is the share of the probe's rays that met
+// a backface; coefficients 1 to 4 carry the first-order harmonics of the
+// probe's visibility of the environment (one where a ray left the scene, zero
+// where it hit), band 0 then y, z, x; the rest are unused.
 //   StructuredBuffer<float2> probe_moments;  // probe * 64 + texel
 //
 // The arithmetic mirrors `probe_grid.zig` in lenore-scene, which is where it
@@ -112,6 +117,21 @@ float2 probeMoments(uint probe, float3 direction)
     return lerp(lerp(a, b, t.x), lerp(c, e, t.x), t.y);
 }
 
+// The share of the environment a probe sees around `direction`, weighted by a
+// cosine lobe as irradiance is: what a fully rough surface facing that way
+// would receive of the world outside, over what it would receive in the open.
+// From the first-order harmonics in the fourth lanes, each band scaled by the
+// clamped-cosine kernel over pi (one, then two thirds).
+float probeVisibility(uint probe, float3 direction)
+{
+    const uint base = probe * probe_sh_count;
+    const float v = sh_c0 * probe_sh[base + 1].w
+        + (2.0 / 3.0) * sh_c1 * (direction.y * probe_sh[base + 2].w
+            + direction.z * probe_sh[base + 3].w
+            + direction.x * probe_sh[base + 4].w);
+    return saturate(v);
+}
+
 uint probeIndex(ProbeGridParams grid, uint3 cell)
 {
     return cell.x + grid.counts.x * (cell.y + grid.counts.y * cell.z);
@@ -127,7 +147,18 @@ uint probeIndex(ProbeGridParams grid, uint3 cell)
 // that moves the lookup off the surface, mostly toward the eye, is theirs in
 // shape; its constants were written from memory of the paper and are to be
 // checked against it.
-float3 interpolateProbes(ProbeGridParams grid, float3 position, float3 normal, float3 to_eye)
+// What the eight probes give a shaded point: the irradiance for its normal,
+// and along a second direction the irradiance and the share of the
+// environment seen, for reflections. One set of weights for both, since they
+// say which probes can see the point, not which way it looks.
+struct ProbeLookup
+{
+    float3 irradiance;
+    float3 along;
+    float visible;
+};
+
+ProbeLookup lookUpProbes(ProbeGridParams grid, float3 position, float3 normal, float3 to_eye, float3 direction)
 {
     const float3 biased = position + (normal * 0.2 + to_eye * 0.8) * (0.3 * grid.spacing);
 
@@ -139,6 +170,8 @@ float3 interpolateProbes(ProbeGridParams grid, float3 position, float3 normal, f
     const uint3 base = uint3(cell);
 
     float3 total = float3(0.0, 0.0, 0.0);
+    float3 along = float3(0.0, 0.0, 0.0);
+    float visible = 0.0;
     float weight_sum = 0.0;
     for (uint corner = 0; corner < 8; ++corner)
     {
@@ -178,9 +211,29 @@ float3 interpolateProbes(ProbeGridParams grid, float3 position, float3 normal, f
         if (weight < threshold) weight *= weight * weight / (threshold * threshold);
 
         total += probeIrradiance(probe, normal) * weight;
+        along += probeIrradiance(probe, direction) * weight;
+        visible += probeVisibility(probe, direction) * weight;
         weight_sum += weight;
     }
-    return weight_sum > 0.0 ? total / weight_sum : float3(0.0, 0.0, 0.0);
+    ProbeLookup lookup;
+    if (weight_sum > 0.0)
+    {
+        lookup.irradiance = total / weight_sum;
+        lookup.along = along / weight_sum;
+        lookup.visible = visible / weight_sum;
+    }
+    else
+    {
+        lookup.irradiance = float3(0.0, 0.0, 0.0);
+        lookup.along = float3(0.0, 0.0, 0.0);
+        lookup.visible = 0.0;
+    }
+    return lookup;
+}
+
+float3 interpolateProbes(ProbeGridParams grid, float3 position, float3 normal, float3 to_eye)
+{
+    return lookUpProbes(grid, position, normal, to_eye, normal).irradiance;
 }
 
 // Irradiance at `position` facing `normal`: the probes' light inside their box,
@@ -194,6 +247,28 @@ float3 interpolateProbes(ProbeGridParams grid, float3 position, float3 normal, f
 // floor or wall there belongs to the probes. Over the next spacing the field
 // gives way to `open`, which is right for open ground and is the only estimate
 // there is anywhere else the probes do not reach.
+// `sampleProbeField` for reflections: inside the box, the probes' lookup;
+// past it, giving way over the same spacing to the open world, which sees
+// all of the environment and holds `open` along the direction and
+// `open_along` along the reflection.
+ProbeLookup sampleProbeReflection(ProbeGridParams grid, float3 position, float3 normal, float3 to_eye, float3 direction, float3 open, float3 open_along)
+{
+    const float3 lowest = grid.origin;
+    const float3 highest = grid.origin + float3(grid.counts - 1) * grid.spacing;
+    const float outside = length(max(max(lowest - position, position - highest), float3(0.0, 0.0, 0.0)));
+    const float share = saturate(outside / grid.spacing - 0.5);
+    ProbeLookup lookup;
+    lookup.irradiance = open;
+    lookup.along = open_along;
+    lookup.visible = 1.0;
+    if (share >= 1.0) return lookup;
+    const ProbeLookup field = lookUpProbes(grid, position, normal, to_eye, direction);
+    lookup.irradiance = lerp(field.irradiance, open, share);
+    lookup.along = lerp(field.along, open_along, share);
+    lookup.visible = lerp(field.visible, 1.0, share);
+    return lookup;
+}
+
 float3 sampleProbeField(ProbeGridParams grid, float3 position, float3 normal, float3 to_eye, float3 open)
 {
     const float3 lowest = grid.origin;

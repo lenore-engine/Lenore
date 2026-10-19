@@ -124,6 +124,14 @@ pub const morph: gpu.MorphShader = .{
     .compute_entry = "morphMain",
 };
 
+// The physical sky, marched into the environment cube when the sun moves.
+// Compute only, with a descriptor set of its own; the engine hands it to the
+// renderer when asked for, as it does the meter.
+pub const atmosphere: gpu.AtmosphereShader = .{
+    .spirv = gpu.spirvWords(@embedFile("atmosphere")),
+    .compute_entry = "atmosphereMain",
+};
+
 // The photocell: the frame's own light, reduced to a coarse grid an application
 // can set an exposure from. Compute only, and it shares no binding with any pass
 // above.
@@ -304,6 +312,14 @@ pub const all = [_]Module{
         .reflection = @embedFile("meter_reflection"),
         .entry_points = &.{
             .{ .name = meter.compute_entry, .stage = .compute },
+        },
+    },
+    .{
+        .name = "atmosphere",
+        .spirv = atmosphere.spirv,
+        .reflection = @embedFile("atmosphere_reflection"),
+        .entry_points = &.{
+            .{ .name = atmosphere.compute_entry, .stage = .compute },
         },
     },
 };

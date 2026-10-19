@@ -54,6 +54,16 @@ static const float pi = 3.14159265358979;
 // share the sun's.
 static const float sun_sin_radius = 0.0046600;
 
+// The disc is drawn no brighter than this many times a white surface facing
+// its light. The light itself is unchanged: what a surface receives comes from
+// the light block, not from the disc. Uncapped, the disc is about 4.6e4 times
+// that, and a disc seven pixels across at such a value is binary at its edge;
+// the temporal resolve's jittered copies and the bloom's energy-linear chain
+// then turn it into a lumpy, pulsing square. Fifty is still far past any
+// exposure's white, so the disc stays the brightest thing in the sky and
+// glows through the bloom, and its edge has a range the resolve can carry.
+static const float disc_over_white = 50.0;
+
 // The largest value the HDR attachment holds in its narrowest channel, the
 // unsigned 10-bit float's 63488 (see `min_roughness` in scene.slang). The disc
 // is held under it rather than left to whatever the conversion makes of a
@@ -98,7 +108,7 @@ float4 fragmentMain(Varying varying) : SV_Target
     // footprint would return a correctly filtered sample of the wrong
     // roughness, which reads as a blurred sky and not as a sampling error.
     const float3 direction = normalize(varying.ray);
-    float3 sky = ggx_environment.SampleLevel(direction, 0.0).rgb + ambientRadiance(direction);
+    float3 sky = ggx_environment.SampleLevel(direction, 0.0).rgb + lights.ambient.reflected * ambientRadiance(direction);
 
     // A disc of uniform radiance L and angular radius r gives a surface facing
     // it L pi sin^2 r, so the light's irradiance E over that is the radiance
@@ -122,7 +132,17 @@ float4 fragmentMain(Varying varying) : SV_Target
         const float covered = dot(direction, to_light) > 0.0
             ? saturate((sun_sin_radius - off_centre) / edge + 0.5)
             : 0.0;
-        sky += min(light.colour * (light.intensity * disc * covered), hdr_largest);
+        // A white Lambertian surface facing the light returns E / pi.
+        const float drawn = min(disc, disc_over_white / pi);
+        sky += min(light.colour * (light.intensity * drawn * covered), hdr_largest);
+
+        // The halo, by the angle from the light's centre. Atan2 of the sine
+        // and cosine keeps it smooth through the centre and past a right
+        // angle, where either alone loses precision.
+        const float degrees = atan2(off_centre, dot(direction, to_light)) * (180.0 / pi);
+        const float glow = lights.halo.narrow * exp(-degrees / lights.halo.narrow_degrees) +
+            lights.halo.wide * exp(-degrees / lights.halo.wide_degrees);
+        sky += min(light.colour * (light.intensity * glow / pi), hdr_largest);
     }
 
     // Opaque. The target's alpha is composited against nothing and the post
