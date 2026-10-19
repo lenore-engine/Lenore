@@ -80,17 +80,23 @@ pub const Prop = struct {
     // this model apart from every other one resident at the same time, and two
     // levels opening the same prop under the same name share its images.
     name: []const u8,
+    // How many copies of the model can be drawn at once, each placed or hidden
+    // through the world on its own. They share the upload, the images and the
+    // materials; each costs only its draws in the instance capacity.
+    instances: u32 = 1,
 };
 
 // What a level keeps of each prop beyond its draws, which the world holds.
 const LoadedProp = struct {
     model: *const gltf.importer.Model,
+    instances: u32,
     image_loader: images.ImageLoader,
     image_records: []images.ImageRecord,
     image_report: images.Report,
 
     const empty: LoadedProp = .{
         .model = undefined,
+        .instances = 0,
         .image_loader = .{ .uses = &.{}, .bound = &.{} },
         .image_records = &.{},
         .image_report = .{ .records = &.{} },
@@ -234,6 +240,7 @@ pub const Level = struct {
         var material_count: usize = model.materials.len;
         for (options.props, self.props) |source, *prop| {
             prop.model = source.model;
+            prop.instances = source.instances;
             prop.image_loader = try .init(allocator, source.model, source.name);
             prop.image_records = try allocator.alloc(images.ImageRecord, source.model.images.len);
             @memset(prop.image_records, .{});
@@ -264,7 +271,11 @@ pub const Level = struct {
         var first_mesh: usize = model.meshes.len;
         for (self.props, prop_sources) |*prop, *source| {
             const count = prop.model.meshes.len;
-            source.* = .{ .model = prop.model, .meshes = self.meshes[first_mesh..][0..count] };
+            source.* = .{
+                .model = prop.model,
+                .meshes = self.meshes[first_mesh..][0..count],
+                .instances = prop.instances,
+            };
             first_mesh += count;
         }
         self.world = try .init(

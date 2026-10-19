@@ -30,6 +30,12 @@ const world = @import("world.zig");
 pub const Engine = engine.Engine;
 pub const EngineOptions = engine.Options;
 pub const Look = engine.Look;
+pub const Upscaler = engine.Upscaler;
+pub const FsrLook = engine.FsrLook;
+pub const FsrTuning = engine.FsrTuning;
+pub const fsr_available = engine.fsr_available;
+pub const IndirectSource = engine.IndirectSource;
+pub const IndirectSettings = engine.IndirectSettings;
 pub const Hooks = engine.Hooks;
 
 // The two common cameras as components, and the blocks a custom controller
@@ -77,6 +83,8 @@ pub const Console = console.Console;
 pub const DebugOverlay = debug_overlay.DebugOverlay;
 pub const DebugLines = debug_overlay.Lines;
 pub const DebugOverlaySide = debug_overlay.Side;
+pub const FrameGraph = debug_overlay.FrameGraph;
+pub const debug_graph_frames = debug_overlay.graph_frames;
 
 // A host and a client in one process, and the record that replays a run.
 pub const Pipe = link.Pipe;

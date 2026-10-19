@@ -255,7 +255,7 @@ const Range = struct {
         // Placed against the camera just set, so the pistol is drawn in this
         // frame's view and not the last one's.
         const held = self.handling.place(self.handling.pose(self.recoil.weapon()), engine.camera.placement());
-        try level.world.placeProp(pistol_prop, held.model);
+        try level.world.placeProp(pistol_prop, 0, held.model);
 
         // The clamped delta in nanoseconds, so a stall does not owe a volley.
         const report = self.action.advance(@min(time.interval_ns, lenore.max_frame_delta_ns));

@@ -8,10 +8,13 @@
 // before the blended set is what lets a transparent surface composite over the
 // sky instead of over the clear colour.
 //
-// Nothing here declares a set of its own. The camera comes from the frame set
-// and the cube from the scene set, both of which the main pass has already
-// bound for the draws around this one, so the whole pass is a pipeline bind and
-// three vertices.
+// Nothing here declares a set of its own. The camera and the lights come from
+// the frame set and the cube from the scene set, all of which the main pass has
+// already bound for the draws around this one, so the whole pass is a pipeline
+// bind and three vertices.
+//
+// What it draws is what the surfaces are lit by: the cube, the ambient they
+// add to it, and each directional light as the disc it would be in the sky.
 
 // Mirrors `uniforms.Camera`, as scene.slang does. The fields before the basis
 // are what place it, so they are declared rather than replaced by padding of
@@ -27,6 +30,11 @@ struct CameraUbo
     float4 ray_right;
     float4 ray_up;
     float4 ray_front;
+    float4x4 previous_view_projection;
+    uint4 motion;
+    // The sub-pixel offset `view_projection` carries this frame, in device
+    // coordinates, zero when unjittered.
+    float4 jitter;
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<CameraUbo> camera;
@@ -36,6 +44,21 @@ struct CameraUbo
 // radiometric scale by construction, with no second copy and no intensity to
 // keep in step between the two.
 [[vk::binding(2, 1)]] SamplerCube ggx_environment;
+
+#include "include/lights_block.slang"
+
+static const float pi = 3.14159265358979;
+
+// The sine of the sun's angular radius, 0.267 degrees, which is the disc every
+// directional light is drawn as. A light has no size of its own, so they all
+// share the sun's.
+static const float sun_sin_radius = 0.0046600;
+
+// The largest value the HDR attachment holds in its narrowest channel, the
+// unsigned 10-bit float's 63488 (see `min_roughness` in scene.slang). The disc
+// is held under it rather than left to whatever the conversion makes of a
+// larger one.
+static const float hdr_largest = 63488.0;
 
 struct Varying
 {
@@ -74,7 +97,33 @@ float4 fragmentMain(Varying varying) : SV_Target
     // than an anti-aliasing chain, so a level picked from the screen-space
     // footprint would return a correctly filtered sample of the wrong
     // roughness, which reads as a blurred sky and not as a sampling error.
-    const float3 sky = ggx_environment.SampleLevel(normalize(varying.ray), 0.0).rgb;
+    const float3 direction = normalize(varying.ray);
+    float3 sky = ggx_environment.SampleLevel(direction, 0.0).rgb + ambientRadiance(direction);
+
+    // A disc of uniform radiance L and angular radius r gives a surface facing
+    // it L pi sin^2 r, so the light's irradiance E over that is the radiance
+    // that makes the drawn disc and the light the same light: about 4.6e4 for
+    // E = pi. Past E of about 4.3 the disc is clamped to the attachment's
+    // largest value and is dimmer than its light.
+    //
+    // The angle is measured by its sine, the length of the cross product,
+    // because within a quarter of a degree its cosine is too near one for a
+    // float to resolve the edge. The edge is covered over one pixel's width of
+    // that sine, so the disc, seven or so pixels across, does not shimmer as the
+    // view turns.
+    const float disc = 1.0 / (pi * sun_sin_radius * sun_sin_radius);
+    for (uint i = 0; i < lights.count.x; ++i)
+    {
+        const Light light = lights.lights[i];
+        if (light.kind != 0) continue;
+        const float3 to_light = -light.direction;
+        const float off_centre = length(cross(direction, to_light));
+        const float edge = max(fwidth(off_centre), 1.0e-7);
+        const float covered = dot(direction, to_light) > 0.0
+            ? saturate((sun_sin_radius - off_centre) / edge + 0.5)
+            : 0.0;
+        sky += min(light.colour * (light.intensity * disc * covered), hdr_largest);
+    }
 
     // Opaque. The target's alpha is composited against nothing and the post
     // pass reads the colour alone.

@@ -22,8 +22,8 @@ const gpu = @import("lenore-gpu");
 // listed in the order `gpu.sceneVariantIndex` computes: skinning is the most
 // significant axis and the colour the least.
 //
-// Four fragment entry points, on the colour axis and whether the pass shades or
-// only applies MASK coverage. A fragment stage's input is the vertex stage's
+// Six fragment entry points, on the colour axis and whether the pass shades,
+// writes opaque motion or writes motion with MASK coverage. A fragment stage's input is the vertex stage's
 // output, so the variants that carry COLOR_0 need the one that declares it.
 pub const scene: gpu.SceneShader = .{
     .spirv = gpu.spirvWords(@embedFile("scene")),
@@ -39,12 +39,15 @@ pub const scene: gpu.SceneShader = .{
     },
     .fragment_entry = "fragmentMain",
     .colour_fragment_entry = "colourFragmentMain",
+    .motion_fragment_entry = "motionFragmentMain",
+    .colour_motion_fragment_entry = "colourMotionFragmentMain",
     .mask_fragment_entry = "maskFragmentMain",
     .colour_mask_fragment_entry = "colourMaskFragmentMain",
 };
 
 // The background: one screen-covering triangle sampling the environment cube
-// along the view ray. It reads the camera and the cube and declares nothing
+// along the view ray, with the ambient and a disc for each directional light
+// on top. It reads the camera, the lights and the cube and declares nothing
 // else, which is what lets it be created against the pipeline layout the scene
 // draws through.
 pub const sky: gpu.SkyShader = .{
@@ -85,6 +88,25 @@ pub const shadow: gpu.ShadowShader = .{
     .masked_fragment_entry = "fragmentMain",
 };
 
+// Screen-space ambient occlusion: a chain of distances from the stored camera
+// depth, an estimate from the chain and a blur along each axis, every draw one
+// covering triangle against one set layout and one push block.
+pub const ao: gpu.AoShader = .{
+    .spirv = gpu.spirvWords(@embedFile("ao")),
+    .vertex_entry = "vertexMain",
+    .distance_entry = "distanceMain",
+    .downsample_entry = "downsampleMain",
+    .occlusion_entry = "occlusionMain",
+    .blur_entry = "blurMain",
+};
+
+// The probe field's update: one workgroup per probe tracing its rays with
+// inline ray queries. Compute only; built when the device enabled ray queries.
+pub const probes: gpu.ProbesShader = .{
+    .spirv = gpu.spirvWords(@embedFile("probes")),
+    .update_entry = "updateMain",
+};
+
 // The overlay: a two-dimensional draw list composited onto the presentable
 // image after the tone operator. One pipeline, because the fragment stage
 // multiplies the vertex colour by the sampled texel whatever the image holds.
@@ -110,6 +132,15 @@ pub const meter: gpu.MeterShader = .{
     .compute_entry = "meterMain",
 };
 
+// The temporal resolve: this frame's jittered picture and the history of the
+// frames before it, gathered at the output resolution. Optional like the meter,
+// and added by the engine when it is asked for.
+pub const temporal: gpu.TemporalShader = .{
+    .spirv = gpu.spirvWords(@embedFile("temporal")),
+    .vertex_entry = "vertexMain",
+    .fragment_entry = "fragmentMain",
+};
+
 // The five the renderer builds pipelines from, in the one value its `init`
 // takes. The prepass is not among them: the engine owns that pass directly and
 // hands it `morph` above.
@@ -124,6 +155,7 @@ pub const renderer: gpu.Shaders = .{
     .post = post,
     .bloom = bloom,
     .shadow = shadow,
+    .ao = ao,
 };
 
 // Below: a uniform view of the table for the checks that walk it rather than
@@ -175,6 +207,8 @@ pub const all = [_]Module{
             .{ .name = scene.vertex_entry[7], .stage = .vertex },
             .{ .name = scene.fragment_entry, .stage = .fragment },
             .{ .name = scene.colour_fragment_entry, .stage = .fragment },
+            .{ .name = scene.motion_fragment_entry, .stage = .fragment },
+            .{ .name = scene.colour_motion_fragment_entry, .stage = .fragment },
             .{ .name = scene.mask_fragment_entry, .stage = .fragment },
             .{ .name = scene.colour_mask_fragment_entry, .stage = .fragment },
         },
@@ -219,6 +253,26 @@ pub const all = [_]Module{
         },
     },
     .{
+        .name = "ao",
+        .spirv = ao.spirv,
+        .reflection = @embedFile("ao_reflection"),
+        .entry_points = &.{
+            .{ .name = ao.vertex_entry, .stage = .vertex },
+            .{ .name = ao.distance_entry, .stage = .fragment },
+            .{ .name = ao.downsample_entry, .stage = .fragment },
+            .{ .name = ao.occlusion_entry, .stage = .fragment },
+            .{ .name = ao.blur_entry, .stage = .fragment },
+        },
+    },
+    .{
+        .name = "probes",
+        .spirv = probes.spirv,
+        .reflection = @embedFile("probes_reflection"),
+        .entry_points = &.{
+            .{ .name = probes.update_entry, .stage = .compute },
+        },
+    },
+    .{
         .name = "ui",
         .spirv = ui.spirv,
         .reflection = @embedFile("ui_reflection"),
@@ -233,6 +287,15 @@ pub const all = [_]Module{
         .reflection = @embedFile("morph_reflection"),
         .entry_points = &.{
             .{ .name = morph.compute_entry, .stage = .compute },
+        },
+    },
+    .{
+        .name = "temporal",
+        .spirv = temporal.spirv,
+        .reflection = @embedFile("temporal_reflection"),
+        .entry_points = &.{
+            .{ .name = temporal.vertex_entry, .stage = .vertex },
+            .{ .name = temporal.fragment_entry, .stage = .fragment },
         },
     },
     .{

@@ -470,6 +470,7 @@ const Driver = struct {
             .ray_right = lane(basis.right),
             .ray_up = lane(basis.up),
             .ray_front = lane(basis.front),
+            .previous_view_projection = gpu.mat4(zm.identity()),
         }).block;
 
         self.effect.record(commands, .{

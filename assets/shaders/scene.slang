@@ -4,11 +4,12 @@
 // the frame supplies and is bound once with a dynamic offset per ring; set 1
 // holds the scene's material array and is bound once; set 2 holds one material's
 // textures and is bound when the ordered list reaches a new material; set 3
-// holds the sun shadow map and is bound once.
+// holds the shadow maps, the sun's and the local lights' array, and is bound
+// once.
 //
-// The map has a set to itself rather than a slot in set 1. The bake that fills
-// it names sets 0 to 2 in its own pipeline layout, so a slot in any of them
-// would leave the map bound as a texture while it is the attachment being
+// The maps have a set to themselves rather than slots in set 1. The bake that
+// fills them names sets 0 to 2 in its own pipeline layout, so a slot in any of
+// them would leave a map bound as a texture while it is the attachment being
 // written into.
 
 struct CameraUbo
@@ -25,39 +26,20 @@ struct CameraUbo
     float4 ray_right;
     float4 ray_up;
     float4 ray_front;
+    float4x4 previous_view_projection;
+    uint4 motion;
+    // The sub-pixel offset `view_projection` carries this frame, in device
+    // coordinates, zero when unjittered.
+    float4 jitter;
 };
 
-// Mirrors `uniforms.Light`. Each kind reads only its own fields and the rest
-// are zero, so no lane means one thing here and another there.
-struct Light
-{
-    float3 position; // the centre for rect, the source for point and spot
-    uint kind;       // 0 = directional, 1 = point, 2 = spot, 3 = rect
-    float3 colour;
-    float intensity;
-    // Unit, the way the light travels. For rect it is the face the rectangle
-    // emits from. Directional, spot and rect.
-    float3 direction;
-    float range;      // point, spot and rect
-    float cos_inner;  // spot
-    float cos_outer;  // spot
-    float2 padding;
-    // The rectangle, for rect. `half_edge` is half of one edge as a vector from
-    // the centre; the other edge is perpendicular to it and to `direction`, with
-    // `half_extent` for its half length.
-    float3 half_edge;
-    float half_extent;
-};
+#include "include/lights_block.slang"
 
-// Mirrors `uniforms.max_lights`. The array bounds the loop; `count.x` is how
-// much of it holds a light, and the rest is not written by anyone.
-static const uint max_lights = 16;
-
-struct LightsUbo
-{
-    uint4 count; // x = live lights, yzw are the array's alignment
-    Light lights[max_lights];
-};
+// The indirect-light probe field, written by probes.slang and read by
+// `sampleProbeField`. Declared before the include, which reads them by name.
+[[vk::binding(7, 1)]] StructuredBuffer<float4> probe_sh;
+[[vk::binding(8, 1)]] StructuredBuffer<float2> probe_moments;
+#include "include/probe_field.slang"
 
 // Mirrors `frame_set.Instance`. The padding is declared rather than left to the
 // rules, because the stride this struct is stepped through by has to be the one
@@ -70,12 +52,12 @@ struct Instance
     // `skinnedVertexMain` and by nothing else.
     uint joint_base;
     // The material and two padding words are scalars and not a `uint3`. A
-    // three-component vector aligns to sixteen bytes, which pushes the tail to
-    // offset eighty and rounds the element to ninety-six; measured, against the
-    // host's eighty.
+    // three-component vector would move these fields and the previous matrix
+    // away from the offsets the host's Instance declares.
     uint material_index;
     uint padding_0;
     uint padding_1;
+    float4x4 previous_model;
 };
 
 // Mirrors `uniforms.SunShadow`, and shadow.slang reads the same block for the
@@ -117,7 +99,6 @@ struct MaterialData
 
 [[vk::binding(0, 0)]] ConstantBuffer<CameraUbo> camera;
 [[vk::binding(1, 0)]] StructuredBuffer<Instance> instances;
-[[vk::binding(2, 0)]] ConstantBuffer<LightsUbo> lights;
 // One array for the whole frame. Each instance owns a contiguous run in it,
 // starting at its own `joint_base`, so several skeletons can be drawn as
 // instances of one draw.
@@ -147,6 +128,15 @@ struct MaterialData
 // Backrooms' achromatic directional cache, but both shaders share one scene-set
 // layout and every slot in that layout is declared here for reflection.
 [[vk::binding(5, 1)]] Sampler2D lightmap_direction;
+// How much ambient reaches each pixel, estimated from the camera depth between
+// the prepass and this pass at half the target's resolution, and one wherever
+// the effect is off. Read by screen position, so it is the same for every
+// surface drawn at a pixel; a blended surface in front of an occluded one
+// takes the darkness meant for what is behind it.
+[[vk::binding(6, 1)]] Sampler2D ambient_occlusion;
+[[vk::binding(9, 1)]] Sampler2D motion_vectors;
+
+static const uint debug_view_motion = 4;
 
 [[vk::binding(0, 2)]] Sampler2D base_colour;
 [[vk::binding(1, 2)]] Sampler2D metallic_roughness;
@@ -159,6 +149,12 @@ struct MaterialData
 // percentage-closer filtering for one fetch. The comparison and the border are
 // the sampler's, in shadow.zig.
 [[vk::binding(0, 3)]] Sampler2DShadow sun_shadow_map;
+// The local lights' layers, through the same comparison sampler: spots and
+// point light faces alike, each layer read through its own matrix.
+[[vk::binding(1, 3)]] Sampler2DArrayShadow local_shadow_maps;
+// The same layers through a nearest sampler that returns depths, for the
+// search that finds how far the casters over a point stand from the light.
+[[vk::binding(2, 3)]] Sampler2DArray local_depths;
 
 struct Vertex
 {
@@ -203,6 +199,34 @@ struct VaryingColour
     // range section 3.7.2 clamps COLOR_0 to.
     float4 colour : COLOR;
 };
+
+// Motion follows the shaded interface so its existing field locations stay fixed.
+struct Motion
+{
+    float4 current : MOTION0;
+    float4 previous : MOTION1;
+};
+
+struct VaryingMotion
+{
+    Varying base;
+    Motion motion;
+};
+
+struct VaryingColourMotion
+{
+    Varying base;
+    float4 colour : COLOR;
+    Motion motion;
+};
+
+Motion vertexMotion(float4 current, float3 previous_local, Instance instance)
+{
+    Motion motion;
+    motion.current = current;
+    motion.previous = mul(mul(float4(previous_local, 1.0), instance.previous_model), camera.previous_view_projection);
+    return motion;
+}
 
 // `SV_InstanceID` is the index within the draw, not within the buffer: Slang
 // declares both `InstanceIndex` and `BaseInstance` and subtracts them, which is
@@ -266,8 +290,22 @@ Varying place(
     return varying;
 }
 
+VaryingMotion placeMotion(
+    float3 local_position,
+    float3 local_normal,
+    float4 local_tangent,
+    float2 uv,
+    float2 uv1,
+    Instance instance)
+{
+    VaryingMotion varying;
+    varying.base = place(local_position, local_normal, local_tangent, uv, uv1, instance);
+    varying.motion = vertexMotion(varying.base.position, local_position, instance);
+    return varying;
+}
+
 // The skinned half, shared by the two entry points that read binding 1.
-Varying placeSkinned(
+VaryingMotion placeSkinned(
     Vertex vertex,
     uint4 joint_indices,
     float4 joint_weights,
@@ -299,7 +337,17 @@ Varying placeSkinned(
         mul(vertex.tangent.xyz, (float3x3)skin),
         vertex.tangent.w);
 
-    return place(skinned_position, skinned_normal, skinned_tangent, vertex.uv, uv1, instance);
+    const uint previous_base = camera.motion.x + base;
+    const float4x4 previous_skin =
+        joint_weights.x * joints[previous_base + joint_indices.x] +
+        joint_weights.y * joints[previous_base + joint_indices.y] +
+        joint_weights.z * joints[previous_base + joint_indices.z] +
+        joint_weights.w * joints[previous_base + joint_indices.w];
+    const float3 previous_position = mul(float4(vertex.position, 1.0), previous_skin).xyz;
+    VaryingMotion varying;
+    varying.base = place(skinned_position, skinned_normal, skinned_tangent, vertex.uv, uv1, instance);
+    varying.motion = vertexMotion(varying.base.position, previous_position, instance);
+    return varying;
 }
 
 // Four vertex entry points over two independent axes, selected by name at
@@ -316,13 +364,13 @@ Varying placeSkinned(
 // slot reading set 1 on a mesh with no TEXCOORD_1 is an asset error, and a
 // silent fall back to set 0 would render it as though it were not.
 [shader("vertex")]
-Varying vertexMain(
+VaryingMotion vertexMain(
     Vertex vertex,
     uint local_instance : SV_InstanceID,
     uint first_instance : SV_StartInstanceLocation)
 {
     const Instance instance = instances[instanceIndex(local_instance, first_instance)];
-    return place(
+    return placeMotion(
         vertex.position,
         vertex.normal.xyz,
         vertex.tangent,
@@ -332,14 +380,14 @@ Varying vertexMain(
 }
 
 [shader("vertex")]
-Varying uv1VertexMain(
+VaryingMotion uv1VertexMain(
     Vertex vertex,
     [[vk::location(7)]] float2 uv1 : TEXCOORD1,
     uint local_instance : SV_InstanceID,
     uint first_instance : SV_StartInstanceLocation)
 {
     const Instance instance = instances[instanceIndex(local_instance, first_instance)];
-    return place(
+    return placeMotion(
         vertex.position,
         vertex.normal.xyz,
         vertex.tangent,
@@ -353,27 +401,29 @@ Varying uv1VertexMain(
 // without it would otherwise interpolate a constant white to every fragment,
 // and the parameter that carries it is not free.
 [shader("vertex")]
-VaryingColour colourVertexMain(
+VaryingColourMotion colourVertexMain(
     Vertex vertex,
     [[vk::location(6)]] float4 colour : COLOR,
     uint local_instance : SV_InstanceID,
     uint first_instance : SV_StartInstanceLocation)
 {
     const Instance instance = instances[instanceIndex(local_instance, first_instance)];
-    VaryingColour varying;
-    varying.base = place(
+    VaryingColourMotion varying;
+    const VaryingMotion placed = placeMotion(
         vertex.position,
         vertex.normal.xyz,
         vertex.tangent,
         vertex.uv,
         float2(0.0),
         instance);
+    varying.base = placed.base;
+    varying.motion = placed.motion;
     varying.colour = colour;
     return varying;
 }
 
 [shader("vertex")]
-VaryingColour uv1ColourVertexMain(
+VaryingColourMotion uv1ColourVertexMain(
     Vertex vertex,
     [[vk::location(6)]] float4 colour : COLOR,
     [[vk::location(7)]] float2 uv1 : TEXCOORD1,
@@ -381,20 +431,22 @@ VaryingColour uv1ColourVertexMain(
     uint first_instance : SV_StartInstanceLocation)
 {
     const Instance instance = instances[instanceIndex(local_instance, first_instance)];
-    VaryingColour varying;
-    varying.base = place(
+    VaryingColourMotion varying;
+    const VaryingMotion placed = placeMotion(
         vertex.position,
         vertex.normal.xyz,
         vertex.tangent,
         vertex.uv,
         uv1,
         instance);
+    varying.base = placed.base;
+    varying.motion = placed.motion;
     varying.colour = colour;
     return varying;
 }
 
 [shader("vertex")]
-Varying skinnedVertexMain(
+VaryingMotion skinnedVertexMain(
     Vertex vertex,
     uint4 joint_indices : JOINTS,
     float4 joint_weights : WEIGHTS,
@@ -406,7 +458,7 @@ Varying skinnedVertexMain(
 }
 
 [shader("vertex")]
-Varying skinnedUv1VertexMain(
+VaryingMotion skinnedUv1VertexMain(
     Vertex vertex,
     uint4 joint_indices : JOINTS,
     float4 joint_weights : WEIGHTS,
@@ -419,7 +471,7 @@ Varying skinnedUv1VertexMain(
 }
 
 [shader("vertex")]
-VaryingColour skinnedColourVertexMain(
+VaryingColourMotion skinnedColourVertexMain(
     Vertex vertex,
     uint4 joint_indices : JOINTS,
     float4 joint_weights : WEIGHTS,
@@ -428,14 +480,16 @@ VaryingColour skinnedColourVertexMain(
     uint first_instance : SV_StartInstanceLocation)
 {
     const Instance instance = instances[instanceIndex(local_instance, first_instance)];
-    VaryingColour varying;
-    varying.base = placeSkinned(vertex, joint_indices, joint_weights, float2(0.0), instance);
+    VaryingColourMotion varying;
+    const VaryingMotion placed = placeSkinned(vertex, joint_indices, joint_weights, float2(0.0), instance);
+    varying.base = placed.base;
+    varying.motion = placed.motion;
     varying.colour = colour;
     return varying;
 }
 
 [shader("vertex")]
-VaryingColour skinnedUv1ColourVertexMain(
+VaryingColourMotion skinnedUv1ColourVertexMain(
     Vertex vertex,
     uint4 joint_indices : JOINTS,
     float4 joint_weights : WEIGHTS,
@@ -445,36 +499,12 @@ VaryingColour skinnedUv1ColourVertexMain(
     uint first_instance : SV_StartInstanceLocation)
 {
     const Instance instance = instances[instanceIndex(local_instance, first_instance)];
-    VaryingColour varying;
-    varying.base = placeSkinned(vertex, joint_indices, joint_weights, uv1, instance);
+    VaryingColourMotion varying;
+    const VaryingMotion placed = placeSkinned(vertex, joint_indices, joint_weights, uv1, instance);
+    varying.base = placed.base;
+    varying.motion = placed.motion;
     varying.colour = colour;
     return varying;
-}
-
-// Windowed inverse-square falloff: pure 1/d^2 over most of the radius, reaching
-// exactly zero at `range` instead of being cut there.
-//
-// KHR_lights_punctual, "Range Property", recommends exactly
-// `max(min(1 - (d/range)^4, 1), 0) / d^2`, and that is what this is. Frostbite
-// squares the window on top of it for a vanishing derivative at the cutoff; the
-// extension is the authority for the assets this reads, and the kink it leaves
-// is in a term that is already zero there.
-//
-// Squared distance in, so a caller can cull before taking a root. `d^4` is the
-// square of that, so no root is needed here either. The floor on the divisor is
-// what a surface at the light's own position lands on.
-float rangeAttenuation(float distance_squared, float range)
-{
-    const float ratio = distance_squared / (range * range);
-    return saturate(1.0 - ratio * ratio) / max(distance_squared, 1.0e-4);
-}
-
-// The cone, between the two cosines. `cos_inner > cos_outer` is established
-// where the cone is built, in `lenore-scene`'s `Light.spot`, which is what keeps
-// smoothstep off its undefined equal-edge case.
-float spotAttenuation(float3 to_light, Light light)
-{
-    return smoothstep(light.cos_outer, light.cos_inner, dot(to_light, -light.direction));
 }
 
 // How much of the sun reaches a point: 1 is lit, 0 is fully shadowed, and the
@@ -512,6 +542,165 @@ float sunVisibility(float3 world_position, float3 geometric_normal)
     // disassembly shows.
     const float visible = sun_shadow_map.SampleCmpLevelZero(uv, ndc.z);
     return 1.0 - (1.0 - visible) * sun_shadow.strength;
+}
+
+// Which of a point light's six layers a direction from the light falls in: the
+// largest component's axis, the negative face second. The face order of
+// `LocalShadowFit` in lenore-scene, whose margin keeps a direction on the edge
+// between two faces inside whichever this picks.
+uint localFace(float3 from_light)
+{
+    const float3 magnitude = abs(from_light);
+    uint axis = 0;
+    float largest = magnitude.x;
+    if (magnitude.y > largest) { axis = 1; largest = magnitude.y; }
+    if (magnitude.z > largest) axis = 2;
+    return 2 * axis + (from_light[axis] < 0.0 ? 1 : 0);
+}
+
+// Taps in the filter, and gathers (four texels each) in the blocker search.
+static const uint soft_taps = 16;
+static const uint search_gathers = 8;
+
+// DECIDE: below this irradiance from a light at a point, in the light block's
+// units, its shadow there is taken hard. The ambient's sky in Reclaim gives
+// about 0.16; a lamp of intensity 5 falls under 0.5 past about 3.2 m. Closed by
+// looking at a soft edge at the boundary, and by the frame time.
+static const float soft_shadow_least_irradiance = 0.5;
+// The widest a penumbra or a search may spread, in texels of the layer. Past
+// it the taps are too sparse to average into an edge, and on a point light's
+// face they would cross more of the two-texel margin than it holds.
+static const float max_soft_texels = 24.0;
+static const float golden_angle = 2.39996323;
+
+// Tap `index` of `count` on a unit disk, spread evenly by area along the golden
+// angle (Vogel 1979) and turned by `spin`.
+float2 vogelTap(uint index, uint count, float spin)
+{
+    const float radius = sqrt((float(index) + 0.5) / float(count));
+    const float angle = float(index) * golden_angle + spin;
+    return radius * float2(cos(angle), sin(angle));
+}
+
+// Jimenez 2014 interleaved gradient noise, as in ao.slang: a per-pixel turn of
+// the tap pattern, so neighbouring pixels sample different points of the disk.
+float shadowNoise(float2 pixel)
+{
+    return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
+}
+
+// The distance along a layer's axis a stored depth stands for. The layer is
+// zmath's `perspectiveFovRh` from the shared near plane to the light's range,
+// so stored = f (z - n) / (z (f - n)) and this is its inverse.
+float layerDistance(float stored, float range)
+{
+    const float near = lights.local_shadow.near;
+    return near * range / (range - stored * (range - near));
+}
+
+// How much of a local light reaches a point, as `sunVisibility` for the sun.
+//
+// The normal offset is authored in texels like the sun's, but a perspective
+// texel grows with distance, so it is scaled by the distance from the light.
+// The face is picked from the offset point, the one projected, so the face and
+// the projection cannot disagree about which side of an edge the point is on.
+//
+// Behind a spot's projection, and past its far plane, read as lit: the cone's
+// own attenuation is zero there in the first case, and in the second the
+// light's range test already rejected the point before this was called.
+//
+// With a source radius the edge is soft, by percentage-closer soft shadows
+// (Fernando, "Percentage-Closer Soft Shadows", SIGGRAPH 2005 sketch): the
+// casters over the point are found and averaged, the penumbra is the width
+// similar triangles give a light of that radius through a caster at that
+// distance, and the comparison is filtered over it. Taps are clamped into the
+// layer, so a wide filter on a point light's face repeats the edge rather than
+// reading the border, which reads as lit.
+float localVisibility(Light light, float3 world_position, float3 geometric_normal, float2 pixel, float arriving)
+{
+    const float strength = lights.local_shadow.strength;
+    if (strength <= 0.0 || light.shadow_layer == no_shadow_layer) return 1.0;
+
+    const float distance = length(world_position - light.position);
+    const float offset = lights.local_shadow.normal_offset_texels * light.shadow_texel_slope * distance;
+    const float3 lookup = world_position + geometric_normal * offset;
+
+    uint layer = light.shadow_layer;
+    if (light.kind == 1) layer += localFace(lookup - light.position);
+
+    const float4 clip = mul(float4(lookup, 1.0), lights.shadow_view_projection[layer]);
+    if (clip.w <= 0.0) return 1.0;
+    const float3 ndc = clip.xyz / clip.w;
+    if (ndc.z > 1.0) return 1.0;
+
+    // No Y flip on either side, as for the sun, and an explicit level for the
+    // same reason as there.
+    const float2 uv = ndc.xy * 0.5 + 0.5;
+    const float source = lights.local_shadow.source_radius;
+    // A light this dim at the point gets the hard edge: the penumbra's width
+    // is invisible under the rest of the light there, and the soft search is
+    // most of a shadowed light's cost.
+    if (source <= 0.0 || arriving < soft_shadow_least_irradiance)
+    {
+        const float visible = local_shadow_maps.SampleCmpLevelZero(float3(uv, float(layer)), ndc.z);
+        return 1.0 - (1.0 - visible) * strength;
+    }
+
+    uint width, height, layers;
+    local_depths.GetDimensions(width, height, layers);
+    const float texel = 1.0 / float(width);
+    const float2 lowest = float2(0.5 * texel, 0.5 * texel);
+    const float2 highest = float2(1.0 - 0.5 * texel, 1.0 - 0.5 * texel);
+
+    // Along the layer's axis, which is what its depth measures, and the
+    // world width of one texel at that distance.
+    const float receiver = clip.w;
+    const float texel_world = light.shadow_texel_slope * receiver;
+    const float spin = shadowNoise(pixel) * 6.28318530718;
+
+    // A caster at distance b from the light shades the point if it lies in the
+    // cone from the point to the light's disk, whose radius there is
+    // r (receiver - b) / receiver. Searched for casters down to a quarter of
+    // the receiver's distance, where that cone is three radii wide at the
+    // point's own distance in texels.
+    //
+    // Gathered: each fetch returns the 2x2 texels around its point, so the
+    // search reads four times the texels it makes fetches.
+    const float search = min(3.0 * source / texel_world, max_soft_texels);
+    float blockers = 0.0;
+    uint found = 0;
+    for (uint i = 0; i < search_gathers; ++i)
+    {
+        const float2 tap = clamp(uv + vogelTap(i, search_gathers, spin) * (search * texel), lowest, highest);
+        const float4 stored = local_depths.Gather(float3(tap, float(layer)));
+        for (uint k = 0; k < 4; ++k)
+        {
+            if (stored[k] < ndc.z)
+            {
+                blockers += layerDistance(stored[k], light.range);
+                found += 1;
+            }
+        }
+    }
+    if (found == 0) return 1.0;
+    // Every texel searched holds a caster in front: the search reaches as far
+    // as any penumbra that a caster at a quarter of the distance could cast,
+    // so the filter would find nothing lit either.
+    if (found == 4 * search_gathers) return 1.0 - strength;
+    const float blocker = blockers / float(found);
+
+    // Similar triangles: the penumbra's radius on the receiver is
+    // r (receiver - blocker) / blocker, in texels at the receiver's distance.
+    // At least one texel, the hard edge the map resolves.
+    const float penumbra = clamp(source * (receiver - blocker) / (blocker * texel_world), 1.0, max_soft_texels);
+    float visible = 0.0;
+    for (uint i = 0; i < soft_taps; ++i)
+    {
+        const float2 tap = clamp(uv + vogelTap(i, soft_taps, spin) * (penumbra * texel), lowest, highest);
+        visible += local_shadow_maps.SampleCmpLevelZero(float3(tap, float(layer)), ndc.z);
+    }
+    visible /= float(soft_taps);
+    return 1.0 - (1.0 - visible) * strength;
 }
 
 static const float pi = 3.14159265;
@@ -698,6 +887,24 @@ float3 iblFresnel(float3 f0, float roughness, float n_dot_v, float2 f_ab)
     return single + multiple;
 }
 
+// The ambient over the cosine lobe around `normal`, over pi.
+float3 ambientIrradiance(float3 normal)
+{
+    return hemisphereIrradiance(lights.ambient.sky, lights.ambient.ground, normal);
+}
+
+// What the surroundings send a diffuse surface, over pi: the probe field where
+// there is one, fading into the ambient past its edge, and the ambient alone
+// where there is none. The ambient is what an open point receives, which is
+// what a point the probes do not reach is taken to be.
+float3 surroundingIrradiance(float3 position, float3 normal, float3 to_eye)
+{
+    const float3 open = ambientIrradiance(normal);
+    if (lights.probe_grid.enabled == 0) return open;
+    const float pi = 3.14159265358979;
+    return sampleProbeField(lights.probe_grid, position, normal, to_eye, open * pi) * (1.0 / pi);
+}
+
 // The environment's contribution, composed the way glTF 2.0 Appendix B.1
 // composes a material: a linear interpolation of a metal and a dielectric BRDF
 // by metalness. The metal reflects the environment tinted by its base colour and
@@ -716,6 +923,7 @@ float3 iblFresnel(float3 f0, float roughness, float n_dot_v, float2 f_ab)
 // attenuate diffuse differently there, and each follows the construction its
 // Fresnel term was written for.
 float3 imageBasedLight(
+    float3 position,
     float3 base,
     float metallic,
     float roughness,
@@ -737,8 +945,18 @@ float3 imageBasedLight(
     const float lod = roughness * float(max(levels, 1u) - 1u);
 
     const float3 reflection = normalize(reflect(-to_eye, normal));
-    const float3 specular = ggx_environment.SampleLevel(reflection, lod).rgb;
-    const float3 irradiance = lambertian_environment.Sample(normal).rgb;
+    // The ambient is added to what the environment sends rather than being a
+    // term of its own, so it takes the same split-sum Fresnel and the same
+    // occlusion. Its specular half is read along the reflection unblurred:
+    // the hemisphere is already smooth enough that roughness changes it little.
+    const float3 specular = ggx_environment.SampleLevel(reflection, lod).rgb + ambientRadiance(reflection);
+    // With a probe field the ambient's diffuse half comes from it instead: the
+    // probes carry the sky through the openings they see it through and the
+    // light bounced off everything else, where the hemisphere carries the sky
+    // everywhere, walls or not. The field returns irradiance; this term holds
+    // it over pi, the convention the lambertian map arrives in.
+    const float3 surroundings = surroundingIrradiance(position, normal, to_eye);
+    const float3 irradiance = lambertian_environment.Sample(normal).rgb + surroundings;
     const float2 f_ab = ggx_lut.Sample(float2(n_dot_v, roughness)).rg;
 
     // Two sources of the same quantity, summed before the albedo multiplies
@@ -957,9 +1175,31 @@ float4 shade(Varying varying, float4 vertex_colour, bool front_facing)
         // the map was fitted to a single direction, and the block says which.
         if (index == sun_shadow.light)
             attenuation *= sunVisibility(varying.world_position, geometric_normal);
+        // Only a point or a spot is ever given a layer; the frame refuses
+        // anything else.
+        if (light.shadow_layer != no_shadow_layer)
+            attenuation *= localVisibility(
+                light,
+                varying.world_position,
+                geometric_normal,
+                varying.position.xy,
+                light.intensity * attenuation * lambert * dot(light.colour, float3(0.2126, 0.7152, 0.0722)));
 
         const float3 reflected = brdf(base, metallic, alpha, normal, to_light, to_eye);
         radiance += reflected * light.colour * (light.intensity * attenuation * lambert);
+    }
+    // The views of `uniforms.DebugView` that need nothing past the loop.
+    const uint view = lights.debug.x;
+    if (view == debug_view_motion)
+    {
+        const float2 m = motion_vectors.Load(int3(int2(varying.position.xy), 0)).xy;
+        return float4(float3(0.5 + 20 * m.x, 0.5 + 20 * m.y, 0.5), 1.0);
+    }
+    if (view == 2) return float4(radiance, 1.0);
+    if (view == 1)
+    {
+        const float3 surroundings = surroundingIrradiance(varying.world_position, normal, to_eye);
+        return float4(surroundings, 1.0);
     }
 
     // Section 3.9.3: occlusion attenuates indirect light and leaves direct
@@ -977,7 +1217,20 @@ float4 shade(Varying varying, float4 vertex_colour, bool front_facing)
             transformedUv(material.tex[texture_slot_occlusion], varying.uv, varying.uv1)).r;
         occlusion = 1.0 + material.emissive_factor.w * (sampled_occlusion - 1.0);
     }
+    // The screen-space estimate multiplies the authored occlusion: both say how
+    // much of the ambient arrives, one from the asset and one from the scene
+    // around it. A target texel maps to texel floor(x / 2) of the half-size
+    // image, which an odd side rounds up, so the coordinate is the position
+    // halved over the image's own size rather than over the target's.
+    {
+        uint width, height;
+        ambient_occlusion.GetDimensions(width, height);
+        const float2 uv = varying.position.xy * 0.5 / float2(width, height);
+        occlusion *= ambient_occlusion.SampleLevel(uv, 0.0).r;
+    }
+    if (view == 3) return float4(occlusion, occlusion, occlusion, 1.0);
     radiance += occlusion * imageBasedLight(
+        varying.world_position,
         base,
         metallic,
         roughness,
@@ -1001,19 +1254,39 @@ float4 shade(Varying varying, float4 vertex_colour, bool front_facing)
     return float4(radiance, alpha_mode == alpha_mode_blend ? base_alpha : 1.0);
 }
 
-// The MASK half of the camera depth prepass. Opaque geometry has no fragment
-// stage at all; these exist only where the cutoff decides whether the rasterizer
-// may write depth. There is no colour output because that pass declares none.
-[shader("fragment")]
-void maskFragmentMain(Varying varying)
+// The jitter is taken out of the current position and never was in the
+// previous one, so a still scene reads no motion while the samples move.
+float4 fragmentMotion(Motion motion)
 {
-    maskDepth(varying, 1.0);
+    const float2 uv_motion = (motion.current.xy / motion.current.w - camera.jitter.xy -
+        motion.previous.xy / motion.previous.w) * 0.5;
+    return float4(uv_motion, 0.0, 0.0);
 }
 
 [shader("fragment")]
-void colourMaskFragmentMain(VaryingColour varying)
+float4 motionFragmentMain(VaryingMotion varying) : SV_Target
+{
+    return fragmentMotion(varying.motion);
+}
+
+[shader("fragment")]
+float4 colourMotionFragmentMain(VaryingColourMotion varying) : SV_Target
+{
+    return fragmentMotion(varying.motion);
+}
+
+[shader("fragment")]
+float4 maskFragmentMain(VaryingMotion varying) : SV_Target
+{
+    maskDepth(varying.base, 1.0);
+    return fragmentMotion(varying.motion);
+}
+
+[shader("fragment")]
+float4 colourMaskFragmentMain(VaryingColourMotion varying) : SV_Target
 {
     maskDepth(varying.base, varying.colour.a);
+    return fragmentMotion(varying.motion);
 }
 
 // White for the meshes with no COLOR_0, which is the product's identity. The

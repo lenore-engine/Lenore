@@ -720,6 +720,13 @@ test "each skin's joints land in the run the offsets gave it" {
             world.joint_storage[2 + slot],
         );
     }
+
+    try testing.expectEqualSlices(gpu.Joint, world.joint_storage[0..5], world.previous_joint_storage);
+    const first_pose: [5]gpu.Joint = world.joint_storage[0..5].*;
+    world.skeletons[1].animator.pose.joint_transforms[0] = zm.translation(9, 8, 7);
+    world.packJoints();
+    try testing.expectEqualSlices(gpu.Joint, &first_pose, world.previous_joint_storage);
+    try testing.expectEqual(gpu.mat4(zm.translation(9, 8, 7)), world.joint_storage[2]);
 }
 
 // A rigid hierarchy of one slot, offset from the origin, with no clips. It is
@@ -1196,6 +1203,10 @@ const WithProp = struct {
     prop: gltf.importer.Model,
 
     fn init(self: *WithProp, allocator: std.mem.Allocator) !void {
+        return self.initCopies(allocator, 1);
+    }
+
+    fn initCopies(self: *WithProp, allocator: std.mem.Allocator, copies: u32) !void {
         self.level_vertices = .{ vertexAt(.{ -1, -1, -1 }), vertexAt(.{ 1, 1, 1 }) };
         self.prop_vertices = .{
             .{ vertexAt(.{ -0.1, -0.1, -0.1 }), vertexAt(.{ 0.1, 0.1, 0.1 }) },
@@ -1225,8 +1236,27 @@ const WithProp = struct {
         const prop_resident = [_]*const gpu.Mesh{ &mesh_a, &mesh_a };
         self.world = try lenore.World.init(allocator, &self.level, &level_resident, &.{null}, .{
             .capacity = capacity,
-            .props = &.{.{ .model = &self.prop, .meshes = &prop_resident }},
+            .props = &.{.{ .model = &self.prop, .meshes = &prop_resident, .instances = copies }},
         });
+    }
+
+    fn rebuild(self: *WithProp) !void {
+        try self.world.plan.rebuild(
+            self.world.meshes,
+            null,
+            self.world.placement,
+            self.world.prop_placements,
+            .{ 0, 0, 0 },
+            seesEverything(),
+        );
+    }
+
+    // Whether any draw in `run` is among what the plan records.
+    fn records(self: *const WithProp, run: lenore.DrawPlan.Run) bool {
+        for (self.world.plan.ordered) |draw| {
+            if (draw >= run.first and draw < run.first + run.count) return true;
+        }
+        return false;
     }
 };
 
@@ -1259,7 +1289,7 @@ test "a prop is drawn at the matrix placed for it, and the level is not" {
     defer fixture.world.deinit();
 
     const held = zm.mul(zm.rotationY(0.5), zm.translation(0, 0, 7));
-    try fixture.world.placeProp(0, held);
+    try fixture.world.placeProp(0, 0, held);
     try fixture.world.plan.rebuild(
         fixture.world.meshes,
         null,
@@ -1271,7 +1301,8 @@ test "a prop is drawn at the matrix placed for it, and the level is not" {
 
     // Matched through the material index, which is unique per draw here, so
     // the check does not depend on the order the ring was packed in.
-    for (fixture.world.plan.instances) |instance| {
+    try testing.expectEqual(@as(usize, 3), fixture.world.plan.ordered.len);
+    for (fixture.world.plan.instances[0..fixture.world.plan.ordered.len]) |instance| {
         const expected = if (instance.material_index == 0) zm.identity() else held;
         try testing.expectEqual(gpu.mat4(expected), instance.model);
     }
@@ -1284,7 +1315,7 @@ test "a prop is culled through its placement" {
 
     // `seesNearHalf` ends at z 12. Beyond it the prop is behind the visible
     // prefix, and in front of it the prop is in it.
-    try fixture.world.placeProp(0, zm.translation(0, 0, 50));
+    try fixture.world.placeProp(0, 0, zm.translation(0, 0, 50));
     try fixture.world.plan.rebuild(
         fixture.world.meshes,
         null,
@@ -1296,7 +1327,7 @@ test "a prop is culled through its placement" {
     try testing.expect(!fixture.world.plan.keys[1].visible);
     try testing.expect(!fixture.world.plan.keys[2].visible);
 
-    try fixture.world.placeProp(0, zm.translation(0, 0, 5));
+    try fixture.world.placeProp(0, 0, zm.translation(0, 0, 5));
     try fixture.world.plan.rebuild(
         fixture.world.meshes,
         null,
@@ -1324,12 +1355,12 @@ test "a prop counts as a moving caster only in the frame it moved" {
 
     // Placed before `update`, as a component's `update` hook does, and read
     // after it, where the shadow decision is taken.
-    try fixture.world.placeProp(0, zm.translation(1, 0, 0));
+    try fixture.world.placeProp(0, 0, zm.translation(1, 0, 0));
     _ = try fixture.world.update(&morph_pass, 1, time, .{ 0, 0, 0 }, seesEverything());
     try testing.expect(fixture.world.castersMove());
 
     // The same matrix again is not a move.
-    try fixture.world.placeProp(0, zm.translation(1, 0, 0));
+    try fixture.world.placeProp(0, 0, zm.translation(1, 0, 0));
     _ = try fixture.world.update(&morph_pass, 0, time, .{ 0, 0, 0 }, seesEverything());
     try testing.expect(!fixture.world.castersMove());
 }
@@ -1339,7 +1370,8 @@ test "placing a prop that was not given is refused" {
     try fixture.init(testing.allocator);
     defer fixture.world.deinit();
 
-    try testing.expectError(error.NoSuchProp, fixture.world.placeProp(1, zm.identity()));
+    try testing.expectError(error.NoSuchProp, fixture.world.placeProp(1, 0, zm.identity()));
+    try testing.expectError(error.NoSuchProp, fixture.world.hideProp(1, 0));
 }
 
 test "a prop's draws count against the instance capacity" {
@@ -1399,4 +1431,197 @@ test "a prop that animates is refused" {
 
     model.meshes = &.{};
     try testing.expectError(error.PropWithoutGeometry, lenore.checkProp(&model));
+}
+
+test "every copy of a prop is planned, and the copies share its materials" {
+    var fixture: WithProp = undefined;
+    try fixture.initCopies(testing.allocator, 3);
+    defer fixture.world.deinit();
+
+    const plan = &fixture.world.plan;
+    // One level draw and the prop's two, three times over.
+    try testing.expectEqual(@as(usize, 7), plan.candidates.len);
+    try testing.expectEqual(@as(usize, 3), plan.prop_runs.len);
+    for (plan.prop_runs, 0..) |run, copy| {
+        try testing.expectEqual(@as(u32, @intCast(1 + 2 * copy)), run.first);
+        try testing.expectEqual(@as(u32, 2), run.count);
+        // The prop's local 1 and 0 are 2 and 1 in every copy: its materials
+        // follow the level's once.
+        try testing.expectEqual(@as(u32, 2), plan.candidates[run.first].material);
+        try testing.expectEqual(@as(u32, 1), plan.candidates[run.first + 1].material);
+    }
+}
+
+test "a copy is recorded by no pass until it is placed" {
+    var fixture: WithProp = undefined;
+    try fixture.initCopies(testing.allocator, 3);
+    defer fixture.world.deinit();
+
+    try fixture.rebuild();
+    // The level's draw alone, and it is visible.
+    try testing.expectEqual(@as(usize, 1), fixture.world.plan.ordered.len);
+    try testing.expectEqual(@as(u32, 0), fixture.world.plan.ordered[0]);
+    try testing.expectEqual(@as(usize, 1), fixture.world.plan.visible_records);
+
+    try fixture.world.placeProp(0, 1, zm.translation(0, 0, 3));
+    try fixture.rebuild();
+    const runs = fixture.world.plan.prop_runs;
+    try testing.expectEqual(@as(usize, 3), fixture.world.plan.ordered.len);
+    try testing.expect(!fixture.records(runs[0]));
+    try testing.expect(fixture.records(runs[1]));
+    try testing.expect(!fixture.records(runs[2]));
+    for (fixture.world.plan.instances[0..fixture.world.plan.ordered.len]) |instance| {
+        const expected = if (instance.material_index == 0) zm.identity() else zm.translation(0, 0, 3);
+        try testing.expectEqual(gpu.mat4(expected), instance.model);
+    }
+}
+
+test "a hidden copy leaves the shadow bake as well as the camera" {
+    var fixture: WithProp = undefined;
+    try fixture.initCopies(testing.allocator, 2);
+    defer fixture.world.deinit();
+
+    // Copy 0 out of view and copy 1 in it: both are recorded, copy 0 behind
+    // the visible prefix where only the shadow bake reads it.
+    try fixture.world.placeProp(0, 0, zm.translation(0, 0, 50));
+    try fixture.world.placeProp(0, 1, zm.translation(0, 0, 5));
+    try fixture.world.plan.rebuild(
+        fixture.world.meshes,
+        null,
+        fixture.world.placement,
+        fixture.world.prop_placements,
+        .{ 0, 0, 0 },
+        seesNearHalf(),
+    );
+    const keys = fixture.world.plan.keys;
+    try testing.expectEqual(@as(usize, 5), fixture.world.plan.ordered.len);
+    try testing.expect(!keys[1].visible and !keys[2].visible);
+    try testing.expect(keys[3].visible and keys[4].visible);
+
+    try fixture.world.hideProp(0, 0);
+    try fixture.world.plan.rebuild(
+        fixture.world.meshes,
+        null,
+        fixture.world.placement,
+        fixture.world.prop_placements,
+        .{ 0, 0, 0 },
+        seesNearHalf(),
+    );
+    const runs = fixture.world.plan.prop_runs;
+    try testing.expectEqual(@as(usize, 3), fixture.world.plan.ordered.len);
+    try testing.expect(!fixture.records(runs[0]));
+    try testing.expect(fixture.records(runs[1]));
+}
+
+test "hiding a copy is a move, and hiding a hidden one is not" {
+    var fixture: WithProp = undefined;
+    try fixture.initCopies(testing.allocator, 2);
+    defer fixture.world.deinit();
+
+    var morph_pass: gpu.MorphPass = undefined;
+    const time: lenore.FrameTime = .{ .elapsed_ns = 0, .interval_ns = 0, .delta = 0, .index = 0 };
+
+    try fixture.world.placeProp(0, 1, zm.identity());
+    _ = try fixture.world.update(&morph_pass, 0, time, .{ 0, 0, 0 }, seesEverything());
+    try testing.expect(fixture.world.castersMove());
+
+    try fixture.world.hideProp(0, 1);
+    const state = try fixture.world.update(&morph_pass, 1, time, .{ 0, 0, 0 }, seesEverything());
+    try testing.expect(fixture.world.castersMove());
+    // The frame hands the renderer the level's instance record only.
+    try testing.expectEqual(@as(usize, 1), state.instances.len);
+
+    try fixture.world.hideProp(0, 1);
+    try fixture.world.hideProp(0, 0);
+    _ = try fixture.world.update(&morph_pass, 0, time, .{ 0, 0, 0 }, seesEverything());
+    try testing.expect(!fixture.world.castersMove());
+}
+
+test "a copy past a prop's instances is refused" {
+    var fixture: WithProp = undefined;
+    try fixture.initCopies(testing.allocator, 2);
+    defer fixture.world.deinit();
+
+    try fixture.world.placeProp(0, 1, zm.identity());
+    try testing.expectError(error.NoSuchPropInstance, fixture.world.placeProp(0, 2, zm.identity()));
+    try testing.expectError(error.NoSuchPropInstance, fixture.world.hideProp(0, 2));
+}
+
+test "a prop of no copies is never drawn" {
+    var fixture: WithProp = undefined;
+    try fixture.initCopies(testing.allocator, 0);
+    defer fixture.world.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fixture.world.plan.candidates.len);
+    try testing.expectEqual(@as(usize, 0), fixture.world.plan.prop_runs.len);
+    try testing.expectError(error.NoSuchPropInstance, fixture.world.placeProp(0, 0, zm.identity()));
+    try fixture.rebuild();
+    try testing.expectEqual(@as(usize, 1), fixture.world.plan.ordered.len);
+}
+
+test "every copy counts against the instance capacity" {
+    var fixture: WithProp = undefined;
+    // One level draw and two per copy: four copies are nine against room for
+    // eight, three are seven.
+    try testing.expectError(error.InstanceCapacityExceeded, fixture.initCopies(testing.allocator, 4));
+    try fixture.initCopies(testing.allocator, 3);
+    fixture.world.deinit();
+}
+
+test "first-frame motion uses each draw's current matrix" {
+    var fixture: WithProp = undefined;
+    try fixture.initCopies(testing.allocator, 2);
+    defer fixture.world.deinit();
+    fixture.world.placement = zm.translation(3, 0, 0);
+    try fixture.world.placeProp(0, 0, zm.translation(0, 0, 4));
+    try fixture.world.placeProp(0, 1, zm.translation(0, 0, 8));
+    try fixture.rebuild();
+    for (fixture.world.plan.instances[0..fixture.world.plan.ordered.len]) |instance|
+        try testing.expectEqual(instance.model, instance.previous_model);
+}
+
+test "motion history follows draw indices when the sorted order changes" {
+    var fixture: WithProp = undefined;
+    try fixture.initCopies(testing.allocator, 2);
+    defer fixture.world.deinit();
+    try fixture.world.placeProp(0, 0, zm.translation(0, 0, 4));
+    try fixture.world.placeProp(0, 1, zm.translation(0, 0, 8));
+    try fixture.rebuild();
+    var old: [5]gpu.Mat4 = undefined;
+    var old_order: [5]u32 = undefined;
+    @memcpy(&old_order, fixture.world.plan.ordered);
+    for (fixture.world.plan.matrices, &old) |matrix, *saved| saved.* = gpu.mat4(matrix);
+    try fixture.world.placeProp(0, 0, zm.translation(0, 0, 12));
+    try fixture.world.placeProp(0, 1, zm.translation(0, 0, 2));
+    try fixture.rebuild();
+    try testing.expect(!std.mem.eql(u32, &old_order, fixture.world.plan.ordered));
+    for (fixture.world.plan.ordered, fixture.world.plan.instances[0..5]) |draw, instance| {
+        try testing.expectEqual(old[draw], instance.previous_model);
+        try testing.expectEqual(gpu.mat4(fixture.world.plan.matrices[draw]), instance.model);
+    }
+    try fixture.rebuild();
+    for (fixture.world.plan.instances[0..5]) |instance|
+        try testing.expectEqual(instance.model, instance.previous_model);
+}
+
+test "a hidden draw shown again starts motion at its new placement" {
+    var fixture: WithProp = undefined;
+    try fixture.initCopies(testing.allocator, 2);
+    defer fixture.world.deinit();
+    try fixture.world.placeProp(0, 0, zm.translation(0, 0, 4));
+    try fixture.world.placeProp(0, 1, zm.translation(0, 0, 8));
+    try fixture.rebuild();
+    try fixture.world.hideProp(0, 0);
+    try fixture.rebuild();
+    try fixture.world.placeProp(0, 0, zm.translation(0, 0, 12));
+    try fixture.world.placeProp(0, 1, zm.translation(0, 0, 2));
+    try fixture.rebuild();
+    const shown = fixture.world.plan.prop_runs[0];
+    const continuous = fixture.world.plan.prop_runs[1];
+    for (fixture.world.plan.ordered, fixture.world.plan.instances[0..5]) |draw, instance| {
+        if (draw >= shown.first and draw < shown.first + shown.count)
+            try testing.expectEqual(instance.model, instance.previous_model);
+        if (draw >= continuous.first and draw < continuous.first + continuous.count)
+            try testing.expectEqual(gpu.mat4(zm.translation(0, 0, 8)), instance.previous_model);
+    }
 }

@@ -20,6 +20,14 @@ pub fn build(b: *std.Build) void {
         .@"shader-stats" = shader_stats,
     });
     const gpu_import: std.Build.Module.Import = .{ .name = "lenore-gpu", .module = gpu.module("lenore-gpu") };
+    // AMD FSR 3.1 as the temporal pass's alternative filler. Off unless asked
+    // for (Kira, 2026-10-19): on the 780M at 2560x1600 it costs 3.5-5.5 ms
+    // against the resolve's 1.2-1.9 and looks about the same on Reclaim, and
+    // it brings a C++ host, sixteen slangc compiles and a 430 MB package.
+    // Lazy, so a build without it needs none of that, the package included.
+    const fsr_enabled = b.option(bool, "fsr", "Build AMD FSR 3.1 as an alternative temporal upscaler") orelse false;
+    const engine_options = b.addOptions();
+    engine_options.addOption(bool, "fsr", fsr_enabled);
     // The converter is an application's tool and not the engine's: nothing in
     // `src/` imports it. What the engine gained for it is the ability to upload
     // a KTX2 image it is handed, which is format support rather than policy.
@@ -60,6 +68,7 @@ pub fn build(b: *std.Build) void {
     const engine = b.addModule("lenore", .{
         .root_source_file = b.path("src/root.zig"),
         .imports = &.{
+            .{ .name = "build_options", .module = engine_options.createModule() },
             gltf_import,
             gpu_import,
             platform_import,
@@ -74,6 +83,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addShaders(b, engine, "assets/shaders");
+    // Given the same arguments as `lenore_gpu` above, so both resolve one
+    // `lenore-gpu` and the upscaler's types are the engine's.
+    if (fsr_enabled) {
+        if (b.lazyDependency("lenore_fsr", .{
+            .target = target,
+            .optimize = optimize,
+            .@"shader-stats" = shader_stats,
+        })) |fsr| engine.addImport("lenore-fsr", fsr.module("lenore-fsr"));
+    }
 
     // The engine's public API is written in the siblings' types, so anything
     // consuming `lenore` from outside this repository imports them too. They are
@@ -270,7 +288,13 @@ pub fn build(b: *std.Build) void {
 }
 
 // Vulkan 1.3 consumes SPIR-V 1.6, which is what the profile names.
-const spirv_profile = "spirv_1_6";
+//
+// `spvImageGatherExtended` is named because slangc 2026.20 reports any
+// `Gather`, even a plain `Sampler2D` one with no offset, as implicitly
+// upgrading the profile to it, and the build fails on that warning's output.
+// The emitted words declare no `ImageGatherExtended` either way (measured
+// 2026-10-18 with and without it), so the device needs no new feature.
+const spirv_profile = "spirv_1_6+spvImageGatherExtended";
 
 // Every `*.slang` in the named directory becomes one SPIR-V module carrying all
 // of that file's entry points, imported into `module` under the file's stem.
@@ -324,6 +348,14 @@ fn addShaders(b: *std.Build, module: *std.Build.Module, dir_path: []const u8) vo
             "-fvk-use-entrypoint-name",
         });
         command.addFileArg(b.path(b.fmt("{s}/{s}", .{ dir_path, name })));
+        // Files under `include/` are pulled in by `#include` and are not
+        // modules of their own (`filesIn` does not descend into them). slangc
+        // reads them behind the build's back, so each is declared an input of
+        // every module: editing one recompiles whatever might include it
+        // rather than leaving a stale binary in the cache.
+        for (filesIn(b, b.fmt("{s}/include", .{dir_path}), ".slang")) |included| {
+            command.addFileInput(b.path(b.fmt("{s}/include/{s}", .{ dir_path, included })));
+        }
         command.addArg("-o");
         const spirv = command.addOutputFileArg(b.fmt("{s}.spv", .{stem}));
 

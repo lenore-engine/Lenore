@@ -36,6 +36,7 @@ pub const WorldError = error{
     PropCountMismatch,
     TooManyMaterials,
     NoSuchProp,
+    NoSuchPropInstance,
 };
 
 // A model drawn at a matrix the application sets every frame: a held weapon, a
@@ -52,12 +53,21 @@ pub const WorldError = error{
 // the level model: an anchor slot, a skin and a morph template are indices into
 // that model's arrays, and a second model's would need its own. A prop moves as
 // a whole by its placement.
+//
+// One prop may be drawn several times at once: a workbench holding two sensors
+// of one kind, a rack of identical crates. Each copy is placed or hidden on its
+// own, and they share the meshes and materials, so a copy costs its draws in the
+// instance ring and nothing else.
 pub const PropSource = struct {
     // Read only by `World.init`, which keeps nothing of it. The resident
     // meshes below are kept, as the level model's are.
     model: *const gltf.importer.Model,
     // The model's meshes made resident, in model order.
     meshes: []const *const gpu.Mesh,
+    // How many copies can be drawn at once. Every copy is planned at init, so
+    // this is a capacity and not a count: the instance capacity pays for all of
+    // them whether they are shown or not. Zero is a prop that is never drawn.
+    instances: u32 = 1,
 };
 
 // What a prop's model is refused for. Asked before a device is reached, so the
@@ -144,8 +154,9 @@ pub const DrawPlan = struct {
     // `worldAabb`, which is exact for any linear map where scaling a radius is
     // an underestimate under shear.
     local_bounds: []const res.Aabb,
-    // Where each prop's draws sit in the arrays here, in prop order, after the
-    // level model's meshes. Planned once, like everything else in this group.
+    // Where each prop copy's draws sit in the arrays here, after the level
+    // model's meshes: every copy of the first prop, then every copy of the
+    // next. Planned once, like everything else in this group.
     prop_runs: []const Run,
     // Whether a mesh's box describes where its vertices are this frame. False
     // for a skinned or morphed mesh, whose box is its bind pose while the
@@ -160,6 +171,14 @@ pub const DrawPlan = struct {
     // Written in mesh order. Only `depth` of a key changes per frame; the layer
     // is the material's alpha mode and is set once.
     matrices: []zm.Mat,
+    // Whether a draw exists this frame. False only for a hidden prop copy,
+    // which neither the camera nor the shadow bake records. The level model's
+    // draws are always present.
+    present: []bool,
+    // Indexed by draw, independent of the sorted instance ring. Hidden draws
+    // lose their history so showing a copy starts at its current placement.
+    previous_matrices: []zm.Mat = &.{},
+    previous_present: []bool = &.{},
     keys: []scene.DrawKey,
 
     // Written in draw order. `first_instance` of a batch is a position within
@@ -188,14 +207,14 @@ pub const DrawPlan = struct {
         count: u32,
     };
 
-    // `meshes` are the level model's, and `prop_placements` holds one matrix
-    // per entry of `prop_runs`.
+    // `meshes` are the level model's, and `prop_placements` holds one entry
+    // per entry of `prop_runs`: the copy's matrix, or null for a hidden one.
     pub fn rebuild(
         self: *DrawPlan,
         meshes: []const gltf.importer.Mesh,
         animator: ?*const res.NodeAnimator,
         placement: zm.Mat,
-        prop_placements: []const zm.Mat,
+        prop_placements: []const ?zm.Mat,
         eye: res.Vec3,
         view_projection: zm.Mat,
     ) !void {
@@ -210,19 +229,23 @@ pub const DrawPlan = struct {
         for (meshes, self.matrices[0..meshes.len]) |*mesh, *matrix| {
             matrix.* = instanceMatrix(mesh.anchor, animator, placement);
         }
-        // A prop is rigid, so every draw of it takes its placement unchanged.
+        // A prop is rigid, so every draw of a copy takes its placement
+        // unchanged. A hidden copy keeps identity only so that the loop below
+        // has a finite depth to write; nothing records it.
         for (self.prop_runs, prop_placements) |run, prop| {
-            @memset(self.matrices[run.first..][0..run.count], prop);
+            @memset(self.matrices[run.first..][0..run.count], prop orelse zm.identity());
+            @memset(self.present[run.first..][0..run.count], prop != null);
         }
 
         for (
             self.centres,
             self.local_bounds,
             self.cullable,
+            self.present,
             self.matrices,
             self.keys,
             self.candidates,
-        ) |centre, bounds, cullable, matrix, *key, *candidate| {
+        ) |centre, bounds, cullable, present, matrix, *key, *candidate| {
             // glTF 2.0, section 3.7.4: the determinant of the node's global
             // transform decides the winding. The importer settled the part it
             // baked into the vertices, so what is left is exactly this matrix,
@@ -240,19 +263,33 @@ pub const DrawPlan = struct {
             // The box is carried into world space rather than the frustum into
             // the mesh's: six planes against one box either way, and this
             // direction needs no inverse.
-            key.visible = !cullable or
-                frustum.intersectsAabb(scene.worldAabb(bounds, matrix));
+            key.visible = present and (!cullable or
+                frustum.intersectsAabb(scene.worldAabb(bounds, matrix)));
         }
 
-        // Every draw, with the visible ones first. The culled half is kept
-        // because the shadow bake reads it and because an instance record has to
-        // exist for anything that bake draws.
+        // Every present draw, with the visible ones first. The culled half is
+        // kept because the shadow bake reads it and because an instance record
+        // has to exist for anything that bake draws.
+        //
+        // A hidden copy is not visible, so the ordering puts it in the culled
+        // half, and dropping it from there leaves the visible prefix as it was.
+        // Compacting in place keeps the order of what remains.
         const ordered = try scene.orderDraws(self.keys, self.order);
-        self.ordered = ordered.draws;
+        var kept: usize = ordered.visible;
+        for (ordered.draws[ordered.visible..]) |draw_index| {
+            if (!self.present[draw_index]) continue;
+            ordered.draws[kept] = draw_index;
+            kept += 1;
+        }
+        self.ordered = ordered.draws[0..kept];
 
-        for (ordered.draws, self.instances) |draw_index, *instance| {
+        for (self.ordered, self.instances[0..self.ordered.len]) |draw_index, *instance| {
             instance.* = .{
                 .model = gpu.mat4(self.matrices[draw_index]),
+                .previous_model = gpu.mat4(if (self.previous_present.len > 0 and self.previous_present[draw_index])
+                    self.previous_matrices[draw_index]
+                else
+                    self.matrices[draw_index]),
                 .joint_base = translate.jointBase(self.joint_bases[draw_index]),
                 .material_index = self.candidates[draw_index].material,
             };
@@ -260,7 +297,7 @@ pub const DrawPlan = struct {
 
         const built = try RecordPlan.build(
             self.candidates,
-            ordered.draws,
+            self.ordered,
             ordered.visible,
             self.batch_storage,
         );
@@ -268,10 +305,14 @@ pub const DrawPlan = struct {
         self.visible_records = built.visible;
         self.records = try translate.recordBatches(
             built.batches,
-            ordered.draws,
+            self.ordered,
             self.vertex_sources,
             self.record_storage,
         );
+        if (self.previous_present.len > 0) {
+            @memcpy(self.previous_matrices, self.matrices);
+            @memcpy(self.previous_present, self.present);
+        }
     }
 };
 
@@ -284,6 +325,7 @@ pub const DrawPlan = struct {
 pub const FrameState = struct {
     instances: []const gpu.Instance,
     joints: []const gpu.Joint,
+    previous_joints: []const gpu.Joint,
     // Every batch, visible ones first. A camera pass takes `visibleRecords`
     // and a shadow bake takes the whole slice.
     records: []const gpu.RecordBatch,
@@ -323,6 +365,8 @@ pub const World = struct {
 
     plan: DrawPlan,
     joint_storage: []gpu.Joint,
+    previous_joint_storage: []gpu.Joint = &.{},
+    joints_ready: bool = false,
     joint_total: u32,
 
     // Where this world puts the model. Identity unless a caller says otherwise:
@@ -332,9 +376,13 @@ pub const World = struct {
     // instance matrix composes against, and only one order is correct.
     placement: zm.Mat,
 
-    // Where each prop stands, in the order the props were given. Identity until
-    // `placeProp` says otherwise.
-    prop_placements: []zm.Mat,
+    // Where each prop copy stands, one entry per entry of `plan.prop_runs`, or
+    // null while it is hidden. Every copy starts hidden: a prop has no place
+    // until the application gives it one.
+    prop_placements: []?zm.Mat,
+    // Which entries of `prop_placements` belong to each prop, in the order the
+    // props were given.
+    prop_slots: []const DrawPlan.Run,
     // Whether a placement has changed since `update` last took them, and
     // whether one had when it did. Two flags because the frame that reads the
     // second is the one `update` built: a prop placed from a component's
@@ -400,6 +448,7 @@ pub const World = struct {
                 .cullable = &.{},
                 .joint_bases = &.{},
                 .matrices = &.{},
+                .present = &.{},
                 .keys = &.{},
                 .order = &.{},
                 .instances = &.{},
@@ -411,6 +460,7 @@ pub const World = struct {
             .joint_total = 0,
             .placement = zm.identity(),
             .prop_placements = &.{},
+            .prop_slots = &.{},
             .props_moved = false,
             .props_moved_in_frame = false,
             .bounds = .{ .min = @splat(0), .max = @splat(0) },
@@ -439,14 +489,19 @@ pub const World = struct {
 
         // Summed in `usize` and compared before anything is narrowed: the
         // instance capacity bounds the draws, and every draw index and material
-        // index the plan carries is a u32.
+        // index the plan carries is a u32. A copy repeats a prop's draws and
+        // not its materials.
         var draws: usize = model.meshes.len;
         var materials: usize = model.materials.len;
+        var copies: usize = 0;
         for (options.props) |prop| {
             try checkProp(prop.model);
             if (prop.meshes.len != prop.model.meshes.len) return error.MeshCountMismatch;
-            draws += prop.model.meshes.len;
+            const prop_draws = std.math.mul(usize, prop.model.meshes.len, prop.instances) catch
+                return error.InstanceCapacityExceeded;
+            draws = std.math.add(usize, draws, prop_draws) catch return error.InstanceCapacityExceeded;
             materials += prop.model.materials.len;
+            copies += prop.instances;
         }
         if (draws > options.capacity.instances) return error.InstanceCapacityExceeded;
         if (draws > std.math.maxInt(u32)) return error.InstanceCapacityExceeded;
@@ -473,6 +528,7 @@ pub const World = struct {
                 .cullable = &.{},
                 .joint_bases = &.{},
                 .matrices = &.{},
+                .present = &.{},
                 .keys = &.{},
                 .order = &.{},
                 .instances = &.{},
@@ -484,6 +540,7 @@ pub const World = struct {
             .joint_total = 0,
             .placement = options.placement,
             .prop_placements = &.{},
+            .prop_slots = &.{},
             .props_moved = false,
             .props_moved_in_frame = false,
             .bounds = .{ .min = @splat(0), .max = @splat(0) },
@@ -496,8 +553,15 @@ pub const World = struct {
         self.morph_registrations = try allocator.alloc(?u32, draws);
         @memcpy(self.morph_registrations[0..model.meshes.len], morph_registrations);
         @memset(self.morph_registrations[model.meshes.len..], null);
-        self.prop_placements = try allocator.alloc(zm.Mat, options.props.len);
-        @memset(self.prop_placements, zm.identity());
+        self.prop_placements = try allocator.alloc(?zm.Mat, copies);
+        @memset(self.prop_placements, null);
+        const prop_slots = try allocator.alloc(DrawPlan.Run, options.props.len);
+        self.prop_slots = prop_slots;
+        var slot: usize = 0;
+        for (options.props, prop_slots) |prop, *slots| {
+            slots.* = .{ .first = @intCast(slot), .count = prop.instances };
+            slot += prop.instances;
+        }
 
         // An anchor is a slot inside the rigid template, so geometry cannot
         // carry one unless the importer produced a template to resolve it
@@ -528,6 +592,7 @@ pub const World = struct {
     pub fn deinit(self: *World) void {
         const allocator = self.allocator;
 
+        allocator.free(self.prop_slots);
         allocator.free(self.prop_placements);
         allocator.free(self.plan.prop_runs);
         allocator.free(self.plan.record_storage);
@@ -536,12 +601,16 @@ pub const World = struct {
         allocator.free(self.plan.instances);
         allocator.free(self.plan.order);
         allocator.free(self.plan.keys);
+        allocator.free(self.plan.previous_present);
+        allocator.free(self.plan.previous_matrices);
+        allocator.free(self.plan.present);
         allocator.free(self.plan.matrices);
         allocator.free(self.plan.joint_bases);
         allocator.free(self.plan.cullable);
         allocator.free(self.plan.local_bounds);
         allocator.free(self.plan.centres);
         allocator.free(self.plan.candidates);
+        allocator.free(self.previous_joint_storage);
         allocator.free(self.joint_storage);
 
         allocator.free(self.morph_registrations);
@@ -617,8 +686,9 @@ pub const World = struct {
 
         self.packJoints();
         return .{
-            .instances = self.plan.instances,
+            .instances = self.plan.instances[0..self.plan.ordered.len],
             .joints = self.joint_storage[0..self.joint_total],
+            .previous_joints = self.previous_joint_storage[0..self.joint_total],
             .records = self.plan.records,
             .visible_records = self.plan.visible_records,
         };
@@ -656,6 +726,8 @@ pub const World = struct {
     // which would leave the one place three arrays have to agree reachable by
     // nothing a test can run.
     pub fn packJoints(self: *World) void {
+        if (self.joints_ready)
+            @memcpy(self.previous_joint_storage[0..self.joint_total], self.joint_storage[0..self.joint_total]);
         // The level model's draws only: a prop is rigid and carries no skin.
         for (self.skin_of_mesh, self.plan.joint_bases[0..self.skin_of_mesh.len]) |maybe_skin, base| {
             const skin = maybe_skin orelse continue;
@@ -668,6 +740,9 @@ pub const World = struct {
                 transforms[skin.joint_offset..][0..skin.joint_count],
             ) |*joint, transform| joint.* = gpu.mat4(transform);
         }
+        if (!self.joints_ready)
+            @memcpy(self.previous_joint_storage[0..self.joint_total], self.joint_storage[0..self.joint_total]);
+        self.joints_ready = true;
     }
 
     // Starts one document animation everywhere it means something, and returns
@@ -714,26 +789,42 @@ pub const World = struct {
         return null;
     }
 
-    // Puts a prop where the frame being built draws it: `index` in the order
-    // `Options.props` gave them, and a row-vector model-to-world matrix.
+    // Puts a prop copy where the frame being built draws it, and shows it if
+    // it was hidden: `prop` in the order `Options.props` gave them, `copy`
+    // below that prop's `instances`, and a row-vector model-to-world matrix.
     //
     // Read by the plan rebuild in `update`, which the loop runs after every
     // component's `update` hook and after the camera has been read. A prop
     // placed from that hook against this frame's camera is therefore drawn
     // with the camera it was placed against, not one frame behind it.
-    pub fn placeProp(self: *World, index: usize, placement: zm.Mat) WorldError!void {
-        if (index >= self.prop_placements.len) return error.NoSuchProp;
-        const current = &self.prop_placements[index];
-        // Exact comparison on purpose: a prop set to the same matrix every frame
-        // has not moved, and anything else has.
-        if (@reduce(.Or, current[0] != placement[0]) or
-            @reduce(.Or, current[1] != placement[1]) or
-            @reduce(.Or, current[2] != placement[2]) or
-            @reduce(.Or, current[3] != placement[3]))
-        {
-            current.* = placement;
-            self.props_moved = true;
+    pub fn placeProp(self: *World, prop: usize, copy: u32, placement: zm.Mat) WorldError!void {
+        const current = try self.propSlot(prop, copy);
+        if (current.*) |matrix| {
+            // Exact comparison on purpose: a prop set to the same matrix every
+            // frame has not moved, and anything else has.
+            if (!@reduce(.Or, matrix[0] != placement[0]) and
+                !@reduce(.Or, matrix[1] != placement[1]) and
+                !@reduce(.Or, matrix[2] != placement[2]) and
+                !@reduce(.Or, matrix[3] != placement[3])) return;
         }
+        current.* = placement;
+        self.props_moved = true;
+    }
+
+    // Stops drawing a prop copy, from the frame being built on, until it is
+    // placed again. Timed as `placeProp` is.
+    pub fn hideProp(self: *World, prop: usize, copy: u32) WorldError!void {
+        const current = try self.propSlot(prop, copy);
+        if (current.* == null) return;
+        current.* = null;
+        self.props_moved = true;
+    }
+
+    fn propSlot(self: *World, prop: usize, copy: u32) WorldError!*?zm.Mat {
+        if (prop >= self.prop_slots.len) return error.NoSuchProp;
+        const slots = self.prop_slots[prop];
+        if (copy >= slots.count) return error.NoSuchPropInstance;
+        return &self.prop_placements[slots.first + copy];
     }
 
     // Whether anything the frame draws can move. A world where nothing does lets
@@ -855,9 +946,16 @@ pub const World = struct {
         self.plan.cullable = cullable;
         const joint_bases = try allocator.alloc(u32, count);
         self.plan.joint_bases = joint_bases;
-        const prop_runs = try allocator.alloc(DrawPlan.Run, props.len);
+        var copies: usize = 0;
+        for (props) |prop| copies += prop.instances;
+        const prop_runs = try allocator.alloc(DrawPlan.Run, copies);
         self.plan.prop_runs = prop_runs;
         self.plan.matrices = try allocator.alloc(zm.Mat, count);
+        self.plan.previous_matrices = try allocator.alloc(zm.Mat, count);
+        self.plan.previous_present = try allocator.alloc(bool, count);
+        @memset(self.plan.previous_present, false);
+        self.plan.present = try allocator.alloc(bool, count);
+        @memset(self.plan.present, true);
         self.plan.keys = try allocator.alloc(scene.DrawKey, count);
         self.plan.order = try allocator.alloc(u32, count);
         self.plan.instances = try allocator.alloc(gpu.Instance, count);
@@ -923,32 +1021,38 @@ pub const World = struct {
         }
         self.sphere = scene.sphereAroundAabb(self.bounds);
 
-        // Every prop's draws follow the level's, in prop order, and so do its
-        // materials. `init` summed both and checked them against u32, so the
-        // narrowing casts below cannot truncate.
+        // Every prop's draws follow the level's, in prop order, one run per
+        // copy. A prop's materials follow the level's once, whatever its copies,
+        // because every copy reads the same table entries. `init` summed both
+        // and checked them against u32, so the narrowing casts below cannot
+        // truncate.
         var first: usize = level_count;
         var material_base: usize = model.materials.len;
-        for (props, prop_runs) |prop, *run| {
+        var run_index: usize = 0;
+        for (props) |prop| {
             const draws = prop.model.meshes.len;
-            run.* = .{ .first = @intCast(first), .count = @intCast(draws) };
-            for (
-                prop.model.meshes,
-                prop.meshes,
-                candidates[first..][0..draws],
-                self.plan.keys[first..][0..draws],
-                centres[first..][0..draws],
-                local_bounds[first..][0..draws],
-                cullable[first..][0..draws],
-            ) |*mesh, resident, *candidate, *key, *centre, *box, *may_cull| {
-                candidate.* = drawFor(mesh, resident, prop.model.materials, @intCast(material_base));
-                key.* = keyFor(mesh, prop.model.materials);
-                box.* = .compute(mesh.vertices);
-                centre.* = scene.sphereAroundAabb(box.*).centre;
-                // Rigid, so the box is where the vertices are under whatever
-                // placement the frame gives it.
-                may_cull.* = true;
+            for (prop_runs[run_index..][0..prop.instances]) |*run| {
+                run.* = .{ .first = @intCast(first), .count = @intCast(draws) };
+                for (
+                    prop.model.meshes,
+                    prop.meshes,
+                    candidates[first..][0..draws],
+                    self.plan.keys[first..][0..draws],
+                    centres[first..][0..draws],
+                    local_bounds[first..][0..draws],
+                    cullable[first..][0..draws],
+                ) |*mesh, resident, *candidate, *key, *centre, *box, *may_cull| {
+                    candidate.* = drawFor(mesh, resident, prop.model.materials, @intCast(material_base));
+                    key.* = keyFor(mesh, prop.model.materials);
+                    box.* = .compute(mesh.vertices);
+                    centre.* = scene.sphereAroundAabb(box.*).centre;
+                    // Rigid, so the box is where the vertices are under
+                    // whatever placement the frame gives it.
+                    may_cull.* = true;
+                }
+                first += draws;
             }
-            first += draws;
+            run_index += prop.instances;
             material_base += prop.model.materials.len;
         }
 
@@ -970,6 +1074,7 @@ pub const World = struct {
             @intCast(capacity.joints),
         );
         self.joint_storage = try allocator.alloc(gpu.Joint, capacity.joints);
+        self.previous_joint_storage = try allocator.alloc(gpu.Joint, self.joint_total);
     }
 };
 

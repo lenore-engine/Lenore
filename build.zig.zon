@@ -5,6 +5,7 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .lenore_fps = .{ .path = "lenore-fps" },
+        .lenore_fsr = .{ .path = "lenore-fsr", .lazy = true },
         .lenore_gltf = .{ .path = "lenore-gltf" },
         .lenore_gpu = .{ .path = "lenore-gpu" },
         .lenore_ktx = .{ .path = "lenore-ktx" },

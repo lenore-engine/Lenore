@@ -35,6 +35,7 @@ const Reflection = struct {
         name: []const u8 = "",
         stage: []const u8 = "",
         parameters: []const Parameter = &.{},
+        result: ?Parameter = null,
         // A compute entry point's workgroup size, which Slang reports as the
         // three numbers behind `[numthreads]`. Empty on the other stages.
         threadGroupSize: []const u32 = &.{},
@@ -253,41 +254,45 @@ test "the background samples the cube the surfaces reflect" {
     try testing.expectEqual(gpu.environment_bindings[1].kind, try descriptorTypeOf(ggx));
     try testing.expectEqualStrings("textureCube", ggx.type.baseShape);
 
-    // The camera out of the frame set, at the slot the frame set writes it to,
-    // and nothing else from anywhere. Both halves matter: a background reading
-    // a block out of some other set is a pipeline the main pass cannot serve
-    // from the bindings it already has in place, and at a material set's slot
-    // zero it would read an image where it expects a buffer.
+    // The camera and the lights out of the frame set, at the slots the frame
+    // set writes them to, and nothing else from anywhere. Both halves matter: a
+    // background reading a block out of some other set is a pipeline the main
+    // pass cannot serve from the bindings it already has in place, and at a
+    // material set's slot zero it would read an image where it expects a
+    // buffer.
     const camera = find(parsed.parameters, "camera") orelse return error.MissingCameraBlock;
     try testing.expectEqual(@as(u32, gpu.frame_set_index), camera.binding.space);
     try testing.expectEqual(gpu.FrameSetBindings[0].slot, camera.binding.index);
-    try testing.expectEqual(@as(usize, 2), parsed.parameters.len);
+    const lights = find(parsed.parameters, "lights") orelse return error.MissingLightsBlock;
+    try testing.expectEqual(@as(u32, gpu.frame_set_index), lights.binding.space);
+    try testing.expectEqual(gpu.FrameSetBindings[2].slot, lights.binding.index);
+    try testing.expectEqual(@as(usize, 3), parsed.parameters.len);
 }
 
-test "the lights block is what the shader reads, field by field" {
+// The surfaces and the background read one block from one include, which is
+// what keeps them together; held for both all the same, since the include is
+// one text only for as long as neither module declares the block itself.
+test "the lights block is what the shaders read, field by field" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
-    const parsed = try parse(arena.allocator(), reflectionFor("scene"));
-    const lights = find(parsed.parameters, "lights") orelse return error.MissingLightsBlock;
-    try expectMirrors(gpu.LightsUniform, try block(lights));
+    for ([_][]const u8{ "scene", "sky" }) |module| {
+        const parsed = try parse(arena.allocator(), reflectionFor(module));
+        const lights = find(parsed.parameters, "lights") orelse return error.MissingLightsBlock;
+        try expectMirrors(gpu.LightsUniform, try block(lights));
+    }
 }
 
-// The one block two shaders read. The bake transforms casters by its matrix and
-// the main pass transforms the shaded point by the same one, so a disagreement
-// between the two mirrors is a shadow that lands somewhere else entirely, with
-// nothing on either side to report it.
-test "the sun shadow block is what both shaders read, field by field" {
+// The main pass reads the sun's matrix out of this block. The bake no longer
+// does: it rasterizes through the matrix pushed for it, which the renderer
+// takes from the same fit.
+test "the sun shadow block is what the main pass reads, field by field" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
     const scene = try parse(arena.allocator(), reflectionFor("scene"));
     const in_scene = find(scene.parameters, "sun_shadow") orelse return error.MissingSunShadowBlock;
     try expectMirrors(gpu.SunShadowUniform, try block(in_scene));
-
-    const shadow = try parse(arena.allocator(), reflectionFor("shadow"));
-    const in_bake = find(shadow.parameters, "sun_shadow") orelse return error.MissingSunShadowBlock;
-    try expectMirrors(gpu.SunShadowUniform, try block(in_bake));
 }
 
 // The bake reads the instance ring the main pass reads, at the same slot in the
@@ -305,17 +310,13 @@ test "the bake reads the frame rings the main pass writes" {
     const element = instances.type.resultType orelse return error.NotAStructuredBuffer;
     try expectMirrors(gpu.Instance, element);
 
-    const sun_shadow = find(parsed.parameters, "sun_shadow") orelse
-        return error.MissingSunShadowBlock;
-    try testing.expectEqual(@as(u32, gpu.frame_set_index), sun_shadow.binding.space);
-
     const joints = find(parsed.parameters, "joints") orelse return error.MissingJoints;
     try testing.expectEqual(@as(u32, gpu.frame_set_index), joints.binding.space);
 
     // Every slot it reads out of set zero is one the frame set declares. The
     // bake binds that set with the same dynamic offsets the main pass does, so a
     // slot the table does not carry would take another ring's offset.
-    for ([_]Reflection.Parameter{ instances, sun_shadow, joints }) |parameter| {
+    for ([_]Reflection.Parameter{ instances, joints }) |parameter| {
         _ = for (gpu.FrameSetBindings) |binding| {
             if (binding.slot == parameter.binding.index) break binding;
         } else return error.BindingNotDeclared;
@@ -343,18 +344,25 @@ test "the bake reads the frame rings the main pass writes" {
     }
 }
 
-test "the cutoff a masked caster is tested against is pushed, field by field" {
+// The matrix and the cutoff are pushed, and the renderer writes them at the
+// offsets the host mirror gives. The mask is checked inside as well: its two
+// floats are the same size, so swapped they would pass a check of the outer
+// block alone.
+test "the bake's matrix and cutoff are pushed, field by field" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
     const parsed = try parse(arena.allocator(), reflectionFor("shadow"));
-    const mask = find(parsed.parameters, "mask") orelse return error.MissingMaskPushConstants;
-    try testing.expectEqualStrings("pushConstantBuffer", mask.binding.kind);
-    try expectMirrors(gpu.Shadow.PushConstants, try block(mask));
+    const bake = find(parsed.parameters, "bake") orelse return error.MissingBakePushConstants;
+    try testing.expectEqualStrings("pushConstantBuffer", bake.binding.kind);
+    const contents = try block(bake);
+    try expectMirrors(gpu.Shadow.PushConstants, contents);
     try testing.expectEqual(
         @as(u32, @sizeOf(gpu.Shadow.PushConstants)),
-        try uniformSize(try block(mask)),
+        try uniformSize(contents),
     );
+    const mask = find(contents.fields, "mask") orelse return error.MissingField;
+    try expectMirrors(gpu.Shadow.Mask, &mask.type);
 }
 
 test "the post push constants are what the fullscreen shader reads" {
@@ -589,7 +597,7 @@ test "the descriptor sets are split by how often they are written" {
     try testing.expectEqual(gpu.Shadow.bindings.len, shadow_binding_count);
 
     try testing.expectEqual(gpu.RendererMaterialBindings.len, material_binding_count);
-    // The scene set is assembled from three binding lists. A slot
+    // The scene set is assembled from the passes' binding lists. A slot
     // added to one of them and not declared in the shader leaves a descriptor
     // the layout reserves and nothing reads; the reverse is a read of a
     // descriptor that was never written.
@@ -710,7 +718,7 @@ test "shaded scene fragments test depth before running lighting" {
         try testing.expect(hasExecutionMode(spirv, id, execution_mode_early_fragment_tests));
     }
 
-    // MASK coverage itself must run before depth is written, so its cutoff-only
+    // MASK coverage itself must run before depth is written, so its motion
     // entries deliberately do not request early fragment tests.
     for ([_][]const u8{ "maskFragmentMain", "colourMaskFragmentMain" }) |name| {
         const id = try entryPointId(spirv, name, testing.allocator) orelse
@@ -832,21 +840,18 @@ test "the material index reaches the fragment stage flat" {
     const allocator = arena.allocator();
 
     const parsed = try parse(allocator, reflectionFor("scene"));
-    const fragment = for (parsed.entryPoints) |entry| {
-        if (std.mem.eql(u8, entry.stage, "fragment")) break entry;
-    } else return error.MissingFragmentEntry;
+    const fragment = entryPoint(parsed, "fragmentMain") orelse return error.MissingFragmentEntry;
     const varying = fragment.parameters[0].type;
     const material = find(varying.fields, "material_index") orelse return error.MissingMaterialIndex;
 
     // An interpolated index is a fraction between two records everywhere but the
     // vertices, and it reads a neighbouring material or runs off the array.
-    // Every entry point in this module carries the varying, each through its own
-    // decorated variable: both vertex variants write it and the fragment stage
-    // reads it, so the count is the entry-point count and nothing else here is
-    // flat.
+    // Every vertex variant writes it; shaded and MASK fragments read it.
+    // The two opaque motion fragments do not read a material, so the compiler
+    // removes their unused input. Nothing else in this interface is flat.
     var locations: std.ArrayList(u32) = .empty;
     try flatLocations(lenore.Shaders.scene.spirv, &locations, allocator);
-    try testing.expectEqual(parsed.entryPoints.len, locations.items.len);
+    try testing.expectEqual(parsed.entryPoints.len - 2, locations.items.len);
     for (locations.items) |location|
         try testing.expectEqual(material.binding.index, location);
 }
@@ -1265,7 +1270,7 @@ test "every vertex variant is in the module the pipeline names" {
 
     // One file and one module. The vertex variants share every binding in set
     // zero, which keeps them a pipeline difference rather than a second
-    // descriptor layout; the two MASK entries are the depth-prepass consumers.
+    // descriptor layout; the motion entries are the depth-prepass consumers.
     for ([_]res.VertexStreams{
         .{},
         .{ .skinned = true },
@@ -1274,6 +1279,8 @@ test "every vertex variant is in the module the pipeline names" {
     }) |streams| _ = try sceneVertexEntry(parsed, streams);
     try testing.expect(entryPoint(parsed, "fragmentMain") != null);
     try testing.expect(entryPoint(parsed, "colourFragmentMain") != null);
+    try testing.expect(entryPoint(parsed, "motionFragmentMain") != null);
+    try testing.expect(entryPoint(parsed, "colourMotionFragmentMain") != null);
     try testing.expect(entryPoint(parsed, "maskFragmentMain") != null);
     try testing.expect(entryPoint(parsed, "colourMaskFragmentMain") != null);
 }
@@ -1343,5 +1350,118 @@ test "the overlay writes two sources into one attachment" {
         var others: std.ArrayList([2]u32) = .empty;
         try dualSourceOutputs(@field(lenore.Shaders, name).spirv, &others, allocator);
         try testing.expectEqual(@as(usize, 0), others.items.len);
+    }
+}
+
+// The occlusion pass's push block and its three bindings, against the host's
+// mirror and table: the depth at slot 0, the blur's source at slot 1 and the
+// distance chain at slot 2.
+test "the occlusion pass reads what the host pushes and binds" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try parse(arena.allocator(), reflectionFor("ao"));
+    const push = find(parsed.parameters, "ao") orelse return error.MissingAoPushConstants;
+    try testing.expectEqualStrings("pushConstantBuffer", push.binding.kind);
+    try expectMirrors(gpu.Ao.PushConstants, try block(push));
+    try testing.expectEqual(@as(u32, @sizeOf(gpu.Ao.PushConstants)), try uniformSize(try block(push)));
+
+    for (gpu.Ao.bindings) |binding| {
+        const parameter = find(parsed.parameters, binding.name) orelse return error.MissingAoBinding;
+        try testing.expectEqual(@as(u32, 0), parameter.binding.space);
+        try testing.expectEqual(binding.slot, parameter.binding.index);
+    }
+}
+
+// The temporal resolve's push block and its four bindings against the host's
+// mirror and table.
+test "the temporal resolve reads what the host pushes and binds" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try parse(arena.allocator(), reflectionFor("temporal"));
+    const push = find(parsed.parameters, "temporal") orelse return error.MissingTemporalPushConstants;
+    try testing.expectEqualStrings("pushConstantBuffer", push.binding.kind);
+    try expectMirrors(gpu.Temporal.PushConstants, try block(push));
+    try testing.expectEqual(@as(u32, @sizeOf(gpu.Temporal.PushConstants)), try uniformSize(try block(push)));
+
+    for (gpu.Temporal.bindings) |binding| {
+        const parameter = find(parsed.parameters, binding.name) orelse return error.MissingTemporalBinding;
+        try testing.expectEqual(@as(u32, 0), parameter.binding.space);
+        try testing.expectEqual(binding.slot, parameter.binding.index);
+    }
+}
+
+// The main pass reads the result at the slot the renderer writes it to.
+test "the scene shader reads the occlusion result from its scene set slot" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try parse(arena.allocator(), reflectionFor("scene"));
+    const result = find(parsed.parameters, "ambient_occlusion") orelse return error.MissingOcclusionResult;
+    try testing.expectEqual(@as(u32, gpu.scene_set_index), result.binding.space);
+    try testing.expectEqual(gpu.Ao.scene_bindings[0].slot, result.binding.index);
+}
+
+// The probe update's push block and its seven bindings against the host's
+// mirror and table.
+test "the probe update reads what the host pushes and binds" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try parse(arena.allocator(), reflectionFor("probes"));
+    const push = find(parsed.parameters, "update") orelse return error.MissingProbePushConstants;
+    try testing.expectEqualStrings("pushConstantBuffer", push.binding.kind);
+    const contents = try block(push);
+    try expectMirrors(gpu.Probes.PushConstants, contents);
+    try testing.expectEqual(@as(u32, @sizeOf(gpu.Probes.PushConstants)), try uniformSize(contents));
+    const grid = find(contents.fields, "grid") orelse return error.MissingField;
+    try expectMirrors(gpu.Probes.GridParams, &grid.type);
+
+    for (gpu.Probes.bindings) |binding| {
+        const parameter = find(parsed.parameters, binding.name) orelse return error.MissingProbeBinding;
+        try testing.expectEqual(@as(u32, 0), parameter.binding.space);
+        try testing.expectEqual(binding.slot, parameter.binding.index);
+    }
+}
+
+test "motion is sampled from the scene slot and keeps the shaded varying locations" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try parse(arena.allocator(), reflectionFor("scene"));
+    const result = find(parsed.parameters, "motion_vectors") orelse return error.MissingMotionResult;
+    try testing.expectEqual(@as(u32, gpu.scene_set_index), result.binding.space);
+    try testing.expectEqual(gpu.Motion.scene_bindings[0].slot, result.binding.index);
+    try testing.expectEqual(gpu.Motion.scene_bindings[0].kind, try descriptorTypeOf(result));
+
+    for ([_][]const u8{ "motionFragmentMain", "maskFragmentMain", "colourMotionFragmentMain", "colourMaskFragmentMain" }, 0..) |name, axis| {
+        const entry = entryPoint(parsed, name) orelse return error.EntryPointMissing;
+        const varying = find(entry.parameters, "varying") orelse return error.MissingVarying;
+        const base = find(varying.type.fields, "base") orelse return error.MissingBase;
+        const shaded = entryPoint(parsed, "fragmentMain") orelse return error.EntryPointMissing;
+        const shaded_varying = find(shaded.parameters, "varying") orelse return error.MissingVarying;
+        for (shaded_varying.type.fields) |field| {
+            const actual = find(base.type.fields, field.name) orelse return error.MissingVarying;
+            try testing.expectEqual(field.binding.index, actual.binding.index);
+        }
+        const motion = find(varying.type.fields, "motion") orelse return error.MissingMotion;
+        try testing.expectEqual(@as(u32, if (axis < 2) 6 else 7), motion.binding.index);
+        if (axis >= 2) {
+            const colour = find(varying.type.fields, "colour") orelse return error.MissingColour;
+            try testing.expectEqual(@as(u32, 6), colour.binding.index);
+        }
+    }
+
+    for (lenore.Shaders.scene.vertex_entry, 0..) |name, index| {
+        const entry = entryPoint(parsed, std.mem.span(name)) orelse return error.EntryPointMissing;
+        const output = entry.result orelse return error.MissingVertexOutput;
+        const motion = find(output.type.fields, "motion") orelse return error.MissingMotion;
+        const coloured = index % 2 != 0;
+        try testing.expectEqual(@as(u32, if (coloured) 7 else 6), motion.binding.index);
+        try testing.expectEqual(@as(u32, 2), motion.binding.count);
+        if (coloured) {
+            const colour = find(output.type.fields, "colour") orelse return error.MissingColour;
+            try testing.expectEqual(@as(u32, 6), colour.binding.index);
+        }
     }
 }

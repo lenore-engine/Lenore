@@ -1,5 +1,7 @@
-// The sun shadow bake: casters rasterized through the fit's orthographic matrix
-// into a depth map that the main pass compares its shaded points against.
+// The shadow bake: casters rasterized into a depth map that the main pass
+// compares its shaded points against. The same entry points draw the sun's map
+// through its orthographic fit and each local light's layer through that
+// layer's perspective one; the matrix is pushed per map or layer.
 //
 // Two vertex entry points, one per vertex variant, mirroring scene.slang's pair
 // and reading the same instance and joint rings. One fragment entry point, used
@@ -11,7 +13,7 @@
 // pipeline layout so that the texture set keeps index 2, and nothing here
 // declares anything out of it.
 //
-// The matrix carries no Vulkan Y flip. The bake rasterizes through it and the
+// No matrix carries a Vulkan Y flip. The bake rasterizes through it and the
 // lookup turns its own product with it into texture coordinates, so the mirror
 // cancels only if neither side applies one.
 
@@ -27,31 +29,20 @@ struct Instance
     uint material_index;
     uint padding_0;
     uint padding_1;
-};
-
-// Mirrors `uniforms.SunShadow`. Only the matrix is read here; the strength and
-// the normal offset belong to the lookup, which is scene.slang's half.
-struct SunShadowUbo
-{
-    float4x4 view_projection;
-    float strength;
-    float normal_offset;
-    uint light;
-    uint padding;
+    float4x4 previous_model;
 };
 
 [[vk::binding(1, 0)]] StructuredBuffer<Instance> instances;
 // One array for the whole frame, indexed from each instance's own base, exactly
 // as the main pass reads it.
 [[vk::binding(3, 0)]] StructuredBuffer<float4x4> joints;
-[[vk::binding(4, 0)]] ConstantBuffer<SunShadowUbo> sun_shadow;
 [[vk::binding(0, 2)]] Sampler2D base_colour;
 
 // What a masked caster needs to run the cutoff test, pushed per material rather
 // than read out of the material array. Two floats, against binding that array
 // and carrying an index through as a varying, and it leaves the bake
-// independent of the array's layout.
-struct MaskPushConstants
+// independent of the array's layout. Mirrors `shadow.Mask`.
+struct Mask
 {
     // glTF 2.0 section 3.9.4: below the cutoff the fragment is fully
     // transparent, at or above it fully opaque.
@@ -62,8 +53,17 @@ struct MaskPushConstants
     float factor_alpha;
 };
 
+// Mirrors `shadow.PushConstants`: the matrix at 0, read by the vertex stage
+// and pushed once per map or layer, then the mask, read by the fragment stage
+// and pushed once per masked material.
+struct BakePushConstants
+{
+    float4x4 view_projection;
+    Mask mask;
+};
+
 [[vk::push_constant]]
-ConstantBuffer<MaskPushConstants> mask;
+ConstantBuffer<BakePushConstants> bake;
 
 // The locations are stated rather than left to declaration order. This struct is
 // shorter than scene.slang's, so positional numbering would put the skinning
@@ -100,7 +100,7 @@ Varying place(float3 local_position, float2 uv, Instance instance)
     const float4 world = mul(float4(local_position, 1.0), instance.model);
 
     Varying varying;
-    varying.position = mul(world, sun_shadow.view_projection);
+    varying.position = mul(world, bake.view_projection);
     varying.uv = uv;
     return varying;
 }
@@ -152,6 +152,6 @@ Varying skinnedVertexMain(
 [shader("fragment")]
 void fragmentMain(Varying varying)
 {
-    const float alpha = base_colour.Sample(varying.uv).a * mask.factor_alpha;
-    if (alpha < mask.alpha_cutoff) discard;
+    const float alpha = base_colour.Sample(varying.uv).a * bake.mask.factor_alpha;
+    if (alpha < bake.mask.alpha_cutoff) discard;
 }

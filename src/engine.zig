@@ -4,6 +4,9 @@ const imui = @import("lenore-imui");
 const platform = @import("lenore-platform");
 const res = @import("lenore-resources");
 const scene = @import("lenore-scene");
+const gltf = @import("lenore-gltf");
+const build_options = @import("build_options");
+const zm = @import("zmath");
 
 const font_module = @import("font.zig");
 const level_module = @import("level.zig");
@@ -33,6 +36,7 @@ const RendererOptions = struct {
     frame_capacity: gpu.FrameCapacity,
     material_capacity: u32,
     shadow_map_size: u32,
+    local_shadow_maps: gpu.Shadow.LocalMaps,
     ui_capacity: gpu.UiCapacity,
     ui_widgets: ui_module.Capacity,
     font_capacity: font_module.Capacity,
@@ -40,6 +44,9 @@ const RendererOptions = struct {
     fps_window_ns: u64,
     gpu_timing: bool,
     metering: bool,
+    temporal: bool,
+    upscaler: Upscaler,
+    fsr_fp16: bool,
     scene_shading: ?gpu.SceneShading,
     background_shader: ?gpu.SkyShader,
     post_shader: ?gpu.PostShader,
@@ -185,11 +192,85 @@ pub const Look = struct {
     // decision: an asset's own, or one diagnostic sun over every model.
     lights: []const gpu.LightUniform = &.{},
     sun_shadow: scene.SunShadowSettings = .{},
+    // How the local lights' shadows are read. Off at the default strength of
+    // zero; which lights cast, and through what, is `refitLocalShadows`.
+    local_shadow: gpu.LocalShadowUniform = .{},
+    // Light from everywhere, added to the environment's; none by default.
+    ambient: gpu.AmbientUniform = .{},
+    // One term of the main pass alone, for looking at it; the shaded frame
+    // by default.
+    debug_view: gpu.DebugView = .shaded,
+    // How much of that ambient reaches each pixel, estimated from the depth.
+    // Off by default.
+    ambient_occlusion: scene.AmbientOcclusionSettings = .{},
     background: gpu.Background = .clear,
     // Null runs no chain and composites none. Not a look with everything at
     // zero: that would still cost the chain.
     bloom: ?gpu.BloomSettings = null,
     post: gpu.PostSettings = .{},
+    // How many frames the sub-pixel jitter cycles through (`scene.jitter`), or
+    // zero for none. Off by default: without a temporal pass that gathers the
+    // frames together, a jittered picture only shimmers.
+    jitter_phases: u32 = 0,
+    // Read only when `Options.upscaler` is `.fsr`.
+    fsr: FsrLook = .{},
+};
+
+// The temporal pass's two fillers. `resolve` is the engine's own draw;
+// `fsr` is AMD FSR 3.1 (`lenore-fsr`) writing the same picture from compute.
+// FSR needs storage images without a declared format, the HDR format as one,
+// and quad subgroup operations in compute; without them `initRenderer` fails.
+pub const Upscaler = enum { resolve, fsr };
+
+// Whether the engine was built with FSR (`zig build -Dfsr`). Without it
+// `lenore-fsr` is not part of the build, and `.fsr` fails `initRenderer`
+// rather than falling back to the resolve without saying so.
+pub const fsr_available = build_options.fsr;
+const fsr = if (fsr_available) @import("lenore-fsr") else struct {};
+
+// FSR's tuning, and nothing to tune in a build without it.
+pub const FsrTuning = if (fsr_available) fsr.Tuning else struct {};
+
+const FsrState = if (fsr_available) struct {
+    // Null when the resolve fills the picture. Rebuilt on a resize, at the
+    // new extents.
+    upscaler: ?*fsr.Upscaler = null,
+    // The tuning the upscaler holds, so a change in the look is applied once.
+    tuning: fsr.Tuning = .{},
+    // The next dispatch discards the history: the first one, a resize, a cut.
+    reset: bool = false,
+} else struct {};
+
+// FSR's settings that may change between frames.
+pub const FsrLook = struct {
+    // Contrast-adaptive sharpening after the upscale, 0 to 1, or none.
+    sharpness: ?f32 = null,
+    tuning: FsrTuning = .{},
+    // The upscaler's internal state in place of the picture.
+    debug_view: bool = false,
+};
+
+// A model whose triangles the indirect light is traced against, placed in the
+// world by `matrix` (the same row-vector matrix a prop copy is placed by).
+pub const IndirectSource = struct {
+    model: *const gltf.importer.Model,
+    matrix: zm.Mat,
+};
+
+pub const IndirectSettings = struct {
+    // What the probes cover, in world space.
+    bounds: res.Aabb,
+    // Between neighbouring probes, in metres.
+    spacing: f32 = 0.5,
+    // Updates at build time. Each carries the light one bounce further, and
+    // with hysteresis each also averages another set of ray directions in.
+    iterations: u32 = 256,
+    // The most of a probe that survives an update: the first updates average
+    // every ray so far, and past this share each keeps it (see
+    // `Probes.settleHysteresis`).
+    hysteresis: f32 = 0.98,
+    // How far a ray looks before it counts as leaving the scene, in metres.
+    max_distance: f32 = 60,
 };
 
 // The directional light the shadow map is fitted to, and the fit.
@@ -293,6 +374,17 @@ pub const Options = struct {
     // recorded.
     shadow_map_size: u32 = 2048,
 
+    // The local lights' shadow layers: their extent, square, and how many. A
+    // spot takes one layer and a point light six. Zero layers is no local
+    // shadows and the default, since every layer is memory whether or not a
+    // scene lights anything through it: at 1024 and four bytes of depth, four
+    // megabytes each.
+    //
+    // DECIDE: the size is provisional, half the sun's, because a lamp lights a
+    // room and the sun a scene. Closed by Reclaim's base under its own lamps.
+    local_shadow_map_size: u32 = 1024,
+    local_shadow_layers: u32 = 0,
+
     // What one frame's overlay may hold. The defaults are the pass's own, and
     // an application that draws more than a few panels sets its own.
     ui_capacity: gpu.UiCapacity = .{},
@@ -326,6 +418,18 @@ pub const Options = struct {
     // `meterCells` and nothing here acts on it: how a camera weights the frame,
     // how fast it follows and what it may reach are the application's answers.
     metering: bool = false,
+
+    // The temporal resolve: the main pass at `render_scale` gathered over frames
+    // into a picture at the window's resolution. Off by default; it is a pass,
+    // three images at the output's size and a history that a camera cut has to
+    // reset (`resetTemporalHistory`). It wants `Look.jitter_phases` on, without
+    // which it only smooths.
+    temporal: bool = false,
+
+    // What fills the temporal pass's picture when `temporal` is on.
+    upscaler: Upscaler = .resolve,
+    // FSR's 16-bit variants where the device enables 16-bit arithmetic.
+    fsr_fp16: bool = true,
 
     // Optional game-authored surface shading. The renderer retains its vertex
     // transforms, MASK depth prepass and descriptor layouts; only the two
@@ -440,8 +544,14 @@ pub const Engine = struct {
     ui: ui_module.Host,
     renderer: gpu.Renderer,
     materials: gpu.MaterialStorage,
+    // FSR, when built and asked for (`Options.upscaler`).
+    fsr_state: FsrState,
 
     camera: scene.Camera,
+    previous_view_projection: ?zm.Mat,
+    // This frame's sub-pixel offset in the framebuffer's device coordinates,
+    // which the camera block and the occlusion pass both carry.
+    frame_jitter: [2]f32,
     look: Look,
     sun: ?Sun,
 
@@ -452,6 +562,23 @@ pub const Engine = struct {
     // What the previous frame decided, so the off-to-on edge is detectable. A
     // level or a look can change between any two frames.
     shadows_were_on: bool,
+
+    // The local layers `refitLocalShadows` gave out, in layer order, and how
+    // many. The light block carries the same prefix and the bake draws through
+    // it, so the two cannot be filled from different fits.
+    local_matrices: [gpu.max_shadow_layers]gpu.Mat4,
+    local_layer_count: usize,
+    // Set when the layers changed since the last local bake, as `shadow_dirty`
+    // is for the sun's.
+    local_shadow_dirty: bool,
+
+    // The indirect-light probe field, once `buildIndirect` made one, and the
+    // grid the light block carries to the main pass while it exists.
+    probe_field: ?gpu.ProbeField,
+    probe_grid: gpu.ProbeGridUniform,
+    // How long the last `buildIndirect` took on the host, waiting for the
+    // device included: the acceleration structures and every settle update.
+    indirect_build_ns: u64,
 
     frame_clock: FrameClock,
     // Where the host time of a frame went and how fast the frames came. A
@@ -624,6 +751,10 @@ pub const Engine = struct {
             },
             .material_capacity = @max(options.material_capacity, 1),
             .shadow_map_size = options.shadow_map_size,
+            .local_shadow_maps = .{
+                .map_size = options.local_shadow_map_size,
+                .layers = options.local_shadow_layers,
+            },
             .ui_capacity = options.ui_capacity,
             .ui_widgets = options.ui_widgets,
             .font_capacity = options.font_capacity,
@@ -631,6 +762,9 @@ pub const Engine = struct {
             .fps_window_ns = options.fps_window_ns,
             .gpu_timing = options.gpu_timing,
             .metering = options.metering,
+            .temporal = options.temporal,
+            .upscaler = options.upscaler,
+            .fsr_fp16 = options.fsr_fp16,
             .scene_shading = options.scene_shading,
             .background_shader = options.background_shader,
             .post_shader = options.post_shader,
@@ -653,6 +787,8 @@ pub const Engine = struct {
         renderer_shaders.scene_extra_layout = scene_extra_layout;
         renderer_shaders.scene_shading = options.scene_shading;
         if (options.metering) renderer_shaders.meter = shaders.meter;
+        if (options.temporal) renderer_shaders.temporal = shaders.temporal;
+        if (options.upscaler == .fsr) renderer_shaders.temporal_writer = .external;
         if (options.background_shader) |background| renderer_shaders.sky = background;
         if (options.post_shader) |present| renderer_shaders.post = present;
 
@@ -662,15 +798,30 @@ pub const Engine = struct {
             &self.memory,
             allocator,
             .{ .width = extent.width, .height = extent.height },
+            outputExtent(self.swapchain.currentExtent()),
             frames_in_flight,
             options.frame_capacity,
             options.material_capacity,
             self.swapchain.surface_format.format,
             self.renderer_post_sampler,
             options.shadow_map_size,
+            options.local_shadow_maps,
             renderer_shaders,
         );
         errdefer self.renderer.deinit();
+
+        self.fsr_state = .{};
+        if (options.temporal and options.upscaler == .fsr) {
+            if (comptime fsr_available) {
+                self.fsr_state.upscaler = try self.createUpscaler();
+            } else {
+                log.err("FSR was asked for, but the engine was built without it (zig build -Dfsr)", .{});
+                return error.FsrNotBuilt;
+            }
+        }
+        errdefer if (comptime fsr_available) {
+            if (self.fsr_state.upscaler) |upscaler| upscaler.deinit();
+        };
 
         self.materials = try .init(&self.context, &self.memory, options.material_capacity);
         errdefer self.materials.deinit();
@@ -805,6 +956,8 @@ pub const Engine = struct {
         self.swapchain_stale = false;
         self.exit_requested = false;
         self.paused = false;
+        self.previous_view_projection = null;
+        self.frame_jitter = .{ 0, 0 };
         self.camera = .{
             .anchor = .{ .orbit = .{ .target = @splat(0), .distance = 0.01 } },
             .yaw = -std.math.pi / 4.0,
@@ -814,6 +967,12 @@ pub const Engine = struct {
         self.sun = null;
         self.shadow_dirty = true;
         self.shadows_were_on = false;
+        self.local_matrices = undefined;
+        self.local_layer_count = 0;
+        self.local_shadow_dirty = true;
+        self.probe_field = null;
+        self.probe_grid = .none;
+        self.indirect_build_ns = 0;
         self.frame_clock = .start(self.clock);
         self.metrics = .init(options.fps_window_ns);
         self.recorded_frames = 0;
@@ -832,8 +991,12 @@ pub const Engine = struct {
 
         switch (self.init_phase) {
             .renderer => {
+                if (self.probe_field) |*field| field.deinit();
                 if (self.gpu_timer) |*timer| timer.deinit(&self.context);
                 self.materials.deinit();
+                if (comptime fsr_available) {
+                    if (self.fsr_state.upscaler) |upscaler| upscaler.deinit();
+                }
                 self.renderer.deinit();
                 self.ui_pass.deinit();
                 self.ui.deinit(self.allocator);
@@ -943,6 +1106,104 @@ pub const Engine = struct {
         // `Renderer.plan` enforces that on its own account; this is the map's
         // half of the same statement.
         self.shadow_dirty = true;
+        // The layers were fitted to lights in that level's block, which the
+        // caller replaces with the next level's.
+        self.local_layer_count = 0;
+        self.local_shadow_dirty = true;
+        // Traced against that level's geometry. The drain above is what makes
+        // destroying it here correct.
+        self.dropIndirect();
+    }
+
+    // Builds the indirect-light probe field over `settings.bounds` from the
+    // triangles of `sources`, settles it under the look's current lights and
+    // ambient, and points the main pass at it. Replaces a field built before.
+    //
+    // Synchronous and a load-time cost: the acceleration structures are built
+    // and the field updated `settings.iterations` times before this returns.
+    // Call it after `install` and after the look's lights are final; a light
+    // switched later is not in the field until it is built again.
+    //
+    // Every mesh of every source is taken as static, at its model's
+    // placement composed with the source's matrix, and lit by its material's
+    // base colour factor: textures are not sampled by the update.
+    pub fn buildIndirect(self: *Engine, sources: []const IndirectSource, settings: IndirectSettings) !void {
+        const started = self.clock.now();
+        const grid_fit = try scene.probe_grid.ProbeGrid.fit(settings.bounds, settings.spacing);
+        const grid: gpu.ProbeGridUniform = .{
+            .origin = grid_fit.origin,
+            .spacing = grid_fit.spacing,
+            .counts = grid_fit.counts,
+            .enabled = 1,
+        };
+
+        var triangle_count: usize = 0;
+        for (sources) |source| {
+            for (source.model.meshes) |mesh| triangle_count += if (mesh.indices.len > 0) mesh.indices.len / 3 else mesh.vertices.len / 3;
+        }
+        const triangles = try self.allocator.alloc(gpu.Probes.Triangle, triangle_count);
+        defer self.allocator.free(triangles);
+        var written: usize = 0;
+        for (sources) |source| {
+            for (source.model.meshes) |mesh| {
+                const colour = source.model.materials[mesh.material].factors.base_colour;
+                const corners = if (mesh.indices.len > 0) mesh.indices.len else mesh.vertices.len;
+                var corner: usize = 0;
+                while (corner + 2 < corners) : (corner += 3) {
+                    var points: [3][4]f32 = undefined;
+                    for (&points, 0..) |*point, k| {
+                        const index = if (mesh.indices.len > 0) mesh.indices[corner + k] else @as(u32, @intCast(corner + k));
+                        const p = mesh.vertices[index].position;
+                        const world = zm.mul(zm.f32x4(p[0], p[1], p[2], 1), source.matrix);
+                        point.* = .{ world[0], world[1], world[2], colour[k] };
+                    }
+                    triangles[written] = .{ .a = points[0], .b = points[1], .c = points[2] };
+                    written += 1;
+                }
+            }
+        }
+
+        var field = try gpu.ProbeField.init(
+            &self.context,
+            &self.memory,
+            self.allocator,
+            self.setup_pool.handle,
+            grid,
+            triangles[0..written],
+            shaders.probes,
+        );
+        errdefer field.deinit();
+        try field.settle(self.setup_pool.handle, .{
+            .lights = self.look.lights,
+            .sky = self.look.ambient.sky,
+            .ground = self.look.ambient.ground,
+            .max_distance = settings.max_distance,
+        }, settings.iterations, settings.hysteresis);
+
+        // The previous field may still be read by a frame in flight.
+        try self.context.waitIdle();
+        self.dropIndirect();
+        self.probe_field = field;
+        self.renderer.setProbeField(&self.probe_field.?);
+        self.probe_grid = grid;
+        self.indirect_build_ns = self.clock.now() - started;
+        log.info("indirect: {d} probes over {d} triangles, {d} updates, {d:.2} s", .{
+            grid.probeCount(),
+            written,
+            settings.iterations,
+            @as(f64, @floatFromInt(self.indirect_build_ns)) / std.time.ns_per_s,
+        });
+    }
+
+    // No field: the main pass lights from the ambient again. Only when no
+    // frame can be reading it.
+    fn dropIndirect(self: *Engine) void {
+        if (self.probe_field) |*field| {
+            self.renderer.setProbeField(null);
+            field.deinit();
+            self.probe_field = null;
+        }
+        self.probe_grid = .none;
     }
 
     // Gives a device resource back, to be destroyed once no frame can be reading
@@ -1005,6 +1266,58 @@ pub const Engine = struct {
         self.sun = null;
     }
 
+    // Gives local shadow layers to the lights at `casting`, which index
+    // `lights`, in priority order, and takes them from every other light.
+    //
+    // `lights` is the array `look.lights` is a view of: the layer each light
+    // reads is written into its own entry, so the block the shader reads and
+    // the fits the bake draws through come from one call. Call it after
+    // changing a casting light, as `refitSun` after moving the sun; a light
+    // whose shadow did not change keeps its layer and costs no bake.
+    //
+    // A light that cannot cast (a kind with no local map, or one the fit
+    // refuses) is logged and passed over, and so is one past the layers the
+    // engine was built with: one lamp less of a shadow is still a frame.
+    pub fn refitLocalShadows(self: *Engine, lights: []gpu.LightUniform, casting: []const usize) void {
+        for (lights) |*light| {
+            light.shadow_layer = gpu.no_shadow_layer;
+            light.shadow_texel_slope = 0;
+        }
+        const map_size = self.renderer.localShadowMapSize();
+        const capacity = self.renderer.localShadowLayers();
+        var matrices: [gpu.max_shadow_layers]gpu.Mat4 = undefined;
+        var used: u32 = 0;
+        for (casting) |index| {
+            if (index >= lights.len) {
+                log.warn("local shadow requested for light {d} of {d}", .{ index, lights.len });
+                continue;
+            }
+            const light = &lights[index];
+            const fit = scene.LocalShadowFit.compute(sceneLightOf(light.*) orelse {
+                log.warn("light {d} has no local shadow: kind {t}", .{ index, light.kind });
+                continue;
+            }, map_size) catch |err| {
+                log.warn("local shadow fit rejected for light {d}: {t}", .{ index, err });
+                continue;
+            };
+            if (fit.layers > capacity - used) {
+                log.warn("light {d} has no local shadow: {d} of {d} layers given out", .{ index, used, capacity });
+                continue;
+            }
+            for (fit.view_proj[0..fit.layers], matrices[used..][0..fit.layers]) |from, *to| to.* = gpu.mat4(from);
+            light.shadow_layer = used;
+            light.shadow_texel_slope = fit.texel_slope;
+            used += fit.layers;
+        }
+        if (used != self.local_layer_count or
+            !std.mem.eql(u8, std.mem.sliceAsBytes(matrices[0..used]), std.mem.sliceAsBytes(self.local_matrices[0..used])))
+        {
+            self.local_shadow_dirty = true;
+        }
+        @memcpy(self.local_matrices[0..used], matrices[0..used]);
+        self.local_layer_count = used;
+    }
+
     // Fits the camera around a sphere and returns the distance it stood off at.
     //
     // A vertical field of view narrows horizontally below aspect one, so the
@@ -1039,6 +1352,15 @@ pub const Engine = struct {
     // the surface's own extent and not this one.
     pub fn renderExtent(self: *const Engine) platform.Extent2D {
         return scaledExtent(self.swapchain.currentExtent(), self.renderer_options.render_scale);
+    }
+
+    // A camera cut: the next frame's resolve takes that frame alone, and the
+    // motion it is drawn with starts from its own camera rather than from the
+    // view it cut away from.
+    pub fn resetTemporalHistory(self: *Engine) void {
+        self.renderer.resetTemporalHistory();
+        if (comptime fsr_available) self.fsr_state.reset = true;
+        self.previous_view_projection = null;
     }
 
     // The ratio of the image the triangles land in, which is what a projection
@@ -1248,14 +1570,30 @@ pub const Engine = struct {
             // different frames, and which field went into which is not
             // something a picture shows.
             const look = self.look;
+            const render_extent = self.renderExtent();
+            // FSR states the cycle its accumulation is tuned for, longer as
+            // the ratio grows; the resolve takes the look's.
+            const jitter_phases = phases: {
+                if (comptime fsr_available) {
+                    if (self.fsr_state.upscaler != null and look.jitter_phases > 0)
+                        break :phases fsr.jitterPhaseCount(render_extent.width, outputExtent(self.swapchain.currentExtent()).width);
+                }
+                break :phases look.jitter_phases;
+            };
+            self.frame_jitter = if (jitter_phases > 0)
+                scene.jitter.deviceOffset(time.index, jitter_phases, render_extent.width, render_extent.height)
+            else
+                .{ 0, 0 };
 
             try self.renderer.update(self.frame_index, .{
                 // The scene's clip space goes in and the framebuffer's comes
                 // out. The conversion is named here rather than performed
                 // inside the renderer, so the value a frame is filled with says
                 // which of the two it is.
-                .camera = gpu.vulkanClipCamera(.{
+                .camera = jitterCamera(gpu.vulkanClipCamera(.{
                     .view_projection = gpu.mat4(view_projection),
+                    .previous_view_projection = gpu.mat4(self.previous_view_projection orelse view_projection),
+                    .motion = .{ @intCast(state.joints.len), 0, 0, 0 },
                     // The fourth lane is the frame's clock and not a
                     // homogeneous one: nothing multiplies this by a matrix, and
                     // a shader that animates has nowhere else to read a clock.
@@ -1266,9 +1604,10 @@ pub const Engine = struct {
                     .ray_right = lane(ray_basis.right),
                     .ray_up = lane(ray_basis.up),
                     .ray_front = lane(ray_basis.front),
-                }),
+                }), self.frame_jitter),
                 .models = state.instances,
                 .joints = state.joints,
+                .previous_joints = state.previous_joints,
                 .lights = look.lights,
                 // Off unless a directional light was found and fitted. The
                 // block's strength is what the shader tests, so an absent sun is
@@ -1279,6 +1618,11 @@ pub const Engine = struct {
                     .normal_offset = look.sun_shadow.normalOffsetWorld(&sun.fit),
                     .light = sun.index,
                 } else .off,
+                .local_shadow = localShadowBlock(look.local_shadow),
+                .shadow_view_projections = self.local_matrices[0..self.local_layer_count],
+                .ambient = look.ambient,
+                .probe_grid = self.probe_grid,
+                .debug = .{ .view = look.debug_view },
             });
 
             self.metrics.record(.rings, phase.split());
@@ -1329,7 +1673,24 @@ pub const Engine = struct {
             // The bake first, because it opens a rendering of its own and the
             // map it writes is sampled by every fragment the main pass shades.
             self.mark(commands, .shadow, .begin);
-            self.renderer.recordShadowBake(commands, self.shadowBake(look, level), frame_plan);
+            self.renderer.recordShadowBake(
+                commands,
+                self.shadowBake(look, level),
+                // Unread when there is no sun: the bake is not opened
+                // after the first, and that one draws nothing worth reading.
+                if (self.sun) |sun| gpu.mat4(sun.fit.view_proj) else gpu.SunShadowUniform.off.view_projection,
+                frame_plan,
+            );
+            // Every frame, for the renderer's first-frame transition; off, or
+            // with nothing given a layer, it passes no layers and records
+            // nothing after that, and the lookup reads nothing either.
+            const local_on = look.local_shadow.strength > 0 and self.local_layer_count > 0;
+            self.renderer.recordLocalShadowBake(
+                commands,
+                if (local_on) self.localShadowBake(level) else .reuse,
+                if (local_on) self.local_matrices[0..self.local_layer_count] else &.{},
+                frame_plan,
+            );
             self.mark(commands, .shadow, .end);
 
             self.mark(commands, .depth, .begin);
@@ -1337,6 +1698,16 @@ pub const Engine = struct {
             self.renderer.recordDepthPrepass(commands, frame_plan);
             self.renderer.endDepthPrepass(commands);
             self.mark(commands, .depth, .end);
+
+            // Between the prepass and the shaded pass: the stored depth is
+            // complete there and not yet loaded again.
+            const occlusion = self.occlusionFrame(look, ratio);
+            self.mark(commands, .occlusion, .begin);
+            self.renderer.recordOcclusionEstimate(commands, occlusion);
+            self.mark(commands, .occlusion, .end);
+            self.mark(commands, .occlusion_blur, .begin);
+            self.renderer.recordOcclusionBlur(commands, occlusion);
+            self.mark(commands, .occlusion_blur, .end);
 
             self.mark(commands, .main, .begin);
             self.renderer.beginMain(commands);
@@ -1360,6 +1731,21 @@ pub const Engine = struct {
             self.mark(commands, .after_main, .begin);
             try callHooks(components, "depth", .{ self, level, commands });
             self.mark(commands, .after_main, .end);
+
+            // After the application's depth readers and before the meter and
+            // the chain, which read what it writes when it exists.
+            self.mark(commands, .temporal, .begin);
+            const upscaled = upscaled: {
+                if (comptime fsr_available) {
+                    if (self.fsr_state.upscaler) |upscaler| {
+                        try self.recordUpscaler(upscaler, commands, look.fsr, time);
+                        break :upscaled true;
+                    }
+                }
+                break :upscaled false;
+            };
+            if (!upscaled) self.renderer.recordTemporal(commands, .{ .jitter = self.frame_jitter });
+            self.mark(commands, .temporal, .end);
 
             // Before the chain rather than after it: both read the target the
             // main pass filled, and neither changes it, so the order between
@@ -1408,6 +1794,7 @@ pub const Engine = struct {
                 // layout. A tighter stage would signal before it completed.
                 .signal_stage = .{ .all_commands_bit = true },
             });
+            self.previous_view_projection = view_projection;
             self.metrics.record(.submit, phase.split());
 
             // Held rather than unwrapped, so that the last two splits and the
@@ -1681,6 +2068,188 @@ pub const Engine = struct {
         return request.decide();
     }
 
+    // The look's settings with the layers' near plane, which is the fit's and
+    // not the caller's to choose.
+    fn localShadowBlock(settings: gpu.LocalShadowUniform) gpu.LocalShadowUniform {
+        var block = settings;
+        block.near = scene.local_shadow_near;
+        return block;
+    }
+
+    // A block light as the fit takes it: position, axis, range and cone, which
+    // is all a fit reads. Null for a kind with no local map.
+    fn sceneLightOf(light: gpu.LightUniform) ?scene.Light {
+        const position: res.Vec3 = light.position;
+        const kind: scene.Light.Kind = switch (light.kind) {
+            .point => .{ .point = .{ .position = position, .range = light.range } },
+            .spot => .{ .spot = .{
+                .position = position,
+                .direction = light.direction,
+                .range = light.range,
+                .cos_inner = light.cos_inner,
+                .cos_outer = light.cos_outer,
+            } },
+            .directional, .rect => return null,
+        };
+        return .{ .colour = light.colour, .intensity = light.intensity, .kind = kind };
+    }
+
+    // The framebuffer camera with this frame's sub-pixel offset applied to the
+    // matrix the geometry is drawn through. The previous matrix stays as it
+    // was, since motion is measured between unjittered positions, and the ray
+    // basis stays too: the background is smooth at the scale of a pixel.
+    // The presented image's extent, which the temporal resolve writes at.
+    fn outputExtent(surface: anytype) gpu.vk.Extent2D {
+        return .{ .width = surface.width, .height = surface.height };
+    }
+
+    fn createUpscaler(self: *Engine) !*fsr.Upscaler {
+        const images = self.renderer.temporalImages() orelse return error.NoTemporalPass;
+        if (!fsr.supportsStorageWithoutFormat(&self.context, images.resolved.format)) {
+            log.err("FSR: {t} cannot be written as a storage image without a format here", .{images.resolved.format});
+            return error.UpscalerOutputUnsupported;
+        }
+        const upscaler = try fsr.Upscaler.init(self.allocator, &self.context, &self.memory, .{
+            .max_render = images.colour.extent,
+            .max_output = images.resolved.extent,
+            .frames = frames_in_flight,
+            .tuning = self.look.fsr.tuning,
+            // Its passes, beside the frame's: the same request.
+            .profile = self.renderer_options.gpu_timing,
+            .fp16 = self.renderer_options.fsr_fp16,
+        });
+        self.fsr_state.tuning = self.look.fsr.tuning;
+        self.fsr_state.reset = true;
+        return upscaler;
+    }
+
+    // FSR in place of the resolve: the same inputs, written into the image the
+    // passes after it read. The states are what the passes around it leave and
+    // expect, stated here beside the call rather than inferred: the main pass
+    // and the prepass hand colour and motion to the fragment stage and depth
+    // to fragment and compute (`gpu.MainPass.endBarriers`,
+    // `gpu.Motion.endBarrier`); bloom, the meter and the post pass read the
+    // picture from fragment and compute.
+    fn recordUpscaler(
+        self: *Engine,
+        upscaler: *fsr.Upscaler,
+        commands: gpu.vk.CommandBuffer,
+        settings: FsrLook,
+        time: FrameTime,
+    ) !void {
+        // Exists whenever an upscaler does: both come from the same option.
+        const images = self.renderer.temporalImages().?;
+        if (!std.meta.eql(settings.tuning, self.fsr_state.tuning)) {
+            upscaler.setTuning(settings.tuning);
+            self.fsr_state.tuning = settings.tuning;
+        }
+
+        const fragment_read: fsr.Access = .{
+            .layout = .shader_read_only_optimal,
+            .stage = .{ .fragment_shader_bit = true },
+            .access = .{ .shader_sampled_read_bit = true },
+        };
+        const any_read: fsr.Access = .{
+            .layout = .shader_read_only_optimal,
+            .stage = .{ .fragment_shader_bit = true, .compute_shader_bit = true },
+            .access = .{ .shader_sampled_read_bit = true },
+        };
+        const colour = upscalerInput(images.colour, .{ .color_bit = true }, fragment_read);
+        const depth = upscalerInput(images.depth, .{ .depth_bit = true }, any_read);
+        const motion = upscalerInput(images.motion, .{ .color_bit = true }, fragment_read);
+        const output: fsr.External = .{
+            .image = images.resolved.image,
+            .sampled_view = images.resolved.view,
+            .storage_view = images.resolved.view,
+            .format = images.resolved.format,
+            .width = images.resolved.extent.width,
+            .height = images.resolved.extent.height,
+            // Last frame's readers; what they read is replaced whole.
+            .before = .{ .layout = .undefined, .stage = any_read.stage, .access = .{} },
+            .after = any_read,
+        };
+
+        const render = images.colour.extent;
+        const perspective = self.camera.projection.perspective;
+        try upscaler.dispatch(commands, @intCast(self.frame_index), .{
+            .colour = &colour,
+            .depth = &depth,
+            .motion = &motion,
+            .output = &output,
+        }, .{
+            .render = render,
+            .output = images.resolved.extent,
+            // The resolve's convention too: render pixels, x right and y down,
+            // the sample sitting at the texel centre minus this.
+            .jitter = gpu.Temporal.jitterPixels(self.frame_jitter, render),
+            // Motion is current minus previous in UV units; FidelityFX reads
+            // `uv + motion * scale / render` as last frame's position.
+            .motion_scale = .{ -@as(f32, @floatFromInt(render.width)), -@as(f32, @floatFromInt(render.height)) },
+            .delta_ms = time.delta * 1000,
+            .reset = self.fsr_state.reset,
+            .camera_near = perspective.near,
+            .camera_far = perspective.far,
+            .camera_fov_y = perspective.fov_y,
+            .sharpness = settings.sharpness,
+            .debug_view = settings.debug_view,
+        });
+        self.fsr_state.reset = false;
+    }
+
+    fn upscalerInput(image: gpu.TemporalImage, aspect_mask: gpu.vk.ImageAspectFlags, state: fsr.Access) fsr.External {
+        return .{
+            .image = image.image,
+            .sampled_view = image.view,
+            .format = image.format,
+            .aspect = aspect_mask,
+            .width = image.extent.width,
+            .height = image.extent.height,
+            .before = state,
+            .after = state,
+        };
+    }
+
+    fn jitterCamera(camera: gpu.FramebufferCamera, offset: [2]f32) gpu.FramebufferCamera {
+        var moved = camera;
+        moved.block.view_projection = gpu.jitterClip(camera.block.view_projection, offset);
+        moved.block.jitter = .{ offset[0], offset[1], 0, 0 };
+        return moved;
+    }
+
+    // The occlusion pass's values for this frame, or null when it is off or
+    // its settings cannot describe one. The projection is the frame's own, so
+    // the reconstruction inverts the matrix the depth was written through.
+    fn occlusionFrame(self: *const Engine, look: Look, ratio: f32) ?gpu.Ao.Frame {
+        const settings = look.ambient_occlusion;
+        const intensity = settings.clampedIntensity();
+        if (intensity == 0) return null;
+        const radius = settings.usableRadius() orelse return null;
+        const projection = self.camera.projectionMatrix(ratio) catch return null;
+        const reconstruction = scene.AmbientOcclusionReconstruction.compute(projection) catch return null;
+        return .{
+            .half_width = reconstruction.half_width,
+            .half_height = reconstruction.half_height,
+            .depth_scale = reconstruction.depth_scale,
+            .depth_offset = reconstruction.depth_offset,
+            .pixels_per_unit = reconstruction.pixelsPerUnit(self.renderExtent().height),
+            .radius = radius,
+            .intensity = intensity,
+            .bias = settings.bias,
+            .jitter = self.frame_jitter,
+        };
+    }
+
+    // The local layers' decision. Simpler than the sun's: the renderer bakes on
+    // its own account when the layers to be read were never written, which
+    // covers the first frame and the switch back on.
+    fn localShadowBake(self: *Engine, level: *const Level) gpu.ShadowBake {
+        if (self.local_shadow_dirty or level.world.castersMove()) {
+            self.local_shadow_dirty = false;
+            return .rebake;
+        }
+        return .reuse;
+    }
+
     // The frame's events, to the UI first and to the components with what the UI
     // did about it. Called inside the routing pass, which is what makes the
     // second half of that sentence true.
@@ -1720,7 +2289,18 @@ pub const Engine = struct {
         try self.swapchain.recreate(self.surface_extent);
 
         const target = self.renderExtent();
-        try self.renderer.resize(.{ .width = target.width, .height = target.height });
+        try self.renderer.resize(.{ .width = target.width, .height = target.height }, outputExtent(self.swapchain.currentExtent()));
+        // Created for the extents it serves, and the drain above covers its
+        // images. A failure leaves no upscaler and the picture unwritten; the
+        // error is the caller's.
+        if (comptime fsr_available) {
+            if (self.fsr_state.upscaler) |upscaler| {
+                upscaler.deinit();
+                self.fsr_state.upscaler = null;
+                self.fsr_state.upscaler = try self.createUpscaler();
+            }
+        }
+        self.previous_view_projection = null;
         self.swapchain_stale = false;
 
         // The surface extent and not the target's. A component lays out an overlay

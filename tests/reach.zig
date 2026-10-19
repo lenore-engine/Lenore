@@ -20,6 +20,8 @@ test "the device-facing surface is compiled" {
     // Its fallback drains the device, so nothing host-side reaches the body.
     _ = &lenore.Engine.retire;
     _ = &lenore.Engine.refitSun;
+    _ = &lenore.Engine.refitLocalShadows;
+    _ = &lenore.Engine.buildIndirect;
     // The scale it reads comes off the window, so the body needs one. The
     // arithmetic it hands that scale to is `fontPixelsFor`, tested on its own.
     _ = &lenore.Engine.fontPixels;
