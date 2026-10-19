@@ -1585,26 +1585,28 @@ pub const Engine = struct {
             else
                 .{ 0, 0 };
 
+            // The scene's clip space goes in and the framebuffer's comes
+            // out. The conversion is named here rather than performed
+            // inside the renderer, so the value a frame is filled with says
+            // which of the two it is.
+            const frame_camera = jitterCamera(gpu.vulkanClipCamera(.{
+                .view_projection = gpu.mat4(view_projection),
+                .previous_view_projection = gpu.mat4(self.previous_view_projection orelse view_projection),
+                .motion = .{ @intCast(state.joints.len), 0, 0, 0 },
+                // The fourth lane is the frame's clock and not a
+                // homogeneous one: nothing multiplies this by a matrix, and
+                // a shader that animates has nowhere else to read a clock.
+                .position = .{ eye[0], eye[1], eye[2], time.shaderSeconds() },
+                // The same pose and the same aspect the matrix above was
+                // built from, so the background's rays and the geometry's
+                // clip coordinates cannot describe two different cameras.
+                .ray_right = lane(ray_basis.right),
+                .ray_up = lane(ray_basis.up),
+                .ray_front = lane(ray_basis.front),
+            }), self.frame_jitter);
+
             try self.renderer.update(self.frame_index, .{
-                // The scene's clip space goes in and the framebuffer's comes
-                // out. The conversion is named here rather than performed
-                // inside the renderer, so the value a frame is filled with says
-                // which of the two it is.
-                .camera = jitterCamera(gpu.vulkanClipCamera(.{
-                    .view_projection = gpu.mat4(view_projection),
-                    .previous_view_projection = gpu.mat4(self.previous_view_projection orelse view_projection),
-                    .motion = .{ @intCast(state.joints.len), 0, 0, 0 },
-                    // The fourth lane is the frame's clock and not a
-                    // homogeneous one: nothing multiplies this by a matrix, and
-                    // a shader that animates has nowhere else to read a clock.
-                    .position = .{ eye[0], eye[1], eye[2], time.shaderSeconds() },
-                    // The same pose and the same aspect the matrix above was
-                    // built from, so the background's rays and the geometry's
-                    // clip coordinates cannot describe two different cameras.
-                    .ray_right = lane(ray_basis.right),
-                    .ray_up = lane(ray_basis.up),
-                    .ray_front = lane(ray_basis.front),
-                }), self.frame_jitter),
+                .camera = frame_camera,
                 .models = state.instances,
                 .joints = state.joints,
                 .previous_joints = state.previous_joints,
@@ -1744,7 +1746,10 @@ pub const Engine = struct {
                 }
                 break :upscaled false;
             };
-            if (!upscaled) self.renderer.recordTemporal(commands, .{ .jitter = self.frame_jitter });
+            if (!upscaled) self.renderer.recordTemporal(commands, .{
+                .jitter = self.frame_jitter,
+                .sky = gpu.Temporal.skyFor(frame_camera),
+            });
             self.mark(commands, .temporal, .end);
 
             // Before the chain rather than after it: both read the target the

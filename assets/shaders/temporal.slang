@@ -11,7 +11,8 @@
 //   pulled back toward it rather than kept;
 // - last frame's colour read where this surface was, `uv - motion`, with the
 //   motion of the nearest surface in the 3x3 so that an edge takes the motion
-//   of what is in front;
+//   of what is in front; where the whole 3x3 is background, which the depth
+//   prepass leaves without motion, where the camera's turn last frame put it;
 // - the two blended, the new frame weighing more where one of its samples
 //   lands near the pixel's centre.
 //
@@ -30,6 +31,13 @@ struct TemporalPushConstants
     float blend;
     // Nonzero takes the frame alone.
     uint reset;
+    // Last frame's clip position of the background at device (x, y) is
+    // `x * sky_across + y * sky_down + sky_ahead`: the view direction through
+    // last frame's view-projection with w = 0, so only the camera's turning
+    // moves it.
+    float4 sky_across;
+    float4 sky_down;
+    float4 sky_ahead;
 };
 
 [[vk::push_constant]]
@@ -214,9 +222,24 @@ Resolved fragmentMain(Varying varying)
     }
 
     const float3 now = gathered / gathered_weight;
-    const float2 motion = motion_vectors.Load(int3(closest, 0)).xy;
-    const float2 history_uv = varying.uv - motion;
-    const bool outside = any(history_uv < 0.0) || any(history_uv > 1.0);
+    float2 history_uv;
+    bool behind = false;
+    // The depth clear is the far plane, and the background is drawn there.
+    if (closest_depth >= 1.0)
+    {
+        // The output pixel's own centre, which no jitter moves.
+        const float2 device = varying.uv * 2.0 - 1.0;
+        const float4 clip = device.x * temporal.sky_across + device.y * temporal.sky_down + temporal.sky_ahead;
+        // A turn of more than a right angle puts the direction behind last
+        // frame's camera, where nothing of it was seen.
+        behind = clip.w <= 0.0;
+        history_uv = clip.xy / clip.w * 0.5 + 0.5;
+    }
+    else
+    {
+        history_uv = varying.uv - motion_vectors.Load(int3(closest, 0)).xy;
+    }
+    const bool outside = behind || any(history_uv < 0.0) || any(history_uv > 1.0);
 
     float3 result = now;
     if (temporal.reset == 0 && !outside)
